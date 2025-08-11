@@ -12,6 +12,14 @@ from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
+# 导入 deepscaler 奖励模型
+try:
+    from slime.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
+except ImportError:
+    # 如果无法导入，使用简单的评分逻辑
+    def get_deepscaler_rule_based_reward(response, label):
+        return 0.0
+
 RETOOL_CONFIGS = {
     "max_turns": 5,
     "max_tool_calls": 3,
@@ -19,6 +27,9 @@ RETOOL_CONFIGS = {
     # reward model
     "format_score": 0.1,
     "execution_score": 0.9,
+    # tool call reward settings
+    "tool_call_bonus": 0.1,  # 每次工具调用的奖励
+    "max_tool_bonus": 0.3,   # 最大工具调用奖励
     # Python interpreter settings
     "python_timeout": 10,  # seconds
     "python_memory_limit": "100MB",
@@ -357,6 +368,25 @@ async def execute_tool_calls(tool_calls: List[Dict[str, Any]]) -> str:
     return "\n".join(results)
 
 
+def compute_tool_call_bonus(full_text: str) -> float:
+    """计算工具调用奖励"""
+    tool_calls = extract_tool_calls(full_text)
+    final_answer = extract_final_answer(full_text)
+    
+    # 基础奖励：格式正确性
+    format_bonus = 0.0
+    if tool_calls and final_answer:
+        format_bonus += 0.1  # 有工具调用且有最终答案
+    
+    # 工具调用次数奖励
+    tool_count_bonus = min(
+        len(tool_calls) * RETOOL_CONFIGS["tool_call_bonus"],
+        RETOOL_CONFIGS["max_tool_bonus"]
+    )
+    
+    return format_bonus + tool_count_bonus
+
+
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     """自定义生成函数，支持工具调用"""
     assert not args.partial_rollout, "Partial rollout is not supported for this function at the moment."
@@ -449,32 +479,23 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
 
 async def reward_func(args, sample, **kwargs):
-    """工具调用的奖励函数"""
+    """工具调用的奖励函数，使用 deepscaler 作为主要奖励模型"""
     if not isinstance(sample, Sample):
         raise TypeError("Sample must be an instance of Sample class.")
 
-    full_text = sample.prompt + sample.response
+    # 构建完整的解决方案字符串
+    solution_str = sample.prompt + sample.response
     
-    # 检查格式正确性
-    format_score = 0.0
-    if "<tool_call>" in full_text and "</tool_call>" in full_text:
-        format_score += 0.5
-    if "<answer>" in full_text and "</answer>" in full_text:
-        format_score += 0.5
+    # 获取真实答案
+    ground_truth = sample.label.get("ground_truth", "")
     
-    # 检查执行正确性（这里简化处理，实际应该根据具体任务评估）
-    execution_score = 0.0
-    tool_calls = extract_tool_calls(full_text)
-    final_answer = extract_final_answer(full_text)
+    # 使用 deepscaler 计算基础分数
+    base_score = get_deepscaler_rule_based_reward(solution_str, ground_truth)
     
-    if tool_calls and final_answer:
-        execution_score = 0.8  # 基础分数
-        # 可以根据具体任务添加更复杂的评估逻辑
+    # 计算工具调用奖励
+    tool_bonus = compute_tool_call_bonus(solution_str)
     
-    # 计算总分数
-    total_score = (
-        format_score * RETOOL_CONFIGS["format_score"] +
-        execution_score * RETOOL_CONFIGS["execution_score"]
-    )
+    # 组合分数：基础分数 + 工具调用奖励
+    total_score = base_score + tool_bonus
     
     return total_score 
