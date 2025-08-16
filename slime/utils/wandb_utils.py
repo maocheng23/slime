@@ -35,6 +35,9 @@ def init_wandb_secondary(args, wandb_run_id):
     if wandb_run_id is None:
         return
 
+    if args.wandb_key is not None:
+        wandb.login(key=args.wandb_key, host=args.wandb_host)
+
     wandb.init(
         id=wandb_run_id,
         entity=args.wandb_team,

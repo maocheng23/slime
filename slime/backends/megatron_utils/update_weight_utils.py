@@ -2,7 +2,6 @@ import re
 import socket
 import time
 from tqdm import tqdm
-from contextlib import nullcontext
 from sglang.srt.utils import MultiprocessingSerializer
 import inspect
 
@@ -299,13 +298,6 @@ class UpdateWeightFromTensor:
         self.quantization_config = quantization_config
         self.param_info_buckets = get_param_info_buckets(self.args, self.model)
 
-        if self.args.experimental_offload:
-            import pytorch_malloc
-
-            self.allocator = torch.cuda.memory.CUDAPluggableAllocator(
-                pytorch_malloc.get_library_path(), "my_malloc", "my_free"
-            ).allocator()
-
     def connect_rollout_engines(self, rollout_engines, rollout_engine_lock):
         self.rollout_engines = rollout_engines
 
@@ -323,21 +315,16 @@ class UpdateWeightFromTensor:
                 self._ipc_gather_group = new_group
                 self._ipc_engine = engine
 
+    @torch.no_grad()
     def update_weights(self):
         rank = dist.get_rank()
         if rank == 0:
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
-        if self.args.experimental_offload:
-            pool = torch.cuda.MemPool(self.allocator)
-        with torch.cuda.use_mem_pool(pool) if self.args.experimental_offload else nullcontext():
-            for param_infos in tqdm(self.param_info_buckets, disable=rank != 0, desc="Update weights"):
-                self._update_bucket_weights_from_tensor(param_infos)
+        for param_infos in tqdm(self.param_info_buckets, disable=rank != 0, desc="Update weights"):
+            self._update_bucket_weights_from_tensor(param_infos)
 
         dist.barrier(group=get_gloo_group())
-        if self.args.experimental_offload:
-            # must manually delete here to release the memory
-            del pool
 
     def _update_bucket_weights_from_tensor(self, param_infos):
         monkey_patch_torch_reductions()
@@ -350,7 +337,8 @@ class UpdateWeightFromTensor:
             if dist.get_rank() == info.src_rank:
                 params.append(
                     torch.nn.Parameter(
-                        self.weights["actor"][info.name].to(device=torch.cuda.current_device(), non_blocking=True)
+                        self.weights["actor"][info.name].to(device=torch.cuda.current_device(), non_blocking=True),
+                        requires_grad=False,
                     )
                 )
             else:
@@ -406,7 +394,7 @@ class UpdateWeightFromTensor:
         self._update_converted_params_from_tensor(converted_named_tensors)
 
     def _update_converted_params_from_tensor(self, converted_named_tensors):
-        if use_flattened_tensor_bucket:
+        if use_flattened_tensor_bucket and self.quantization_config is None:
             flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=converted_named_tensors)
             metadata = flattened_tensor_bucket.get_metadata()
 
@@ -432,7 +420,7 @@ class UpdateWeightFromTensor:
             kwargs = {
                 "serialized_named_tensors": serialized_named_tensors,
             }
-            if use_flattened_tensor_bucket:
+            if use_flattened_tensor_bucket and self.quantization_config is None:
                 kwargs["load_format"] = "flattened_bucket"
 
             ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
@@ -488,6 +476,7 @@ class UpdateWeightFromDistributed:
             )
             ray.get(refs)
 
+    @torch.no_grad()
     def update_weights(self):
         if dist.get_rank() == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
