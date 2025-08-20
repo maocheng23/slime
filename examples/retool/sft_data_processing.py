@@ -3,7 +3,7 @@ from datasets import load_dataset
 ds = load_dataset("JoeYing/ReTool-SFT")["train"]
 
 def convert(sample):
-    conversations = sample["conversations"]
+    conversations = sample["messages"]
 
     def convert_role(role):
         if role == "human":
