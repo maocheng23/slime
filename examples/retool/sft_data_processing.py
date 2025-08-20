@@ -6,9 +6,9 @@ def convert(sample):
     conversations = sample["messages"]
 
     def convert_role(role):
-        if role == "human":
+        if role == "user":
             return "user"
-        elif role == "gpt":
+        elif role == "assistant":
             return "assistant"
         elif role == "system":
             return "system"
@@ -17,8 +17,8 @@ def convert(sample):
 
     messages = [
         {
-            "role": convert_role(turn["from"]),
-            "content": turn["value"],
+            "role": convert_role(turn["role"]),
+            "content": turn["content"],
         }
         for turn in conversations
     ]
