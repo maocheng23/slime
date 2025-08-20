@@ -27,15 +27,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/../../scripts/models/qwen3-4B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/qwen2.5-0.5b
-   --ref-load /root/qwen2.5-0.5b_torch_dist
+   --hf-checkpoint ./models/font-info/qwen3-4b-sft
+   --ref-load ./models/font-info/qwen3-4b-sft_torch_dist
    # --load /root/Qwen3-4B_slime/
-   --save /root/qwen2.5-0.5b-multi-turn/
+   --save ./models/font-info/qwen3-4b-sft-multi-turn/
    --save-interval 20
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
+   --prompt-data ./data/dapo-math-17k/dapo-math-17k.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -52,7 +52,7 @@ ROLLOUT_ARGS=(
 
 EVAL_ARGS=(
    --eval-interval 20
-   --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
+   --eval-prompt-data aime  ./data/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 16
    --eval-max-response-len 16384
    --eval-top-p 0.7
