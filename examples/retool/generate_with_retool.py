@@ -1,46 +1,63 @@
 # Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
 import asyncio
-import json
 import re
 import subprocess
 import tempfile
 import os
-from typing import Dict, List, Any, Optional
+import gc
+import psutil
+from typing import Dict, List, Any
 from contextlib import contextmanager
 
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
-# 导入 deepscaler 奖励模型
+# Import deepscaler reward model
 try:
     from slime.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
 except ImportError:
-    # 如果无法导入，使用简单的评分逻辑
+    # If import fails, use simple scoring logic
     def get_deepscaler_rule_based_reward(response, label):
         return 0.0
 
 RETOOL_CONFIGS = {
-    "max_turns": 5,
+    "max_turns": 16,
     "max_tool_calls": 3,
     "tool_concurrency": 64,
     # reward model
     "format_score": 0.1,
     "execution_score": 0.9,
     # tool call reward settings
-    "tool_call_bonus": 0.1,  # 每次工具调用的奖励
-    "max_tool_bonus": 0.3,   # 最大工具调用奖励
+    "tool_call_bonus": 0.1,  # reward for each tool call
+    "max_tool_bonus": 0.3,   # maximum tool call reward
     # Python interpreter settings
     "python_timeout": 10,  # seconds
     "python_memory_limit": "100MB",
     "python_cpu_limit": 1,
+    # Memory management settings
+    "max_memory_usage": 512,  # MB
+    "cleanup_threshold": 256,  # MB - trigger cleanup when memory exceeds this
 }
 
 SEMAPHORE = asyncio.Semaphore(RETOOL_CONFIGS["tool_concurrency"])
 
 
+def get_memory_usage() -> float:
+    """Get current memory usage in MB"""
+    process = psutil.Process()
+    return process.memory_info().rss / 1024 / 1024
+
+
+def cleanup_memory():
+    """Force garbage collection to free memory"""
+    gc.collect()
+    if hasattr(gc, 'collect'):
+        gc.collect()
+
+
 class PythonSandbox:
-    """Python 代码沙盒，提供安全的代码执行环境"""
+    """Python code sandbox, provides safe code execution environment"""
     
     def __init__(self, timeout: int = 10, memory_limit: str = "100MB"):
         self.timeout = timeout
@@ -51,8 +68,8 @@ class PythonSandbox:
         }
     
     def _check_code_safety(self, code: str) -> tuple[bool, str]:
-        """检查代码安全性"""
-        # 检查危险操作
+        """Check code safety"""
+        # Check for dangerous operations
         dangerous_patterns = [
             r'import\s+os',
             r'import\s+sys',
@@ -84,14 +101,14 @@ class PythonSandbox:
             r'property\s*\(',
             r'staticmethod\s*\(',
             r'classmethod\s*\(',
-            r'__\w+__',  # 双下划线方法
+            r'__\w+__',  # double underscore methods
         ]
         
         for pattern in dangerous_patterns:
             if re.search(pattern, code, re.IGNORECASE):
                 return False, f"Code contains dangerous pattern: {pattern}"
         
-        # 检查导入的模块
+        # Check imported modules
         import_pattern = r'import\s+(\w+)'
         from_pattern = r'from\s+(\w+)'
         
@@ -107,15 +124,15 @@ class PythonSandbox:
     
     @contextmanager
     def _create_safe_environment(self):
-        """创建安全的执行环境"""
-        # 创建临时目录
+        """Create safe execution environment"""
+        # Create temporary directory
         temp_dir = tempfile.mkdtemp(prefix="python_sandbox_")
         
         try:
-            # 创建安全的 Python 脚本
+            # Create safe Python script
             script_path = os.path.join(temp_dir, "code.py")
             
-            # 设置环境变量
+            # Set environment variables
             env = os.environ.copy()
             env['PYTHONPATH'] = temp_dir
             env['PYTHONUNBUFFERED'] = '1'
@@ -123,7 +140,7 @@ class PythonSandbox:
             yield script_path, env, temp_dir
             
         finally:
-            # 清理临时目录
+            # Clean up temporary directory
             try:
                 import shutil
                 shutil.rmtree(temp_dir)
@@ -131,64 +148,77 @@ class PythonSandbox:
                 pass
     
     async def execute_code(self, code: str) -> str:
-        """在沙盒中执行 Python 代码"""
-        # 检查代码安全性
+        """Execute Python code in sandbox"""
+        # Check memory usage before execution
+        current_memory = get_memory_usage()
+        if current_memory > RETOOL_CONFIGS["max_memory_usage"]:
+            cleanup_memory()
+            return "Error: Memory usage too high, please try again"
+        
+        # Check code safety
         is_safe, message = self._check_code_safety(code)
         if not is_safe:
             return f"Error: {message}"
         
-        # 添加必要的包装代码
+        # Add necessary wrapper code with memory limits
         wrapped_code = f"""
-import sys
-import traceback
-from io import StringIO
+        import sys
+        import traceback
+        from io import StringIO
+        import resource
 
-# 重定向 stdout 和 stderr
-old_stdout = sys.stdout
-old_stderr = sys.stderr
-stdout_capture = StringIO()
-stderr_capture = StringIO()
-sys.stdout = stdout_capture
-sys.stderr = stderr_capture
+        # Set memory limit (100MB)
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (100 * 1024 * 1024, -1))
+        except:
+            pass
 
-try:
-    # 用户代码
-    {code}
-    
-    # 获取输出
-    stdout_output = stdout_capture.getvalue()
-    stderr_output = stderr_capture.getvalue()
-    
-    # 恢复标准输出
-    sys.stdout = old_stdout
-    sys.stderr = old_stderr
-    
-    # 返回结果
-    result = ""
-    if stdout_output:
-        result += f"Output:\\n{{stdout_output}}"
-    if stderr_output:
-        result += f"\\nErrors:\\n{{stderr_output}}"
-    
-    print(result)
-    
-except Exception as e:
-    # 恢复标准输出
-    sys.stdout = old_stdout
-    sys.stderr = old_stderr
-    
-    # 返回错误信息
-    error_msg = f"Error: {{str(e)}}\\nTraceback:\\n{{traceback.format_exc()}}"
-    print(error_msg)
-"""
+        # Redirect stdout and stderr
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        stdout_capture = StringIO()
+        stderr_capture = StringIO()
+        sys.stdout = stdout_capture
+        sys.stderr = stderr_capture
+
+        try:
+            # User code
+            {code}
+            
+            # Get output
+            stdout_output = stdout_capture.getvalue()
+            stderr_output = stderr_capture.getvalue()
+            
+            # Restore standard output
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            
+            # Return result
+            result = ""
+            if stdout_output:
+                result += f"Output:\\n{{stdout_output}}"
+            if stderr_output:
+                result += f"\\nErrors:\\n{{stderr_output}}"
+            
+            print(result)
+            
+        except Exception as e:
+            # Restore standard output
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            
+            # Return error information
+            error_msg = f"Error: {{str(e)}}\\nTraceback:\\n{{traceback.format_exc()}}"
+            print(error_msg)
+        """
         
         with self._create_safe_environment() as (script_path, env, temp_dir):
-            # 写入代码到文件
+            # Write code to file
             with open(script_path, 'w') as f:
                 f.write(wrapped_code)
             
             try:
-                # 使用 subprocess 运行代码
+                # Use subprocess to run code
                 process = subprocess.Popen(
                     ['python3', script_path],
                     stdout=subprocess.PIPE,
@@ -198,25 +228,34 @@ except Exception as e:
                     text=True
                 )
                 
-                # 设置超时
+                # Set timeout
                 try:
                     stdout, stderr = process.communicate(timeout=self.timeout)
                     
                     if process.returncode == 0:
-                        return stdout.strip()
+                        result = stdout.strip()
                     else:
-                        return f"Error: Process exited with code {process.returncode}\n{stderr}"
+                        result = (f"Error: Process exited with code "
+                                f"{process.returncode}\n{stderr}")
                         
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    return f"Error: Code execution timed out after {self.timeout} seconds"
+                    result = (f"Error: Code execution timed out after "
+                             f"{self.timeout} seconds")
                     
             except Exception as e:
-                return f"Error: Failed to execute code: {str(e)}"
+                result = f"Error: Failed to execute code: {str(e)}"
+            
+            # Check memory usage after execution and cleanup if needed
+            current_memory = get_memory_usage()
+            if current_memory > RETOOL_CONFIGS["cleanup_threshold"]:
+                cleanup_memory()
+            
+            return result
 
 
 class ToolRegistry:
-    """工具注册表，管理可用的工具"""
+    """Tool registry, manages available tools"""
     
     def __init__(self):
         self.tools = {}
@@ -227,8 +266,8 @@ class ToolRegistry:
         self._register_default_tools()
     
     def _register_default_tools(self):
-        """注册默认工具"""
-        # Python 代码解释器
+        """Register default tools"""
+        # Python code interpreter
         self.register_tool("python", {
             "name": "python",
             "description": "Execute Python code in a safe sandbox environment",
@@ -243,144 +282,109 @@ class ToolRegistry:
                 "required": ["code"]
             }
         })
-        
-        # 数学计算工具
-        self.register_tool("calculator", {
-            "name": "calculator",
-            "description": "Perform mathematical calculations",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "Mathematical expression to evaluate"
-                    }
-                },
-                "required": ["expression"]
-            }
-        })
     
     def register_tool(self, name: str, tool_spec: Dict[str, Any]):
-        """注册新工具"""
+        """Register new tool"""
         self.tools[name] = tool_spec
     
     def get_tool_specs(self) -> List[Dict[str, Any]]:
-        """获取所有工具规格"""
+        """Get all tool specifications"""
         return list(self.tools.values())
     
     async def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
-        """执行工具调用"""
+        """Execute tool call"""
         if tool_name not in self.tools:
             return f"Error: Tool '{tool_name}' not found"
         
         async with SEMAPHORE:
             if tool_name == "python":
                 return await self._execute_python(arguments)
-            elif tool_name == "calculator":
-                return await self._execute_calculator(arguments)
             else:
                 return f"Error: Tool '{tool_name}' not implemented"
     
     async def _execute_python(self, arguments: Dict[str, Any]) -> str:
-        """执行 Python 代码"""
+        """Execute Python code"""
         code = arguments.get("code", "")
         if not code.strip():
             return "Error: No code provided"
         
-        # 在沙盒中执行代码
+        # Execute code in sandbox
         result = await self.python_sandbox.execute_code(code)
         return result
-    
-    async def _execute_calculator(self, arguments: Dict[str, Any]) -> str:
-        """执行计算器工具"""
-        try:
-            expression = arguments.get("expression", "")
-            # 安全地评估数学表达式
-            allowed_chars = set("0123456789+-*/.() ")
-            if not all(c in allowed_chars for c in expression):
-                return "Error: Invalid characters in expression"
-            
-            result = eval(expression)
-            return f"Result: {result}"
-        except Exception as e:
-            return f"Error: {str(e)}"
-
-
-# 全局工具注册表
+# Global tool registry
 tool_registry = ToolRegistry()
 
 
-def extract_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """从文本中提取工具调用"""
-    tool_calls = []
-    
-    # 匹配工具调用模式：<tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>
-    pattern = r'<tool_call>(.*?)</tool_call>'
-    matches = re.findall(pattern, text, re.DOTALL)
-    
-    for match in matches:
-        try:
-            tool_call = json.loads(match.strip())
-            if "name" in tool_call and "arguments" in tool_call:
-                tool_calls.append(tool_call)
-        except json.JSONDecodeError:
-            continue
-    
-    return tool_calls
-
-
-def extract_final_answer(text: str) -> Optional[str]:
-    """从文本中提取最终答案"""
-    # 匹配最终答案模式：<answer>...</answer>
-    pattern = r'<answer>(.*?)</answer>'
-    match = re.search(pattern, text, re.DOTALL)
+def postprocess_predictions(prediction: str):
+    """Extract action and content from prediction"""
+    pattern = r"<(code|answer)>(.*?)</\1>"
+    match = re.search(pattern, prediction, re.DOTALL)
     if match:
-        return match.group(1).strip()
-    return None
+        content = match.group(2).strip()  # Return only the content inside the tags
+        action = match.group(1)
+    else:
+        content = ""
+        action = None
+
+    return action, content
 
 
-def postprocess_response(resp: str) -> str:
-    """后处理响应，确保标签完整性"""
-    # 处理工具调用标签
-    if "<tool_call>" in resp and "</tool_call>" not in resp:
-        resp = resp.split("<tool_call>")[0]
+
+
+
+def postprocess_responses(resp: str) -> str:
+    """Post-process response to ensure tag completeness"""
+    return (
+        resp.split("</code>")[0] + "</code>"
+        if "</code>" in resp
+        else resp.split("</answer>")[0] + "</answer>" if "</answer>" in resp else resp
+    )
+
+
+async def execute_predictions(prediction: str) -> str:
+    """Execute predictions and return results"""
+    action, content = postprocess_predictions(prediction)
+
+    if action == "code":
+        # Extract Python code from the content
+        code_pattern = r'```python\s*(.*?)\s*```'
+        code_match = re.search(code_pattern, content, re.DOTALL)
+        if code_match:
+            code = code_match.group(1).strip()
+            async with SEMAPHORE:
+                result = await tool_registry.execute_tool("python", {"code": code})
+            next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n\n"
+            done = False
+        else:
+            next_obs = "\n\n<interpreter>\nError: No Python code found\n</interpreter>\n\n"
+            done = False
+    elif action == "answer":
+        next_obs = ""
+        done = True
+    else:
+        next_obs = "\nMy previous action is invalid. \
+If I want to execute code, I should put the code between <code> and </code>. \
+If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n"
+        done = False
+
+    return next_obs, done
+
+
+def compute_tool_call_bonus(tool_call_count: int, full_text: str) -> float:
+    """Compute tool call bonus using tracked tool call count"""
+    # Extract final answer using new format
+    answer_pattern = r'<answer>(.*?)</answer>'
+    answer_match = re.search(answer_pattern, full_text, re.DOTALL)
+    final_answer = answer_match.group(1).strip() if answer_match else None
     
-    # 处理答案标签
-    if "<answer>" in resp and "</answer>" not in resp:
-        resp = resp.split("<answer>")[0]
-    
-    return resp
-
-
-async def execute_tool_calls(tool_calls: List[Dict[str, Any]]) -> str:
-    """执行工具调用并返回结果"""
-    if not tool_calls:
-        return ""
-    
-    results = []
-    for tool_call in tool_calls:
-        tool_name = tool_call["name"]
-        arguments = tool_call["arguments"]
-        
-        result = await tool_registry.execute_tool(tool_name, arguments)
-        results.append(f"Tool '{tool_name}' result: {result}")
-    
-    return "\n".join(results)
-
-
-def compute_tool_call_bonus(full_text: str) -> float:
-    """计算工具调用奖励"""
-    tool_calls = extract_tool_calls(full_text)
-    final_answer = extract_final_answer(full_text)
-    
-    # 基础奖励：格式正确性
+    # Base bonus: format correctness
     format_bonus = 0.0
-    if tool_calls and final_answer:
-        format_bonus += 0.1  # 有工具调用且有最终答案
+    if tool_call_count > 0 and final_answer:
+        format_bonus += 0.1  # has tool calls and final answer
     
-    # 工具调用次数奖励
+    # Tool call count bonus
     tool_count_bonus = min(
-        len(tool_calls) * RETOOL_CONFIGS["tool_call_bonus"],
+        max(0, (tool_call_count-2)/2) * RETOOL_CONFIGS["tool_call_bonus"],
         RETOOL_CONFIGS["max_tool_bonus"]
     )
     
@@ -388,23 +392,26 @@ def compute_tool_call_bonus(full_text: str) -> float:
 
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
-    """自定义生成函数，支持工具调用"""
-    assert not args.partial_rollout, "Partial rollout is not supported for this function at the moment."
+    """Custom generation function supporting tool calls"""
+    assert not args.partial_rollout, ("Partial rollout is not supported for "
+                                     "this function at the moment.")
 
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     prompt = sample.prompt
-    prompt_tokens_ids = state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
+    prompt_tokens_ids = (state.tokenizer(sample.prompt, add_special_tokens=False)
+                        ["input_ids"])
     response = ""
     response_token_ids = []
     loss_masks = []
+    tool_call_count = 0  # Track actual tool call rounds
     
     for turn in range(RETOOL_CONFIGS["max_turns"]):
-        # 构建当前输入
+        # Build current input
         current_input = prompt + response
         
-        # 添加工具规格到prompt（如果需要）
+        # Add tool specifications to prompt (if needed)
         if turn == 0:
             tool_specs = tool_registry.get_tool_specs()
             if tool_specs:
@@ -420,53 +427,56 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         
         output = await post(url, payload, use_http2=args.use_http2)
 
-        # 处理中止
+        # Handle abort
         if output["meta_info"]["finish_reason"]["type"] == "abort":
             sample.status = Sample.Status.ABORTED
             return sample
 
         cur_response = output["text"]
-        cur_response = postprocess_response(cur_response)
+        cur_response = postprocess_responses(cur_response)
 
-        # 记录当前响应的token
-        cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
+        # Record current response tokens
+        cur_response_token_ids = (state.tokenizer(cur_response, 
+                                                 add_special_tokens=False)
+                                 ["input_ids"])
         response += cur_response
         response_token_ids += cur_response_token_ids
         loss_masks += [1] * len(cur_response_token_ids)
 
-        # 检查长度限制
+        # Check length limit
         if output["meta_info"]["finish_reason"]["type"] == "length":
             break
 
-        # 提取工具调用
-        tool_calls = extract_tool_calls(cur_response)
-        final_answer = extract_final_answer(cur_response)
-        
-        # 如果有最终答案，结束对话
-        if final_answer is not None:
+        next_obs, done = await execute_predictions(cur_response)
+        if done:
             break
+
+        # Count tool calls (when we get interpreter output, it means a tool was called)
+        if "<interpreter>" in next_obs:
+            tool_call_count += 1
+
+        assert next_obs != "", "Next observation should not be empty."
+        obs_tokens_ids = (state.tokenizer(next_obs, 
+                                         add_special_tokens=False)
+                         ["input_ids"])
+        response += next_obs
+        response_token_ids += obs_tokens_ids
+        loss_masks += [0] * len(obs_tokens_ids)
         
-        # 如果有工具调用，执行它们
-        if tool_calls:
-            tool_results = await execute_tool_calls(tool_calls)
-            if tool_results:
-                next_obs = f"\n\n<tool_results>\n{tool_results}\n</tool_results>\n\n"
-                obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
-                response += next_obs
-                response_token_ids += obs_tokens_ids
-                loss_masks += [0] * len(obs_tokens_ids)
-        
-        # 检查是否达到最大工具调用次数
+        # Check if maximum tool call count reached
         if turn >= RETOOL_CONFIGS["max_tool_calls"]:
             break
 
-    # 设置样本属性
+    # Set sample attributes
     sample.tokens = prompt_tokens_ids + response_token_ids
     sample.response_length = len(response_token_ids)
     sample.response = response
     sample.loss_masks = loss_masks
     
-    # 设置状态
+    # Store tool call count for reward calculation
+    sample.tool_call_count = tool_call_count
+    
+    # Set status
     match output["meta_info"]["finish_reason"]["type"]:
         case "length":
             sample.status = Sample.Status.TRUNCATED
@@ -479,23 +489,24 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
 
 async def reward_func(args, sample, **kwargs):
-    """工具调用的奖励函数，使用 deepscaler 作为主要奖励模型"""
+    """Tool call reward function using deepscaler as primary reward model"""
     if not isinstance(sample, Sample):
         raise TypeError("Sample must be an instance of Sample class.")
 
-    # 构建完整的解决方案字符串
+    # Build complete solution string
     solution_str = sample.prompt + sample.response
     
-    # 获取真实答案
+    # Get ground truth answer
     ground_truth = sample.label.get("ground_truth", "")
     
-    # 使用 deepscaler 计算基础分数
+    # Use deepscaler to calculate base score
     base_score = get_deepscaler_rule_based_reward(solution_str, ground_truth)
     
-    # 计算工具调用奖励
-    tool_bonus = compute_tool_call_bonus(solution_str)
+    # Calculate tool call bonus using tracked count
+    tool_call_count = getattr(sample, 'tool_call_count', 0)
+    tool_bonus = compute_tool_call_bonus(tool_call_count, solution_str)
     
-    # 组合分数：基础分数 + 工具调用奖励
+    # Combine scores: base score + tool call bonus
     total_score = base_score + tool_bonus
     
     return total_score 
