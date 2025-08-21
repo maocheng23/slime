@@ -317,16 +317,28 @@ tool_registry = ToolRegistry()
 
 def postprocess_predictions(prediction: str):
     """Extract action and content from prediction"""
-    pattern = r"<(code|answer)>(.*?)</\1>"
-    match = re.search(pattern, prediction, re.DOTALL)
-    if match:
-        content = match.group(2).strip()  # Return only the content inside the tags
-        action = match.group(1)
-    else:
-        content = ""
-        action = None
-
-    return action, content
+    # First check for <code> tags
+    code_pattern = r"<code>(.*?)</code>"
+    code_match = re.search(code_pattern, prediction, re.DOTALL)
+    if code_match:
+        content = code_match.group(1).strip()
+        return "code", content
+    
+    # Then check for Answer: \boxed{...} format
+    answer_pattern = r"Answer:\s*\\boxed\{([^}]*)\}"
+    answer_match = re.search(answer_pattern, prediction, re.DOTALL)
+    if answer_match:
+        content = answer_match.group(1).strip()
+        return "answer", content
+    
+    # Finally check for <answer> tags (fallback)
+    answer_tag_pattern = r"<answer>(.*?)</answer>"
+    answer_tag_match = re.search(answer_tag_pattern, prediction, re.DOTALL)
+    if answer_tag_match:
+        content = answer_tag_match.group(1).strip()
+        return "answer", content
+    
+    return None, ""
 
 
 
@@ -334,11 +346,24 @@ def postprocess_predictions(prediction: str):
 
 def postprocess_responses(resp: str) -> str:
     """Post-process response to ensure tag completeness"""
-    return (
-        resp.split("</code>")[0] + "</code>"
-        if "</code>" in resp
-        else resp.split("</answer>")[0] + "</answer>" if "</answer>" in resp else resp
-    )
+    # Handle <code> tags
+    if "</code>" in resp:
+        return resp.split("</code>")[0] + "</code>"
+    
+    # Handle <answer> tags
+    if "</answer>" in resp:
+        return resp.split("</answer>")[0] + "</answer>"
+    
+    # Handle Answer: \boxed{...} format
+    if "Answer:" in resp and "\\boxed{" in resp:
+        # Find the last occurrence of Answer: \boxed{...}
+        answer_pattern = r'Answer:\s*\\boxed\{[^}]*\}'
+        matches = list(re.finditer(answer_pattern, resp, re.DOTALL))
+        if matches:
+            last_match = matches[-1]
+            return resp[:last_match.end()]
+    
+    return resp
 
 
 async def execute_predictions(prediction: str) -> str:
@@ -364,7 +389,7 @@ async def execute_predictions(prediction: str) -> str:
     else:
         next_obs = "\nMy previous action is invalid. \
 If I want to execute code, I should put the code between <code> and </code>. \
-If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n"
+If I want to give the final answer, I should use the format 'Answer: \\boxed{answer}' or put the answer between <answer> and </answer>. Let me try again.\n"
         done = False
 
     return next_obs, done
@@ -372,10 +397,21 @@ If I want to give the final answer, I should put the answer between <answer> and
 
 def compute_tool_call_bonus(tool_call_count: int, full_text: str) -> float:
     """Compute tool call bonus using tracked tool call count"""
-    # Extract final answer using new format
-    answer_pattern = r'<answer>(.*?)</answer>'
+    # Extract final answer using multiple formats
+    final_answer = None
+    
+    # Check for Answer: \boxed{...} format first
+    answer_pattern = r'Answer:\s*\\boxed\{([^}]*)\}'
     answer_match = re.search(answer_pattern, full_text, re.DOTALL)
-    final_answer = answer_match.group(1).strip() if answer_match else None
+    if answer_match:
+        final_answer = answer_match.group(1).strip()
+    
+    # Fallback to <answer> tags
+    if not final_answer:
+        answer_tag_pattern = r'<answer>(.*?)</answer>'
+        answer_tag_match = re.search(answer_tag_pattern, full_text, re.DOTALL)
+        if answer_tag_match:
+            final_answer = answer_tag_match.group(1).strip()
     
     # Base bonus: format correctness
     format_bonus = 0.0

@@ -59,7 +59,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 1
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -102,7 +102,7 @@ WANDB_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.7
 )
 
@@ -124,12 +124,21 @@ CUSTOM_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+
+# Check available GPUs
+echo "Available GPUs:"
+nvidia-smi --list-gpus
+
+# Set CUDA_VISIBLE_DEVICES to ensure only GPUs 0,1 are used
+export CUDA_VISIBLE_DEVICES=0,1
+
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-stats
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}\",
-    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\"
+    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+    \"CUDA_VISIBLE_DEVICES\": \"0,1\"
   }
 }"
 
