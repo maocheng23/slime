@@ -496,8 +496,8 @@ async def reward_func(args, sample, **kwargs):
     # Build complete solution string
     solution_str = sample.prompt + sample.response
     
-    # Get ground truth answer
-    ground_truth = sample.label.get("ground_truth", "")
+    # Get ground truth answer - label is a string, not a dict
+    ground_truth = sample.label if sample.label is not None else ""
     
     # Use deepscaler to calculate base score
     base_score = get_deepscaler_rule_based_reward(solution_str, ground_truth)

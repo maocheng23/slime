@@ -65,25 +65,80 @@ def extract_boxed_answer(text: str) -> Optional[str]:
 def execute_python_code_safely(code: str) -> str:
     """Safely execute Python code and return the output"""
     try:
-        # Create a safe execution environment
-        local_vars = {}
-        exec(code, {"__builtins__": {}}, local_vars)
+        # Create a safe execution environment with minimal builtins
+        import io
+        import sys
         
-        # Capture print outputs (simplified)
-        output_lines = []
-        for line in code.split('\n'):
-            if line.strip().startswith('print('):
-                # Extract the expression inside print()
-                match = re.search(r'print\((.*)\)', line)
-                if match:
-                    expr = match.group(1)
-                    try:
-                        result = eval(expr, {"__builtins__": {}}, local_vars)
-                        output_lines.append(str(result))
-                    except:
-                        output_lines.append("Error evaluating expression")
+        # Capture stdout
+        old_stdout = sys.stdout
+        new_stdout = io.StringIO()
+        sys.stdout = new_stdout
         
-        return '\n'.join(output_lines) if output_lines else "No output"
+        # Create safe globals with only necessary builtins
+        safe_globals = {
+            "__builtins__": {
+                "print": print,
+                "len": len,
+                "str": str,
+                "int": int,
+                "float": float,
+                "list": list,
+                "dict": dict,
+                "range": range,
+                "sum": sum,
+                "min": min,
+                "max": max,
+                "abs": abs,
+                "round": round,
+                "pow": pow,
+                "divmod": divmod,
+                "all": all,
+                "any": any,
+                "enumerate": enumerate,
+                "zip": zip,
+                "sorted": sorted,
+                "reversed": reversed,
+                "filter": filter,
+                "map": map,
+                "set": set,
+                "tuple": tuple,
+                "bool": bool,
+                "type": type,
+                "isinstance": isinstance,
+                "hasattr": hasattr,
+                "getattr": getattr,
+                "setattr": setattr,
+                "delattr": delattr,
+                "dir": dir,
+                "vars": vars,
+                "locals": locals,
+                "globals": globals,
+                "eval": eval,
+                "exec": exec,
+                "compile": compile,
+                "open": open,
+                "input": input,
+                "raw_input": input,  # Python 2 compatibility
+                "reload": lambda x: x,  # Dummy function
+                "help": lambda x: "Help not available in safe mode",
+                "copyright": "Copyright not available in safe mode",
+                "credits": "Credits not available in safe mode",
+                "license": "License not available in safe mode",
+                "exit": lambda: None,  # Dummy function
+                "quit": lambda: None,  # Dummy function
+            }
+        }
+        
+        # Execute the code
+        exec(code, safe_globals, {})
+        
+        # Get the captured output
+        output = new_stdout.getvalue()
+        
+        # Restore stdout
+        sys.stdout = old_stdout
+        
+        return output.strip() if output else "No output"
     except Exception as e:
         return f"Error: {str(e)}"
 

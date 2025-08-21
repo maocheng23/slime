@@ -24,18 +24,18 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "/root/workspace/slime/scripts/models/qwen3-4B-2507.sh"
+source "/root/slime/scripts/models/qwen3-4B-2507.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/workspace/slime/models/font-info/qwen3-4b-sft
-   --ref-load /root/workspace/slime/models/font-info/qwen3-4b-sft_torch_dist
+   --hf-checkpoint /root/font-info/qwen3-4b-sft
+   --ref-load /root/font-info/qwen3-4b-sft_torch_dist
    # --load /root/Qwen3-4B_slime/
-   --save /root/workspace/slime/models/font-info/qwen3-4b-sft-multi-turn/
+   --save /root/font-info/qwen3-4b-sft/qwen3-4b-sft-multi-turn/
    --save-interval 20
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data ./data/dapo-math-17k/dapo-math-17k.jsonl
+   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -52,7 +52,7 @@ ROLLOUT_ARGS=(
 
 EVAL_ARGS=(
    --eval-interval 20
-   --eval-prompt-data aime  ./data/aime-2024/aime-2024.jsonl
+   --eval-prompt-data aime  /root/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 16
    --eval-max-response-len 16384
    --eval-top-p 0.7
