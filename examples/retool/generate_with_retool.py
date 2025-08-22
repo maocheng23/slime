@@ -13,24 +13,22 @@ from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
-# Import deepscaler reward model
+# Import reward models
 try:
     from slime.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
+    from slime.rollout.rm_hub.math_dapo_utils import compute_score as math_dapo_compute_score
 except ImportError:
     # If import fails, use simple scoring logic
     def get_deepscaler_rule_based_reward(response, label):
         return 0.0
+    
+    def math_dapo_compute_score(solution_str, ground_truth, strict_box_verify=False):
+        return {"score": 0.0, "acc": False, "pred": ""}
 
 RETOOL_CONFIGS = {
     "max_turns": 16,
     "max_tool_calls": 3,
     "tool_concurrency": 64,
-    # reward model
-    "format_score": 0.1,
-    "execution_score": 0.9,
-    # tool call reward settings
-    "tool_call_bonus": 0.1,  # reward for each tool call
-    "max_tool_bonus": 0.3,   # maximum tool call reward
     # Python interpreter settings
     "python_timeout": 10,  # seconds
     "python_memory_limit": "100MB",
@@ -409,36 +407,7 @@ If I want to give the final answer, I should use the format 'Answer: \\boxed{ans
     return next_obs, done
 
 
-def compute_tool_call_bonus(tool_call_count: int, full_text: str) -> float:
-    """Compute tool call bonus using tracked tool call count"""
-    # Extract final answer using multiple formats
-    final_answer = None
-    
-    # Check for Answer: \boxed{...} format first
-    answer_pattern = r'Answer:\s*\\boxed\{([^}]*)\}'
-    answer_match = re.search(answer_pattern, full_text, re.DOTALL)
-    if answer_match:
-        final_answer = answer_match.group(1).strip()
-    
-    # Fallback to <answer> tags
-    if not final_answer:
-        answer_tag_pattern = r'<answer>(.*?)</answer>'
-        answer_tag_match = re.search(answer_tag_pattern, full_text, re.DOTALL)
-        if answer_tag_match:
-            final_answer = answer_tag_match.group(1).strip()
-    
-    # Base bonus: format correctness
-    format_bonus = 0.0
-    if tool_call_count > 0 and final_answer:
-        format_bonus += 0.1  # has tool calls and final answer
-    
-    # Tool call count bonus
-    tool_count_bonus = min(
-        max(0, (tool_call_count-2)/2) * RETOOL_CONFIGS["tool_call_bonus"],
-        RETOOL_CONFIGS["max_tool_bonus"]
-    )
-    
-    return format_bonus + tool_count_bonus
+
 
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
@@ -539,7 +508,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
 
 async def reward_func(args, sample, **kwargs):
-    """Tool call reward function using deepscaler as primary reward model"""
+    """Tool call reward function using math_dapo as primary reward model"""
     if not isinstance(sample, Sample):
         raise TypeError("Sample must be an instance of Sample class.")
 
@@ -549,14 +518,22 @@ async def reward_func(args, sample, **kwargs):
     # Get ground truth answer - label is a string, not a dict
     ground_truth = sample.label if sample.label is not None else ""
     
-    # Use deepscaler to calculate base score
-    base_score = get_deepscaler_rule_based_reward(solution_str, ground_truth)
+    # Get tool call count as num_turns
+    num_turns = getattr(sample, 'tool_call_count', 0)
     
-    # Calculate tool call bonus using tracked count
-    tool_call_count = getattr(sample, 'tool_call_count', 0)
-    tool_bonus = compute_tool_call_bonus(tool_call_count, solution_str)
+    # Create extra_info dict for compatibility
+    extra_info = {"num_turns": num_turns}
     
-    # Combine scores: base score + tool call bonus
-    total_score = base_score + tool_bonus
+    # Use math_dapo compute_score function
+    result = math_dapo_compute_score(solution_str, ground_truth, strict_box_verify=True)
     
-    return total_score 
+    # Encourage model to call tools
+    if result["score"] < 0:
+        tool_call_reward = (num_turns - 2) / 2 * 0.1
+        result["score"] = min(-0.6, result["score"] + tool_call_reward)
+    
+    # Ensure pred is not None
+    if result["pred"] is None:
+        result["pred"] = ""
+    
+    return result 
