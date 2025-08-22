@@ -317,26 +317,33 @@ tool_registry = ToolRegistry()
 
 def postprocess_predictions(prediction: str):
     """Extract action and content from prediction"""
-    # First check for <code> tags
-    code_pattern = r"<code>(.*?)</code>"
-    code_match = re.search(code_pattern, prediction, re.DOTALL)
-    if code_match:
-        content = code_match.group(1).strip()
-        return "code", content
-    
-    # Then check for Answer: \boxed{...} format
+    # First check for Answer: \boxed{...} format (highest priority)
     answer_pattern = r"Answer:\s*\\boxed\{([^}]*)\}"
     answer_match = re.search(answer_pattern, prediction, re.DOTALL)
     if answer_match:
         content = answer_match.group(1).strip()
         return "answer", content
     
-    # Finally check for <answer> tags (fallback)
+    # Then check for <answer> tags
     answer_tag_pattern = r"<answer>(.*?)</answer>"
     answer_tag_match = re.search(answer_tag_pattern, prediction, re.DOTALL)
     if answer_tag_match:
         content = answer_tag_match.group(1).strip()
         return "answer", content
+    
+    # Then check for <code> tags
+    code_pattern = r"<code>(.*?)</code>"
+    code_match = re.search(code_pattern, prediction, re.DOTALL)
+    if code_match:
+        content = code_match.group(1).strip()
+        return "code", content
+    
+    # Finally check for ```python code blocks (lowest priority)
+    python_code_pattern = r"```python\s*(.*?)\s*```"
+    python_code_match = re.search(python_code_pattern, prediction, re.DOTALL)
+    if python_code_match:
+        content = python_code_match.group(1).strip()
+        return "code", content
     
     return None, ""
 
@@ -349,6 +356,15 @@ def postprocess_responses(resp: str) -> str:
     # Handle <code> tags
     if "</code>" in resp:
         return resp.split("</code>")[0] + "</code>"
+    
+    # Handle ```python code blocks
+    if "```python" in resp:
+        # Find the last occurrence of ```python...```
+        python_pattern = r'```python\s*.*?```'
+        matches = list(re.finditer(python_pattern, resp, re.DOTALL))
+        if matches:
+            last_match = matches[-1]
+            return resp[:last_match.end()]
     
     # Handle <answer> tags
     if "</answer>" in resp:
@@ -371,11 +387,9 @@ async def execute_predictions(prediction: str) -> str:
     action, content = postprocess_predictions(prediction)
 
     if action == "code":
-        # Extract Python code from the content
-        code_pattern = r'```python\s*(.*?)\s*```'
-        code_match = re.search(code_pattern, content, re.DOTALL)
-        if code_match:
-            code = code_match.group(1).strip()
+        # Content is already the Python code (extracted by postprocess_predictions)
+        code = content.strip()
+        if code:
             async with SEMAPHORE:
                 result = await tool_registry.execute_tool("python", {"code": code})
             next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n\n"
