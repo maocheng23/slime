@@ -24,7 +24,7 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "/root/slime/scripts/models/qwen3-4B-2507.sh"
+source "${SCRIPT_DIR}/models/qwen3-4B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint /root/font-info/qwen3-4b-sft
@@ -59,7 +59,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 1
+   --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -95,14 +95,14 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   # --use-wandb
-   # --wandb-project slime-dev
-   # --wandb-group retool_qwen3-4B-test
-   # --wandb-key ${WANDB_KEY}
+   --use-wandb
+   --wandb-project slime-dapo
+   --wandb-group qwen3-4B-test-multi-turn
+   --wandb-key 2b9b314aca4fb1f7197f0cc0c9c9c595afbf5122
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 1
+   --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
 )
 
@@ -117,28 +117,16 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_retool.generate
-   --custom-rm-path generate_with_retool.reward_func
-)
-
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
-# Check available GPUs
-echo "Available GPUs:"
-nvidia-smi --list-gpus
-
-# Set CUDA_VISIBLE_DEVICES to ensure only GPUs 0,1 are used
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats
-
+# Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}\",
+    \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"CUDA_VISIBLE_DEVICES\": \"0,1\"
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
 }"
 
@@ -146,20 +134,17 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 2 \
-   --rollout-num-gpus 2 \
+   --actor-num-gpus-per-node 8 \
+   --rollout-num-gpus-per-node 8 \
    --colocate \
-   --debug-rollout-only \
-   --save-debug-rollout-data ./debug/data_{rollout_id}.pt \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
-   ${EVAL_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
    ${DISTRIBUTED_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
+   ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]} \
-   ${CUSTOM_ARGS[@]} 
+   ${MISC_ARGS[@]}
