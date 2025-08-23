@@ -63,7 +63,11 @@ class MegatronTrainRayActor(TrainRayActor):
             self.load_other_checkpoint("ref", args.ref_load)
 
         if self.args.keep_old_actor:
+            # Load old_actor checkpoint
             self.load_other_checkpoint("old_actor", args.load)
+            # Create rollout_actor as a copy of current actor
+            self.weights["rollout_actor"] = {}
+            self.update_cpu_params_dict(self.weights["rollout_actor"])
 
         update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
         self.weight_updator = update_weight_cls(
@@ -118,7 +122,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory()
         print_memory(f"before offload model")
-        self.update_cpu_params_dict(self.weights["actor"])
         if hasattr(mpu, "destroy_process_groups"):
             mpu.destroy_process_groups()
 
@@ -256,6 +259,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 path,
             )
 
+        # update the cpu actor weight to the latest model
+        self.update_cpu_params_dict(self.weights["actor"])
+
         log_perf_data(rollout_id, self.args)
         Timer().start("train_wait")
 
@@ -291,8 +297,13 @@ class MegatronTrainRayActor(TrainRayActor):
             print_memory("after update_weights")
 
             if getattr(self.args, "keep_old_actor", False):
-                print("update rollout model on cpu using actor model")
-                self.update_cpu_params_dict(self.weights["old_actor"])
+                print("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
+                # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
+                # First copy rollout_actor to old_actor
+                for name in self.weights["old_actor"]:
+                    self.weights["old_actor"][name].copy_(self.weights["rollout_actor"][name])
+                # Then copy current actor to rollout_actor
+                self.update_cpu_params_dict(self.weights["rollout_actor"])
 
         if self.args.offload and hasattr(mpu, "destroy_process_groups"):
             mpu.destroy_process_groups()
