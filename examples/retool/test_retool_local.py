@@ -49,10 +49,20 @@ def extract_code_blocks(text: str) -> List[Dict[str, str]]:
     
     # Pair code blocks with interpreter outputs
     for i, code in enumerate(all_code_matches):
+        # If no interpreter output found, try to simulate the output
+        output = ""
+        if i < len(interpreter_matches):
+            output = interpreter_matches[i]
+        else:
+            # For code blocks without interpreter output, simulate execution
+            try:
+                output = execute_python_code_safely(code.strip())
+            except Exception as e:
+                output = f"[Execution error: {str(e)}]"
+        
         code_block = {
             "code": code.strip(),
-            "output": (interpreter_matches[i] if i < len(interpreter_matches) 
-                      else "")
+            "output": output
         }
         code_blocks.append(code_block)
     
