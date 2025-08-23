@@ -130,9 +130,9 @@ echo "Available GPUs:"
 nvidia-smi --list-gpus
 
 # Set CUDA_VISIBLE_DEVICES to ensure only GPUs 0,1 are used
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-stats
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
