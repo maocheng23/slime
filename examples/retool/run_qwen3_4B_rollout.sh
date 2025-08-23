@@ -40,6 +40,7 @@ ROLLOUT_ARGS=(
    --label-key label
    --apply-chat-template
    --rollout-shuffle
+   --reward-key score
    --num-rollout 3000
    --rollout-batch-size 32
    --n-samples-per-prompt 8
@@ -136,7 +137,7 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-s
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}\",
+    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:/root/slime\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"CUDA_VISIBLE_DEVICES\": \"0,1\"
   }
