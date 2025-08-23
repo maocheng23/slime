@@ -117,6 +117,11 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+CUSTOM_ARGS=(
+   --custom-generate-function-path generate_with_retool.generate
+   --custom-rm-path generate_with_retool.reward_func
+)
+
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
