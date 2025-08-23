@@ -24,13 +24,13 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "/root/workspace/slime/scripts/models/qwen3-4B-2507.sh"
+source "/root/slime/scripts/models/qwen3-4B-2507.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/workspace/slime/models/Qwen/Qwen3-4B-Instruct-2507/
-   --ref-load /root/workspace/slime/models/Qwen/Qwen3-4B-Instruct-2507_torch_dist
+   --hf-checkpoint /root/slime/models/Qwen/Qwen3-4B-Instruct-2507/
+   --ref-load /root/slime/models/Qwen/Qwen3-4B-Instruct-2507_torch_dist
 #    --load ./models/Qwen/Qwen3-4B-Instruct-2507_slime/
-   --save /root/workspace/slime/models/Qwen/Qwen3-4B-Instruct-2507_sft_slime/
+   --save /root/slime/models/Qwen/Qwen3-4B-Instruct-2507_sft_slime/
    --save-interval 1000
 )
 
