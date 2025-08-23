@@ -36,12 +36,19 @@ def extract_code_blocks(text: str) -> List[Dict[str, str]]:
     code_pattern = r'<code>\s*```python\s*(.*?)\s*```\s*</code>'
     code_matches = re.findall(code_pattern, text, re.DOTALL)
     
+    # Also match ```python code blocks without <code> tags
+    python_code_pattern = r'```python\s*(.*?)\s*```'
+    python_code_matches = re.findall(python_code_pattern, text, re.DOTALL)
+    
+    # Combine both types of matches
+    all_code_matches = code_matches + python_code_matches
+    
     # Match interpreter output pattern: <interpreter>output</interpreter>
     interpreter_pattern = r'<interpreter>(.*?)</interpreter>'
     interpreter_matches = re.findall(interpreter_pattern, text, re.DOTALL)
     
     # Pair code blocks with interpreter outputs
-    for i, code in enumerate(code_matches):
+    for i, code in enumerate(all_code_matches):
         code_block = {
             "code": code.strip(),
             "output": (interpreter_matches[i] if i < len(interpreter_matches) 
@@ -452,6 +459,15 @@ class RetoolLocalTester:
         llm_response = self.mock_llm.generate_response(user_input)
         print(f"LLM Response:\n{llm_response}")
         
+        # Test postprocess_predictions
+        print(f"\n{'='*60}")
+        print("Testing postprocess_predictions")
+        print(f"{'='*60}")
+        
+        action, content = postprocess_predictions(llm_response)
+        print(f"Action: {action}")
+        print(f"Content: {repr(content)}")
+        
         # Post-process response
         processed_response = postprocess_responses(llm_response)
         print(f"\nPost-processed Response:\n{processed_response}")
@@ -463,6 +479,10 @@ class RetoolLocalTester:
         # Extract final answer
         final_answer = extract_boxed_answer(processed_response)
         print(f"\nFinal Answer: {final_answer}")
+        
+        # Calculate tool call count
+        tool_call_count = len(code_blocks)
+        print(f"\nTool Call Count: {tool_call_count}")
         
         # Execute code blocks (simulation)
         code_results = []
@@ -481,13 +501,54 @@ class RetoolLocalTester:
                 "match": expected_output.strip() == actual_output.strip()
             })
         
+        # Simulate reward calculation
+        print(f"\n{'='*60}")
+        print("Testing Reward Calculation")
+        print(f"{'='*60}")
+        
+        try:
+            from slime.utils.types import Sample
+            from generate_with_retool import reward_func
+            
+            # Create mock sample
+            mock_sample = Sample(
+                prompt=user_input,
+                response=llm_response,
+                label=final_answer if final_answer else "unknown"
+            )
+            mock_sample.tool_call_count = tool_call_count
+            
+            # Create mock args
+            class MockArgs:
+                pass
+            args = MockArgs()
+            
+            # Calculate reward
+            reward_result = await reward_func(args, mock_sample)
+            print(f"Reward Result: {reward_result}")
+            
+            if isinstance(reward_result, dict):
+                print(f"Score: {reward_result.get('score', 'N/A')}")
+                print(f"Accuracy: {reward_result.get('acc', 'N/A')}")
+                print(f"Prediction: {reward_result.get('pred', 'N/A')}")
+            else:
+                print(f"Total Score: {reward_result}")
+                
+        except Exception as e:
+            print(f"Error calculating reward: {e}")
+            reward_result = None
+        
         return {
             "user_input": user_input,
             "llm_response": llm_response,
+            "action": action,
+            "content": content,
             "processed_response": processed_response,
             "code_blocks": code_blocks,
             "code_results": code_results,
-            "final_answer": final_answer
+            "final_answer": final_answer,
+            "tool_call_count": tool_call_count,
+            "reward_result": reward_result
         }
     
     async def test_multi_turn(self, conversation: List[str]) -> List[Dict[str, Any]]:
@@ -520,112 +581,123 @@ class RetoolLocalTester:
         print(f"{'='*60}")
         
         # Test the format you provided
-        test_response = """Okay, so I need to find out how many students at Dala High School are not taking any of the three classes: Math, Science, or English. The total number of students is 152. Let me see... I remember this is a problem about sets and maybe using the principle of inclusion-exclusion. Let me recall how that works.
+        test_response = """Okay, let's tackle this geometry problem step by step. First, let me understand what's given and what's being asked.
 
-First, the inclusion-exclusion principle for three sets says that the total number of students taking at least one of the classes is equal to the sum of the numbers in each individual class, minus the sum of the numbers in each pair of classes, plus the number in all three classes. Then, subtract that total from the overall number of students to get those not taking any of the three. 
+We have a rectangle \\(ABCD\\) with \\(AB = 5\\) and \\(AD = 12\\). So, \\(AB\\) is the length, and \\(AD\\) is the width. Let me visualize this rectangle. Let's consider \\(A\\) at the origin \\((0, 0)\\), \\(B\\) at \\((5, 0)\\), \\(D\\) at \\((0, 12)\\), and \\(C\\) at \\((5, 12)\\). That's the standard coordinate system setup.
 
-Let me write that down step by step. Let M be the set of students taking Math, S for Science, and E for English. Then:
+Now, there's a point \\(E\\) outside the rectangle such that the perpendicular distances from \\(E\\) to the lines \\(AB\\) and \\(AD\\) are 12 and 1, respectively. Also, triangle \\(ABE\\) is acute. We need to find \\(FG^2\\), where \\(F\\) and \\(G\\) are the intersections of a line passing through \\(E\\) that splits the rectangle into two equal areas. The line intersects \\(\\overline{AB}\\) at \\(F\\) and \\(\\overline{CD}\\) at \\(G\\).
 
-Total in at least one class = |M ∪ S ∪ E| = |M| + |S| + |E| - |M ∩ S| - |M ∩ E| - |S ∩ E| + |M ∩ S ∩ E|
+First, let's figure out the coordinates of point \\(E\\). The distances from \\(E\\) to lines \\(AB\\) and \\(AD\\) are 12 and 1. The line \\(AB\\) is the x-axis, so the distance from \\(E\\) to \\(AB\\) is the vertical distance, which is 12. Similarly, the line \\(AD\\) is the y-axis, so the distance from \\(E\\) to \\(AD\\) is the horizontal distance, which is 1. However, since \\(E\\) is outside the rectangle, we need to determine the correct quadrant.
 
-Given the numbers:
+Given that triangle \\(ABE\\) is acute, let's analyze the possible positions of \\(E\\). If \\(E\\) is at \\((1, 12)\\), the triangle would have sides \\(AB = 5\\), \\(BE = \\sqrt{(5-1)^2 + (0-12)^2} = \\sqrt{16 + 144} = \\sqrt{160}\\), and \\(AE = \\sqrt{1^2 + 12^2} = \\sqrt{145}\\). Checking angles using the Law of Cosines, angle at \\(B\\) would be obtuse, violating the acute condition. Similarly, other quadrants for \\(E\\) either place it inside the rectangle or result in an obtuse triangle. After verifying all possibilities, \\(E\\) must be at \\((-1, 1)\\) to satisfy the acute triangle condition.
 
-|M| = 100
+Next, the line passing through \\(E\\) must split the rectangle into two equal areas. The area of the rectangle is \\(5 \\times 12 = 60\\), so each part must have area 30. The line intersects \\(\\overline{AB}\\) at \\(F(f, 0)\\) and \\(\\overline{CD}\\) at \\(G(f + 6, 12)\\). The equation of the line is determined by passing through \\(E(-1, 1)\\) and has a slope calculated to ensure the area condition. Solving the system of equations for the line and the rectangle's boundaries, we find \\(f = -\\frac{11}{2}\\), leading to \\(F\\left(-\\frac{11}{2}, 0\\right)\\) and \\(G\\left(\\frac{1}{2}, 12\\right)\\).
 
-|S| = 94
-
-|E| = 57
-
-|M ∩ S| = 73
-
-|M ∩ E| = 24
-
-|S ∩ E| = 27
-
-|M ∩ S ∩ E| = 22
-
-So plugging these into the formula:
-
-Total = 100 + 94 + 57 - 73 - 24 - 27 + 22
-
-Let me compute that step by step using code to ensure accuracy.
-
-<code>
+Finally, compute the distance squared between \\(F\\) and \\(G\\):
 ```python
-
-M = 100
-S = 94
-E = 57
-M_S = 73
-M_E = 24
-S_E = 27
-M_S_E = 22
-
-total_in_any = M + S + E - M_S - M_E - S_E + M_S_E
-students_neither = 152 - total_in_any
-print(students_neither)
+f = -11/2
+g = 1/2
+FG_squared = (g - f)**2 + (12 - 0)**2
+print(FG_squared)
 ```
-</code>
-
-<interpreter>
-3
-</interpreter>
-
-The code returns 3, indicating that 3 students take none of the classes. To verify, I'll break down each category to ensure the total matches:
-
-- Only Math and Science: 73 - 22 = 51
-- Only Math and English: 24 - 22 = 2
-- Only Science and English: 27 - 22 = 5
-- Only Math: 100 - 51 - 2 - 22 = 25
-- Only Science: 94 - 51 - 5 - 22 = 16
-- Only English: 57 - 2 - 5 - 22 = 28
-
-Summing all categories:
-
-<code>
-```python
-
-only_M_S = 73 - 22
-only_M_E = 24 - 22
-only_S_E = 27 - 22
-
-only_M = 100 - only_M_S - only_M_E - 22
-only_S = 94 - only_M_S - only_S_E - 22
-only_E = 57 - only_M_E - only_S_E - 22
-
-total_verify = only_M + only_S + only_E + only_M_S + only_M_E + only_S_E + 22
-print(total_verify)
-```
-</code>
-
-<interpreter>
-149
-</interpreter>
-
-The verification total is 149, so students not taking any classes are 152 - 149 = 3, confirming the initial result.
-
-<answer>
-\\boxed{3}
-</answer>"""
+Answer: \\boxed{169}<|im_end|>
+"""
         
         print("Original Response:")
         print(test_response)
         
+        # Test postprocess_predictions
+        print(f"\n{'='*60}")
+        print("Testing postprocess_predictions")
+        print(f"{'='*60}")
+        
+        action, content = postprocess_predictions(test_response)
+        print(f"Action: {action}")
+        print(f"Content: {repr(content)}")
+        
+        # Test postprocess_responses
+        print(f"\n{'='*60}")
+        print("Testing postprocess_responses")
+        print(f"{'='*60}")
+        
+        processed_response = postprocess_responses(test_response)
+        print(f"Processed Response: {repr(processed_response)}")
+        
         # Extract code blocks
+        print(f"\n{'='*60}")
+        print("Testing Code Block Extraction")
+        print(f"{'='*60}")
+        
         code_blocks = extract_code_blocks(test_response)
-        print(f"\nNumber of Extracted Code Blocks: {len(code_blocks)}")
+        print(f"Number of Extracted Code Blocks: {len(code_blocks)}")
         for i, block in enumerate(code_blocks):
             print(f"\nCode Block {i+1}:")
             print(f"Code:\n{block['code']}")
             print(f"Output:\n{block['output']}")
         
         # Extract final answer
+        print(f"\n{'='*60}")
+        print("Testing Answer Extraction")
+        print(f"{'='*60}")
+        
         final_answer = extract_boxed_answer(test_response)
-        print(f"\nFinal Answer: {final_answer}")
+        print(f"Final Answer: {final_answer}")
+        
+        # Simulate tool call count
+        print(f"\n{'='*60}")
+        print("Testing Tool Call Analysis")
+        print(f"{'='*60}")
+        
+        tool_call_count = len(code_blocks)
+        print(f"Tool Call Count: {tool_call_count}")
+        
+        # Simulate reward calculation
+        print(f"\n{'='*60}")
+        print("Testing Reward Calculation")
+        print(f"{'='*60}")
+        
+        # Create a mock sample for reward calculation
+        from slime.utils.types import Sample
+        
+        mock_sample = Sample(
+            prompt="Solve this geometry problem: Find FG² where F and G are...",
+            response=test_response,
+            label="169"  # Ground truth
+        )
+        mock_sample.tool_call_count = tool_call_count
+        
+        # Import and test reward function
+        try:
+            from generate_with_retool import reward_func
+            import asyncio
+            
+            # Create mock args
+            class MockArgs:
+                pass
+            args = MockArgs()
+            
+            # Calculate reward
+            reward_result = await reward_func(args, mock_sample)
+            print(f"Reward Result: {reward_result}")
+            
+            if isinstance(reward_result, dict):
+                print(f"Score: {reward_result.get('score', 'N/A')}")
+                print(f"Accuracy: {reward_result.get('acc', 'N/A')}")
+                print(f"Prediction: {reward_result.get('pred', 'N/A')}")
+            else:
+                print(f"Total Score: {reward_result}")
+                
+        except Exception as e:
+            print(f"Error calculating reward: {e}")
         
         return {
+            "action": action,
+            "content": content,
+            "processed_response": processed_response,
             "code_blocks": code_blocks,
-            "final_answer": final_answer
+            "final_answer": final_answer,
+            "tool_call_count": tool_call_count,
+            "reward_result": reward_result if 'reward_result' in locals() else None
         }
 
 
