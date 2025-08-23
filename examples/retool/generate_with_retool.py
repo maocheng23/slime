@@ -18,12 +18,13 @@ try:
     from slime.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
     from slime.rollout.rm_hub.math_dapo_utils import compute_score as math_dapo_compute_score
 except ImportError:
+    raise ImportError("DeepScaler or MathDapo is not installed")
     # If import fails, use simple scoring logic
-    def get_deepscaler_rule_based_reward(response, label):
-        return 0.0
+    # def get_deepscaler_rule_based_reward(response, label):
+    #     return 0.0
     
-    def math_dapo_compute_score(solution_str, ground_truth, strict_box_verify=False):
-        return {"score": 0.0, "acc": False, "pred": ""}
+    # def math_dapo_compute_score(solution_str, ground_truth, strict_box_verify=False):
+    #     return {"score": 0.0, "acc": False, "pred": ""}
 
 RETOOL_CONFIGS = {
     "max_turns": 16,
