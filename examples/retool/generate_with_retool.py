@@ -521,9 +521,6 @@ async def reward_func(args, sample, **kwargs):
     # Get tool call count as num_turns
     num_turns = getattr(sample, 'tool_call_count', 0)
     
-    # Create extra_info dict for compatibility
-    extra_info = {"num_turns": num_turns}
-    
     # Use math_dapo compute_score function
     result = math_dapo_compute_score(solution_str, ground_truth, strict_box_verify=True)
     
