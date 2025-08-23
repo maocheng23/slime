@@ -24,7 +24,7 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3-4B.sh"
+source "/root/workspace/slime/scripts/models/qwen3-4B-2507.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint /root/font-info/qwen3-4b-sft
