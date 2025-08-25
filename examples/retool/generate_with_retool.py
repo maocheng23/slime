@@ -9,6 +9,11 @@ import psutil
 from typing import Dict, List, Any
 from contextlib import contextmanager
 
+try:
+    from jinja2 import Template
+except ImportError:
+    raise ImportError("Jinja2 is required. Please install it with: pip install jinja2")
+
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
@@ -38,6 +43,74 @@ RETOOL_CONFIGS = {
     "max_memory_usage": 512,  # MB
     "cleanup_threshold": 256,  # MB - trigger cleanup when memory exceeds this
 }
+
+# Jinja2 template for tool-enabled conversations
+TOOL_TEMPLATE = """{%- if tools %}
+<|im_start|>system
+{%- if messages[0]['role'] == 'system' %}
+{{- messages[0]['content'] }}
+{%- else %}
+You are a helpful assistant.
+{%- endif %}
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{%- for tool in tools %}
+{{- tool | tojson }}
+{%- endfor %}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call><|im_end|>
+{%- endif %}
+{%- for message in messages %}
+{%- if message['role'] == 'system' %}
+<|im_start|>system
+{{- message['content'] }}<|im_end|>
+{%- elif message['role'] == 'user' %}
+<|im_start|>user
+{{- message['content'] }}<|im_end|>
+{%- elif message['role'] == 'assistant' %}
+<|im_start|>assistant
+{{- message['content'] }}<|im_end|>
+{%- endif %}
+{%- endfor %}
+<|im_start|>assistant
+"""
+
+def format_conversation_with_tools(prompt: str, tools: List[Dict[str, Any]] = None, system_prompt: str = None) -> str:
+    """Format conversation using Jinja2 template with tool support"""
+    template = Template(TOOL_TEMPLATE)
+    
+    # Prepare messages
+    messages = []
+    
+    # Add system message if provided
+    if system_prompt:
+        messages.append({
+            "role": "system",
+            "content": system_prompt
+        })
+    
+    # Add user message
+    messages.append({
+        "role": "user",
+        "content": prompt
+    })
+    
+    # Render template
+    formatted_text = template.render(
+        messages=messages,
+        tools=tools or []
+    )
+    
+    return formatted_text
 
 SEMAPHORE = asyncio.Semaphore(RETOOL_CONFIGS["tool_concurrency"])
 
@@ -330,6 +403,27 @@ def postprocess_predictions(prediction: str):
         content = answer_tag_match.group(1).strip()
         return "answer", content
     
+    # Then check for <tool_call> tags (new format from Jinja2 template)
+    tool_call_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+    tool_call_match = re.search(tool_call_pattern, prediction, re.DOTALL)
+    if tool_call_match:
+        try:
+            import json
+            # Clean up the JSON string by removing newlines and extra whitespace
+            json_str = tool_call_match.group(1)
+            # Replace newlines in string values with \n
+            json_str = json_str.replace('\n', '\\n')
+            tool_call_data = json.loads(json_str)
+            tool_name = tool_call_data.get("name")
+            arguments = tool_call_data.get("arguments", {})
+            
+            if tool_name == "python":
+                code = arguments.get("code", "")
+                if code.strip():
+                    return "code", code
+        except (json.JSONDecodeError, KeyError, AttributeError):
+            pass
+    
     # Then check for <code> tags
     code_pattern = r"<code>(.*?)</code>"
     code_match = re.search(code_pattern, prediction, re.DOTALL)
@@ -352,6 +446,15 @@ def postprocess_predictions(prediction: str):
 
 def postprocess_responses(resp: str) -> str:
     """Post-process response to ensure tag completeness"""
+    # Handle <tool_call> tags (new format from Jinja2 template)
+    if "<tool_call>" in resp:
+        # Find the last occurrence of <tool_call>...</tool_call>
+        tool_call_pattern = r'<tool_call>\s*\{.*?\}\s*</tool_call>'
+        matches = list(re.finditer(tool_call_pattern, resp, re.DOTALL))
+        if matches:
+            last_match = matches[-1]
+            return resp[:last_match.end()]
+    
     # Handle <code> tags
     if "</code>" in resp:
         return resp.split("</code>")[0] + "</code>"
@@ -428,17 +531,19 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     tool_call_count = 0  # Track actual tool call rounds
     
     for turn in range(RETOOL_CONFIGS["max_turns"]):
-        # Build current input
-        current_input = prompt + response
-        
-        # Add tool specifications to prompt (if needed)
+        # Build current input using Jinja2 template
         if turn == 0:
+            # First turn: format with tools and system prompt
             tool_specs = tool_registry.get_tool_specs()
-            if tool_specs:
-                tools_info = "Available tools:\n"
-                for tool in tool_specs:
-                    tools_info += f"- {tool['name']}: {tool['description']}\n"
-                current_input = tools_info + "\n" + current_input
+            system_prompt = "You are a helpful assistant that can use Python tools to solve mathematical problems. When you need to perform calculations, use the Python tool to execute code and get results."
+            current_input = format_conversation_with_tools(
+                prompt=prompt,
+                tools=tool_specs,
+                system_prompt=system_prompt
+            )
+        else:
+            # Subsequent turns: append to existing conversation
+            current_input = prompt + response
         
         payload = {
             "text": current_input,
@@ -525,10 +630,26 @@ async def reward_func(args, sample, **kwargs):
     # Use math_dapo compute_score function
     result = math_dapo_compute_score(solution_str, ground_truth, strict_box_verify=True)
     
-    # Encourage model to call tools
-    if result["score"] < 0:
-        tool_call_reward = (num_turns - 2) / 2 * 0.1
-        result["score"] = min(-0.6, result["score"] + tool_call_reward)
+    # Improved tool call reward logic
+    base_score = result["score"]
+    
+    # Add tool call bonus for correct answers
+    if base_score > 0:  # Correct answer
+        # Encourage moderate tool usage (1-3 calls)
+        if 1 <= num_turns <= 3:
+            tool_bonus = 0.2
+        elif num_turns > 3:
+            tool_bonus = 0.1  # Diminishing returns
+        else:
+            tool_bonus = 0.0
+        result["score"] = base_score + tool_bonus
+    else:  # Incorrect answer
+        # Small penalty for no tool usage when wrong
+        if num_turns == 0:
+            result["score"] = base_score - 0.1
+        else:
+            # Small bonus for trying to use tools even when wrong
+            result["score"] = base_score + 0.05
     
     # Ensure pred is not None
     if result["pred"] is None:
