@@ -43,7 +43,7 @@ You can download required models and datasets from platforms like Hugging Face, 
 pip install -U huggingface_hub
 
 # Download model weights (GLM-Z1-9B)
-hf download THUDM/GLM-Z1-9B-0414 --local-dir /root/GLM-Z1-9B-0414
+hf download zai-org/GLM-Z1-9B-0414 --local-dir /root/GLM-Z1-9B-0414
 
 # Download training dataset (dapo-math-17k)
 hf download --repo-type dataset zhuzilin/dapo-math-17k \
@@ -370,7 +370,7 @@ And replace `--hf-checkpoint` with:
    --ref-load /root/Qwen3-4B_torch_dist
 ```
 
-This will trigger fp8 training. Currently, we will directly cast bf16 weights to fp8, and we will gradually add quantization schemes with less impact on accuracy in the future.
+This will trigger fp8 inference. Currently, we will directly cast bf16 weights to fp8, and we will gradually add quantization schemes with less impact on accuracy in the future.
 
 ⚠️ The training megatron checkpoint still needs to be the one converted from bf16 huggingface at the beginning.
 

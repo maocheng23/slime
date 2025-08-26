@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
-index 1b96ae678..3b7023c55 100644
+index bdb124e51..3edf30ab1 100644
 --- a/python/sglang/srt/configs/model_config.py
 +++ b/python/sglang/srt/configs/model_config.py
 @@ -454,14 +454,14 @@ class ModelConfig:
@@ -26,7 +26,7 @@ index 1b96ae678..3b7023c55 100644
              # Verify quantization configurations.
              if self.quantization is None:
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index a6bcb0b5b..1ef6abe72 100644
+index 2dd2c75f1..f2adb18f8 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
 @@ -264,6 +264,10 @@ async def validate_json_request(raw_request: Request):
@@ -53,7 +53,7 @@ index 372717bf9..40665cc90 100644
              group,
              num_nvl_bytes,
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index 956264fc9..7801d29d5 100644
+index 956264fc9..69f729336 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
 @@ -351,10 +351,10 @@ class Fp8LinearMethod(LinearMethodBase):
@@ -72,10 +72,10 @@ index 956264fc9..7801d29d5 100644
  
          layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 3856bf259..5f6a6570d 100644
+index 95a529c89..758fbfd5f 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -1346,7 +1346,7 @@ class Scheduler(
+@@ -1359,7 +1359,7 @@ class Scheduler(
  
          if memory_leak:
              msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
@@ -84,7 +84,7 @@ index 3856bf259..5f6a6570d 100644
  
          if self.disaggregation_mode == DisaggregationMode.DECODE:
              req_total_size = (
-@@ -1361,7 +1361,7 @@ class Scheduler(
+@@ -1374,7 +1374,7 @@ class Scheduler(
                  f"available_size={len(self.req_to_token_pool.free_slots)}, "
                  f"total_size={self.req_to_token_pool.size}\n"
              )
@@ -93,7 +93,7 @@ index 3856bf259..5f6a6570d 100644
  
          if (
              self.enable_metrics
-@@ -1817,6 +1817,7 @@ class Scheduler(
+@@ -1830,6 +1830,7 @@ class Scheduler(
              deepep_mode=DeepEPMode(self.server_args.deepep_mode),
              require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
              disable_overlap_schedule=self.server_args.disable_overlap_schedule,
@@ -101,7 +101,7 @@ index 3856bf259..5f6a6570d 100644
          )
  
      def handle_dp_balance_data(self, local_batch: ScheduleBatch):
-@@ -1914,6 +1915,7 @@ class Scheduler(
+@@ -1927,6 +1928,7 @@ class Scheduler(
          deepep_mode: DeepEPMode,
          require_mlp_tp_gather: bool,
          disable_overlap_schedule: bool,
@@ -109,7 +109,7 @@ index 3856bf259..5f6a6570d 100644
      ):
          # Check if other DP workers have running batches
          if local_batch is None:
-@@ -1944,7 +1946,7 @@ class Scheduler(
+@@ -1957,7 +1959,7 @@ class Scheduler(
          )
  
          tbo_preparer = TboDPAttentionPreparer()
@@ -119,10 +119,10 @@ index 3856bf259..5f6a6570d 100644
              device = tp_group.device
          else:
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 50ac39f88..33782a8cd 100644
+index 58220b1d6..3c3d081a8 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1045,10 +1045,15 @@ class TokenizerManager:
+@@ -1044,10 +1044,15 @@ class TokenizerManager:
          request: Optional[fastapi.Request] = None,
      ) -> Tuple[bool, str]:
          self.auto_create_handle_loop()
@@ -142,7 +142,7 @@ index 50ac39f88..33782a8cd 100644
          return result.success, result.message
  
      async def update_weights_from_distributed(
-@@ -1057,9 +1062,6 @@ class TokenizerManager:
+@@ -1056,9 +1061,6 @@ class TokenizerManager:
          request: Optional[fastapi.Request] = None,
      ) -> Tuple[bool, str]:
          self.auto_create_handle_loop()
@@ -152,7 +152,7 @@ index 50ac39f88..33782a8cd 100644
  
          if obj.abort_all_requests:
              self.abort_request(abort_all=True)
-@@ -1067,8 +1069,15 @@ class TokenizerManager:
+@@ -1066,8 +1068,15 @@ class TokenizerManager:
          # This means that weight sync
          # cannot run while requests are in progress.
          async with self.model_update_lock.writer_lock:
@@ -171,7 +171,7 @@ index 50ac39f88..33782a8cd 100644
      async def update_weights_from_tensor(
          self,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index ee83c2d9c..5145d7f78 100644
+index 5222bff0a..ff0bbc62a 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -22,6 +22,7 @@ import os
@@ -182,7 +182,7 @@ index ee83c2d9c..5145d7f78 100644
  
  import torch
  import torch.distributed as dist
-@@ -667,7 +668,7 @@ class ModelRunner:
+@@ -675,7 +676,7 @@ class ModelRunner:
          monkey_patch_vllm_parallel_state()
          monkey_patch_isinstance_for_vllm_base_layer()
  
@@ -192,7 +192,7 @@ index ee83c2d9c..5145d7f78 100644
                  model_config=self.model_config,
                  load_config=self.load_config,
 diff --git a/python/sglang/srt/models/glm4_moe.py b/python/sglang/srt/models/glm4_moe.py
-index 67ef6ca79..1a3db9974 100644
+index e0f0b373d..a18ac10f1 100644
 --- a/python/sglang/srt/models/glm4_moe.py
 +++ b/python/sglang/srt/models/glm4_moe.py
 @@ -1108,5 +1108,4 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):

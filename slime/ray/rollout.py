@@ -105,6 +105,9 @@ def create_rollout_engines(args, pg):
     init_handles = [engine.init.remote(**ports) for engine, ports in zip(rollout_engines, addr_and_ports)]
     ray.get(init_handles)
 
+    if args.offload:
+        ray.get([engine.release_memory_occupation.remote() for engine in rollout_engines])
+
     return rollout_engines
 
 

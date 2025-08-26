@@ -6,8 +6,8 @@
 
 由于 slime 可能会包含针对 sglang/megatron 的临时补丁（patch）。为避免潜在的环境配置问题，强烈建议**用户使用我们提供的最新 Docker 镜像**，它已预置好所有依赖。
 
-- 对于不方便使用 docker 的场景，请参考 [从零搭建环境](./docs/zh/build.md)；
-- 对于 AMD 支持，请参考 [AMD 使用教程](./docs/en/amd_tutorial.md)。
+- 对于不方便使用 docker 的场景，请参考 [从零搭建环境](./build.md)；
+- 对于 AMD 支持，请参考 [AMD 使用教程](../en/amd_tutorial.md)。
 
 ### 拉取并启动 Docker 容器
 
@@ -44,7 +44,7 @@ pip install -e .
 pip install -U huggingface_hub
 
 # 下载模型权重 (GLM-Z1-9B)
-hf download THUDM/GLM-Z1-9B-0414 --local-dir /root/GLM-Z1-9B-0414
+hf download zai-org/GLM-Z1-9B-0414 --local-dir /root/GLM-Z1-9B-0414
 
 # 下载训练数据集 (dapo-math-17k)
 hf download --repo-type dataset zhuzilin/dapo-math-17k \
@@ -264,7 +264,7 @@ OPTIMIZER_ARGS=(
 - 其他 SGLang 参数可以通过添加 `--sglang-` 前缀传递给 slime,  slime 会自动透传给 SGLang。例如，要设置 SGLang 的 `--log-level INFO` 参数，只需使用 `--sglang-log-level INFO` 即可。
 
 > ⚠️ **注意**：
-> slime 使用 `sgl-router` 调度多个 SGLang Server。在不开启 DP Attention 的情况下， `dp_size` 会通过 `rollout-num-gpus/rollout-num-gpus-per-engine` 计算得到。
+> slime 使用 `sgl-router` 调度多个 SGLang Server。在不开启 DP Attention 的情况下， `dp_size` 会通过 `rollout-num-gpus / rollout-num-gpus-per-engine` 计算得到。
 
 ```bash
 SGLANG_ARGS=(
@@ -306,6 +306,8 @@ ray job submit ... \
 > ⚠️ **注意**：
 > 在训推一体化模式下，Megatron 初始化后才能被 offload 掉，会占据一定量的显存。您需要通过调整 `--sglang-mem-fraction-static` 参数来降低 SGLang 的显存占用比例，以避免显存不足。通常我们建议为 0.8。
 
+> 此外，[torch_memory_saver](https://github.com/fzyzcjy/torch_memory_saver) 里面的一些优化只能在训推一体模式中使用，因为需要释放 GPU 显存。训推分离模式暂不支持。
+
 ### Dynamic Sampling
 
 slime 支持更复杂的采样策略，例如 [DAPO](https://dapo-sia.github.io/) 中使用的动态采样。要启用此功能，需配置以下参数：
@@ -316,7 +318,7 @@ slime 支持更复杂的采样策略，例如 [DAPO](https://dapo-sia.github.io/
      slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
 ```
 
-这里 `over_sampling_batch_size` 需要大于 ``rollout_batch_size`，例如配置为：
+这里 `over_sampling_batch_size` 需要大于 `rollout_batch_size`，例如配置为：
 
 ```bash
    --rollout-batch-size 32 \
@@ -375,7 +377,7 @@ hf download Qwen/Qwen3-4B-FP8 --local-dir /root/Qwen3-4B-FP8
    --ref-load /root/Qwen3-4B_torch_dist
 ```
 
-即可触发 fp8 训练。目前我们会将 bf16 权重直接 cast 为 fp8，后续会逐渐添加对精度影响更小的量化方案。
+即可触发 fp8 推理。目前我们会将 bf16 权重直接 cast 为 fp8，后续会逐渐添加对精度影响更小的量化方案。
 
 ⚠️  训练的 megatron checkpoint 还需要是最开始用 bf16 的 huggingface 转换的。
 
@@ -517,6 +519,6 @@ ROLLOUT_ARGS+=(
 ## 大规模 MOE 模型的多机训练
 slime 针对大规模混合专家（MoE）模型的分布式训练进行了深度优化。我们提供了一些端到端的训练案例以供参考：
 
-- [示例：64xH100 训练 GLM-4.5](docs/zh/models/glm4.5-355B-A32B.md)
-- [示例：8xH100 训练 Qwen3-30B-A3B](docs/zh/models/qwen3-30B-A3B.md)
-- [示例：128xH100 训练 DeepSeek-R1](docs/zh/models/deepseek-r1.md)
+- [示例：64xH100 训练 GLM-4.5](models/glm4.5-355B-A32B.md)
+- [示例：8xH100 训练 Qwen3-30B-A3B](models/qwen3-30B-A3B.md)
+- [示例：128xH100 训练 DeepSeek-R1](models/deepseek-r1.md)
