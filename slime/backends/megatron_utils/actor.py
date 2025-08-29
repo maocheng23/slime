@@ -36,6 +36,10 @@ class MegatronTrainRayActor(TrainRayActor):
     def init(self, args, role, wandb_run_id, with_ref=False):
         super().init(args, role, with_ref)
 
+        if self.args.debug_rollout_only:
+            Timer().start("train_wait")
+            return 0
+
         init(args)
 
         if is_megatron_main_rank():
@@ -47,10 +51,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
-
-        if self.args.debug_rollout_only:
-            Timer().start("train_wait")
-            return 0
 
         (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = initialize_model_and_optimizer(
             args
@@ -200,6 +200,9 @@ class MegatronTrainRayActor(TrainRayActor):
     def train(self, rollout_id, rollout_data_ref):
         Timer().end("train_wait")
 
+        if self.args.offload:
+            self.wake_up(("model"))
+
         if self.args.debug_rollout_only:
             # For debug rollout, we just log the data and return.
             rollout_data = self._get_rollout_data(rollout_data_ref)
@@ -207,9 +210,6 @@ class MegatronTrainRayActor(TrainRayActor):
             log_perf_data(rollout_id, self.args)
             Timer().start("train_wait")
             return
-
-        if self.args.offload:
-            self.wake_up(("model"))
 
         with timer("train"):
             with timer("data_preprocess"):
@@ -344,6 +344,11 @@ class MegatronTrainRayActor(TrainRayActor):
         self.args.no_load_optim = True
         self.args.no_load_rng = True
         self.args.finetune = True
+
+        if model_tag == "ref" and self.args.ref_ckpt_step is not None:
+            old_ckpt_step = self.args.ckpt_step
+            self.args.ckpt_step = self.args.ref_ckpt_step
+
         _, _ = load_checkpoint(
             self.model,
             None,
@@ -352,6 +357,9 @@ class MegatronTrainRayActor(TrainRayActor):
             skip_load_to_model_and_opt=False,
         )
         self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+
+        if model_tag == "ref" and self.args.ref_ckpt_step is not None:
+            self.args.ckpt_step = old_ckpt_step
 
         self.weights[model_tag] = {}
         self.update_cpu_params_dict(self.weights[model_tag])

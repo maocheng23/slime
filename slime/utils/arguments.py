@@ -496,6 +496,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "When --load is not set, this will be used as the initial checkpoint for training. "
                 ),
             )
+            parser.add_argument(
+                "--ref-ckpt-step", type=int, default=None, help="The checkpoint step for reference model. "
+            )
             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
             parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
             parser.add_argument(
@@ -587,16 +590,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
             parser.add_argument(
-                "--enable-off-policy-correction",
+                "--use-tis",
                 action="store_true",
                 default=False,
-                help="Enable off-policy correction using importance sampling with rollout log probabilities.",
+                help="Enable TIS from https://fengyao.notion.site/off-policy-rl for off-policy importance sampling.",
             )
             parser.add_argument(
-                "--off-policy-correction-clip-threshold",
+                "--tis-clip",
                 type=float,
                 default=2.0,
                 help="Clipping threshold C for importance sampling ratios to control variance.",
+            )
+            parser.add_argument(
+                "--tis-clip-low",
+                type=float,
+                default=0,
+                help="Lower bound clipping threshold C for importance sampling ratios to control variance.",
             )
             return parser
 
@@ -826,6 +835,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_ci_arguments(parser):
+            parser.add_argument(
+                "--ci-test",
+                action="store_true",
+            )
+            return parser
+
         # Add custom arguments in front to prevent overwritten some slime arguments.
         if add_custom_arguments is not None:
             parser = add_custom_arguments(parser)
@@ -842,6 +858,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        parser = add_ci_arguments(parser)
         # For megatron
         try:
             parser.add_argument("--padded-vocab-size", type=int, default=None)
@@ -890,6 +907,8 @@ def parse_args(add_custom_arguments=None):
         args.no_load_rng = True
         args.finetune = True
         args.load = args.ref_load
+        if args.ref_ckpt_step is not None:
+            args.ckpt_step = args.ref_ckpt_step
         args.start_rollout_id = 0
 
     if args.eval_interval is not None:
@@ -996,7 +1015,8 @@ def parse_args(add_custom_arguments=None):
             "num_epoch is not set, but num_rollout is not set, " "please set --num-rollout or --num-epoch"
         )
 
-    megatron_validate_args(args)
+    if not args.debug_rollout_only:
+        megatron_validate_args(args)
 
     # always use varlen
     args.variable_seq_lengths = True

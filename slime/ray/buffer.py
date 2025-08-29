@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 from typing import Union
+from time import time
 import wandb
 
 import ray
@@ -14,25 +15,6 @@ from slime.utils.wandb_utils import init_wandb_secondary
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-
-def log_eval_data(rollout_id, args, data):
-    log_dict = {}
-    for key in data.keys():
-        rewards = data[key]["rewards"]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
-        if "truncated" in data[key]:
-            truncated = data[key]["truncated"]
-            log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
-
-    print(f"eval {rollout_id}: {log_dict}")
-    if args.use_wandb:
-        log_dict["eval/step"] = (
-            rollout_id
-            if not args.wandb_always_use_train_step
-            else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
-        )
-        wandb.log(log_dict)
 
 
 @ray.remote
@@ -60,6 +42,7 @@ class RolloutController:
     def generate(self, rollout_id):
         self.rollout_id = rollout_id
 
+        start_time = time()
         if self.args.load_debug_rollout_data:
             data = torch.load(
                 open(self.args.load_debug_rollout_data.format(rollout_id=rollout_id), "rb"),
@@ -85,6 +68,7 @@ class RolloutController:
                 path,
             )
         data = self._convert_samples_to_train_data(data)
+        log_rollout_data(rollout_id, self.args, data, time() - start_time)
         return Box(ray.put(data))
 
     def eval(self, rollout_id):
@@ -174,3 +158,41 @@ class RolloutController:
 
     def load(self, rollout_id=None):
         self.data_source.load(rollout_id)
+
+
+def log_eval_data(rollout_id, args, data):
+    log_dict = {}
+    for key in data.keys():
+        rewards = data[key]["rewards"]
+        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        if "truncated" in data[key]:
+            truncated = data[key]["truncated"]
+            log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
+
+    print(f"eval {rollout_id}: {log_dict}")
+    if args.use_wandb:
+        log_dict["eval/step"] = (
+            rollout_id
+            if not args.wandb_always_use_train_step
+            else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+        )
+        wandb.log(log_dict)
+
+
+def log_rollout_data(rollout_id, args, data, rollout_time):
+    if args.load_debug_rollout_data:
+        return
+
+    log_dict = {}
+    response_lengths = [sum(loss_mask) for loss_mask in data["loss_masks"]]
+    log_dict["perf/rollout_time"] = rollout_time
+    log_dict["perf/tokens_per_gpu_per_sec"] = sum(response_lengths) / rollout_time / args.rollout_num_gpus
+    log_dict["perf/longest_sample_tokens_per_sec"] = max(response_lengths) / rollout_time
+    print(f"perf {rollout_id}: {log_dict}")
+    if args.use_wandb:
+        log_dict["rollout/step"] = (
+            rollout_id
+            if not args.wandb_always_use_train_step
+            else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+        )
+        wandb.log(log_dict)
