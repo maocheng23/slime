@@ -6,6 +6,9 @@ import slime.utils.external_utils.command_utils as U
 MODEL_NAME = os.environ.get("SLIME_SCRIPT_MODEL_NAME", "Qwen3-0.6B")
 assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
 
+MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-0.6B")
+assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
+
 MODE = os.environ.get("SLIME_SCRIPT_MODE", "normal")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
@@ -16,6 +19,9 @@ def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
     U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/gsm8k")
+    U.convert_checkpoint(
+        model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=NUM_GPUS, dir_dst="/root/models"
+    )
 
 
 def execute():
@@ -134,7 +140,7 @@ def execute():
     U.execute_train(
         train_args=train_args,
         num_gpus_per_node=NUM_GPUS,
-        megatron_model_type=None,
+        megatron_model_type=MODEL_TYPE,
         extra_env_vars={
             **true_on_policy_envs,
             "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
