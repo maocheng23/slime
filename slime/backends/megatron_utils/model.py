@@ -227,12 +227,21 @@ def forward_only(
                 dumper.add_input_ids(tokens)
                 # Set response start position based on total_lengths - response_lengths
                 # This is the position where response starts in the sequence
+                logger.info(f"[Debug] tokens shape: {tokens.shape}")
+                logger.info(f"[Debug] total_lengths: {total_lengths}")
+                logger.info(f"[Debug] response_lengths: {response_lengths}")
                 if total_lengths is not None and response_lengths is not None:
                     # Use the first sample's response start position
                     prompt_len = total_lengths[0] - response_lengths[0]
+                    # Also record these in the dump for analysis
+                    dumper._current_tensors["debug_prompt_len"] = torch.tensor([prompt_len])
+                    dumper._current_tensors["debug_total_len"] = torch.tensor([total_lengths[0]])
+                    dumper._current_tensors["debug_response_len"] = torch.tensor([response_lengths[0]])
                     dumper.set_response_start_position(int(prompt_len))
                     logger.info(f"[Debug] Response starts at position {prompt_len}, "
                                f"total_len={total_lengths[0]}, response_len={response_lengths[0]}")
+                else:
+                    logger.warning("[Debug] total_lengths or response_lengths is None, using position 0")
         
         output_tensor = model(
             input_ids=tokens,

@@ -132,12 +132,21 @@ class MegatronTensorDumper:
         """
         hooks_registered = 0
 
-        # Hook embedding layer
+        # Hook embedding layer - we need to hook the actual word_embeddings,
+        # not the full LanguageModelEmbedding which includes transpose and dropout
         embedding = getattr(model, 'embedding', None)
         if embedding is not None:
-            embedding.register_forward_hook(self._create_named_hook("model.embed_tokens"))
-            hooks_registered += 1
-            logger.info("[MegatronTensorDumper] Hooked embedding layer")
+            # Try to hook the inner word_embeddings for direct comparison with SGLang
+            word_embeddings = getattr(embedding, 'word_embeddings', None)
+            if word_embeddings is not None:
+                word_embeddings.register_forward_hook(self._create_named_hook("model.embed_tokens"))
+                hooks_registered += 1
+                logger.info("[MegatronTensorDumper] Hooked embedding.word_embeddings layer")
+            else:
+                # Fall back to the full embedding layer
+                embedding.register_forward_hook(self._create_named_hook("model.embed_tokens"))
+                hooks_registered += 1
+                logger.info("[MegatronTensorDumper] Hooked embedding layer (fallback)")
 
         # Hook output layer (lm_head)
         output_layer = getattr(model, 'output_layer', None)

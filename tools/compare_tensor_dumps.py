@@ -33,6 +33,83 @@ def find_dump_files(dump_dir: str, pass_id: int) -> list[Path]:
     return sorted(files)
 
 
+def list_all_passes(dump_dir: str) -> list[tuple[int, Path]]:
+    """List all available pass files with their IDs."""
+    dump_path = Path(dump_dir)
+    if not dump_path.exists():
+        return []
+    
+    passes = []
+    for f in dump_path.glob("*/Pass*.pt"):
+        # Extract pass ID from filename like "Pass00000.pt"
+        name = f.stem
+        if name.startswith("Pass"):
+            try:
+                pass_id = int(name[4:])
+                passes.append((pass_id, f))
+            except ValueError:
+                continue
+    return sorted(passes, key=lambda x: x[0])
+
+
+def get_token_from_dump(dump_file: Path) -> tuple[int | None, int | None]:
+    """Extract (token_id, position) from a dump file."""
+    tensors = torch.load(dump_file, map_location="cpu")
+    
+    token_id = None
+    position = None
+    
+    # SGLang format
+    if "model.forward_batch_info.input_ids" in tensors:
+        ids = tensors["model.forward_batch_info.input_ids"]
+        if ids.numel() > 0:
+            token_id = ids.flatten()[0].item()
+    if "model.forward_batch_info.positions" in tensors:
+        pos = tensors["model.forward_batch_info.positions"]
+        if pos.numel() > 0:
+            position = pos.flatten()[0].item()
+    
+    # Megatron format
+    if "megatron_compared_token_id" in tensors:
+        ids = tensors["megatron_compared_token_id"]
+        if ids.numel() > 0:
+            token_id = ids.item()
+    if "megatron_compared_position" in tensors:
+        pos = tensors["megatron_compared_position"]
+        if pos.numel() > 0:
+            position = pos.item()
+    
+    return token_id, position
+
+
+def find_matching_sglang_pass(sglang_dir: str, target_token: int, target_position: int | None = None) -> int | None:
+    """Find a SGLang pass that has the matching token (and optionally position)."""
+    passes = list_all_passes(sglang_dir)
+    
+    print(f"\n[Auto-matching] Looking for SGLang pass with token={target_token}, position={target_position}")
+    print(f"  Found {len(passes)} SGLang passes:")
+    
+    matching_passes = []
+    for pass_id, path in passes[:20]:  # Show first 20
+        token_id, position = get_token_from_dump(path)
+        marker = ""
+        if token_id == target_token:
+            if target_position is None or position == target_position:
+                matching_passes.append(pass_id)
+                marker = " <-- MATCH!"
+        print(f"    Pass {pass_id:5d}: token={token_id}, position={position}{marker}")
+    
+    if len(passes) > 20:
+        print(f"    ... and {len(passes) - 20} more passes")
+    
+    if matching_passes:
+        print(f"\n  ✓ Found {len(matching_passes)} matching pass(es): {matching_passes}")
+        return matching_passes[0]  # Return first match
+    else:
+        print(f"\n  ✗ No matching pass found!")
+        return None
+
+
 def load_tensors(dump_file: Path) -> dict[str, torch.Tensor]:
     """Load tensors from a dump file."""
     return torch.load(dump_file, map_location="cpu")
@@ -355,24 +432,69 @@ def main():
     parser.add_argument("--sglang-dir", type=str, required=True, help="SGLang tensor dump directory")
     parser.add_argument("--megatron-dir", type=str, required=True, help="Megatron tensor dump directory")
     parser.add_argument("--pass-id", type=int, default=0, help="Forward pass ID to compare (default: 0)")
+    parser.add_argument("--sglang-pass-id", type=int, default=None, help="Override SGLang pass ID (default: same as --pass-id)")
+    parser.add_argument("--auto-match", action="store_true", help="Auto-find SGLang pass that matches Megatron's token")
+    parser.add_argument("--list-passes", action="store_true", help="List all available passes and exit")
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
     args = parser.parse_args()
     
-    print(f"Comparing tensor dumps for pass {args.pass_id}")
-    print(f"  SGLang dir:   {args.sglang_dir}")
-    print(f"  Megatron dir: {args.megatron_dir}")
+    # List passes mode
+    if args.list_passes:
+        print("SGLang passes:")
+        sglang_passes = list_all_passes(args.sglang_dir)
+        for pass_id, path in sglang_passes[:30]:
+            token_id, position = get_token_from_dump(path)
+            print(f"  Pass {pass_id:5d}: token={token_id}, position={position}")
+        if len(sglang_passes) > 30:
+            print(f"  ... and {len(sglang_passes) - 30} more")
+        
+        print("\nMegatron passes:")
+        megatron_passes = list_all_passes(args.megatron_dir)
+        for pass_id, path in megatron_passes[:30]:
+            token_id, position = get_token_from_dump(path)
+            print(f"  Pass {pass_id:5d}: token={token_id}, position={position}")
+        if len(megatron_passes) > 30:
+            print(f"  ... and {len(megatron_passes) - 30} more")
+        sys.exit(0)
+    
+    # Determine which pass IDs to use
+    megatron_pass_id = args.pass_id
+    sglang_pass_id = args.sglang_pass_id if args.sglang_pass_id is not None else args.pass_id
+    
+    # Load Megatron first to get the target token for auto-matching
+    megatron_files = find_dump_files(args.megatron_dir, megatron_pass_id)
+    if not megatron_files:
+        print(f"\nError: No Megatron dump files found for pass {megatron_pass_id}")
+        print(f"  Looking in: {args.megatron_dir}/*/Pass{megatron_pass_id:05d}.pt")
+        sys.exit(1)
+    
+    # Auto-match mode: find SGLang pass with matching token
+    if args.auto_match:
+        megatron_token, megatron_pos = get_token_from_dump(megatron_files[0])
+        if megatron_token is not None:
+            matched_pass = find_matching_sglang_pass(args.sglang_dir, megatron_token, megatron_pos)
+            if matched_pass is not None:
+                sglang_pass_id = matched_pass
+                print(f"\n[Auto-match] Using SGLang pass {sglang_pass_id} (matches Megatron token {megatron_token})")
+            else:
+                print(f"\n[Auto-match] Could not find matching pass, using pass {sglang_pass_id}")
+        else:
+            print(f"\n[Auto-match] Could not extract Megatron token, using pass {sglang_pass_id}")
+    
+    print(f"\nComparing tensor dumps:")
+    print(f"  SGLang:   pass {sglang_pass_id} from {args.sglang_dir}")
+    print(f"  Megatron: pass {megatron_pass_id} from {args.megatron_dir}")
     
     # Find dump files
-    sglang_files = find_dump_files(args.sglang_dir, args.pass_id)
-    megatron_files = find_dump_files(args.megatron_dir, args.pass_id)
+    sglang_files = find_dump_files(args.sglang_dir, sglang_pass_id)
     
     if not sglang_files:
-        print(f"\nError: No SGLang dump files found for pass {args.pass_id}")
-        print(f"  Looking in: {args.sglang_dir}/*/Pass{args.pass_id:05d}.pt")
+        print(f"\nError: No SGLang dump files found for pass {sglang_pass_id}")
+        print(f"  Looking in: {args.sglang_dir}/*/Pass{sglang_pass_id:05d}.pt")
         sys.exit(1)
     
     if not megatron_files:
-        print(f"\nError: No Megatron dump files found for pass {args.pass_id}")
+        print(f"\nError: No Megatron dump files found for pass {megatron_pass_id}")
         print(f"  Looking in: {args.megatron_dir}/*/Pass{args.pass_id:05d}.pt")
         sys.exit(1)
     
@@ -415,6 +537,13 @@ def main():
         input_ids = megatron_tensors["megatron_input_ids"]
         flat = input_ids.flatten()[:10]
         print(f"  Megatron input_ids (first 10): {flat.tolist()}")
+    
+    # Show sequence length debug info
+    if "debug_prompt_len" in megatron_tensors:
+        print(f"\n  Debug info from Megatron:")
+        print(f"    prompt_len: {megatron_tensors['debug_prompt_len'].item()}")
+        print(f"    total_len: {megatron_tensors['debug_total_len'].item()}")
+        print(f"    response_len: {megatron_tensors['debug_response_len'].item()}")
     
     # Check if tokens match
     if sglang_token is not None and megatron_token is not None:
