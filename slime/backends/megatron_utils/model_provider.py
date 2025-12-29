@@ -23,14 +23,28 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
 
     SGLang computes: logits = matmul(hidden_states.bfloat16(), lm_head.weight.T.bfloat16())
     This layer replicates that behavior for true on-policy mode.
+
+    This wrapper is transparent to checkpointing - it delegates all state dict
+    operations to the original layer so checkpoints work correctly.
     """
 
     def __init__(self, original_output_layer):
         super().__init__()
-        self.original_layer = original_output_layer
-        # Copy attributes that may be accessed
-        self.weight = original_output_layer.weight
-        self.sequence_parallel = getattr(original_output_layer, 'sequence_parallel', False)
+        # Store as _original_layer to avoid it being registered as a submodule
+        # We'll handle state dict manually
+        object.__setattr__(self, '_original_layer', original_output_layer)
+
+    @property
+    def weight(self):
+        return self._original_layer.weight
+
+    @property
+    def bias(self):
+        return getattr(self._original_layer, 'bias', None)
+
+    @property
+    def sequence_parallel(self):
+        return getattr(self._original_layer, 'sequence_parallel', False)
 
     def forward(
         self,
@@ -44,7 +58,46 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
             weight_bf16 = weight.to(torch.bfloat16)
         else:
             weight_bf16 = None
-        return self.original_layer(input_bf16, weight=weight_bf16, runtime_gather_output=runtime_gather_output)
+        return self._original_layer(input_bf16, weight=weight_bf16, runtime_gather_output=runtime_gather_output)
+
+    # Delegate all state dict operations to the original layer for checkpoint compatibility
+    def state_dict(self, *args, **kwargs):
+        return self._original_layer.state_dict(*args, **kwargs)
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        return self._original_layer.load_state_dict(state_dict, *args, **kwargs)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        return self._original_layer._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
+    def named_parameters(self, *args, **kwargs):
+        return self._original_layer.named_parameters(*args, **kwargs)
+
+    def parameters(self, *args, **kwargs):
+        return self._original_layer.parameters(*args, **kwargs)
+
+    def named_buffers(self, *args, **kwargs):
+        return self._original_layer.named_buffers(*args, **kwargs)
+
+    def buffers(self, *args, **kwargs):
+        return self._original_layer.buffers(*args, **kwargs)
+
+    # Delegate sharded_state_dict for distributed checkpointing
+    def sharded_state_dict(self, *args, **kwargs):
+        if hasattr(self._original_layer, 'sharded_state_dict'):
+            return self._original_layer.sharded_state_dict(*args, **kwargs)
+        return {}
+
+    # Delegate any other attribute access to the original layer
+    def __getattr__(self, name):
+        if name == '_original_layer':
+            return object.__getattribute__(self, '_original_layer')
+        try:
+            return getattr(self._original_layer, name)
+        except AttributeError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 
 class LinearForLastLayer(torch.nn.Linear):
