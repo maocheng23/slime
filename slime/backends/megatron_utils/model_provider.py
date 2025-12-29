@@ -18,6 +18,35 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
+class SGLangCompatibleOutputLayer(torch.nn.Module):
+    """Output layer that matches SGLang's BF16 numerical path.
+
+    SGLang computes: logits = matmul(hidden_states.bfloat16(), lm_head.weight.T.bfloat16())
+    This layer replicates that behavior for true on-policy mode.
+    """
+
+    def __init__(self, original_output_layer):
+        super().__init__()
+        self.original_layer = original_output_layer
+        # Copy attributes that may be accessed
+        self.weight = original_output_layer.weight
+        self.sequence_parallel = getattr(original_output_layer, 'sequence_parallel', False)
+
+    def forward(
+        self,
+        input_: torch.Tensor,
+        weight: torch.Tensor | None = None,
+        runtime_gather_output: bool | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        # Cast input and weight to BF16 to match SGLang
+        input_bf16 = input_.to(torch.bfloat16)
+        if weight is not None:
+            weight_bf16 = weight.to(torch.bfloat16)
+        else:
+            weight_bf16 = None
+        return self.original_layer(input_bf16, weight=weight_bf16, runtime_gather_output=runtime_gather_output)
+
+
 class LinearForLastLayer(torch.nn.Linear):
     def __init__(
         self,
@@ -174,6 +203,11 @@ def get_model_provider_func(
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+
+        # Wrap output_layer for true on-policy mode to match SGLang's BF16 numerical paths
+        if post_process and role == "actor" and getattr(args, "true_on_policy_mode", False):
+            model.output_layer = SGLangCompatibleOutputLayer(model.output_layer)
+            print("[True On-Policy] Wrapped output_layer with SGLang-compatible BF16 layer")
 
         return model
 
