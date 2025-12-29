@@ -224,9 +224,7 @@ def forward_only(
             from slime.backends.megatron_utils.debug_tensor_dump import get_megatron_tensor_dumper
             dumper = get_megatron_tensor_dumper()
             if dumper is not None:
-                dumper.add_input_ids(tokens)
-                # Set response start position based on total_lengths - response_lengths
-                # This is the position where response starts in the sequence
+                # Set response start position FIRST, before add_input_ids
                 logger.info(f"[Debug] tokens shape: {tokens.shape}")
                 logger.info(f"[Debug] total_lengths: {total_lengths}")
                 logger.info(f"[Debug] response_lengths: {response_lengths}")
@@ -242,6 +240,9 @@ def forward_only(
                                f"total_len={total_lengths[0]}, response_len={response_lengths[0]}")
                 else:
                     logger.warning("[Debug] total_lengths or response_lengths is None, using position 0")
+                    dumper.set_response_start_position(0)
+                # Now add_input_ids will use the correct response_start_pos
+                dumper.add_input_ids(tokens)
         
         output_tensor = model(
             input_ids=tokens,

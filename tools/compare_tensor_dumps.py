@@ -83,28 +83,55 @@ def get_token_from_dump(dump_file: Path) -> tuple[int | None, int | None]:
 
 
 def find_matching_sglang_pass(sglang_dir: str, target_token: int, target_position: int | None = None) -> int | None:
-    """Find a SGLang pass that has the matching token (and optionally position)."""
+    """Find a SGLang pass that has the matching token (and optionally position).
+    
+    Prefers decode passes (single token) over prefill passes (multiple tokens).
+    """
     passes = list_all_passes(sglang_dir)
     
     print(f"\n[Auto-matching] Looking for SGLang pass with token={target_token}, position={target_position}")
     print(f"  Found {len(passes)} SGLang passes:")
     
-    matching_passes = []
+    matching_decode_passes = []  # Prefer decode passes (seq_len=1)
+    matching_prefill_passes = []  # Fallback to prefill passes
+    
     for pass_id, path in passes[:20]:  # Show first 20
+        tensors = torch.load(path, map_location="cpu")
         token_id, position = get_token_from_dump(path)
+        
+        # Check if this is a decode pass (single token) or prefill (multiple tokens)
+        seq_lens = None
+        if "model.forward_batch_info.seq_lens" in tensors:
+            seq_lens = tensors["model.forward_batch_info.seq_lens"]
+            if seq_lens.numel() > 0:
+                seq_lens = seq_lens.item()
+        
+        is_decode = seq_lens == 1 if seq_lens is not None else False
+        
         marker = ""
         if token_id == target_token:
             if target_position is None or position == target_position:
-                matching_passes.append(pass_id)
-                marker = " <-- MATCH!"
-        print(f"    Pass {pass_id:5d}: token={token_id}, position={position}{marker}")
+                if is_decode:
+                    matching_decode_passes.append(pass_id)
+                    marker = " <-- MATCH (decode)!"
+                else:
+                    matching_prefill_passes.append(pass_id)
+                    marker = " <-- MATCH (prefill)!"
+        
+        pass_type = "decode" if is_decode else f"prefill(seq_len={seq_lens})"
+        print(f"    Pass {pass_id:5d}: token={token_id}, position={position}, type={pass_type}{marker}")
     
     if len(passes) > 20:
         print(f"    ... and {len(passes) - 20} more passes")
     
-    if matching_passes:
-        print(f"\n  ✓ Found {len(matching_passes)} matching pass(es): {matching_passes}")
-        return matching_passes[0]  # Return first match
+    # Prefer decode passes
+    if matching_decode_passes:
+        print(f"\n  ✓ Found {len(matching_decode_passes)} matching decode pass(es): {matching_decode_passes}")
+        return matching_decode_passes[0]
+    elif matching_prefill_passes:
+        print(f"\n  ⚠ Found {len(matching_prefill_passes)} matching prefill pass(es): {matching_prefill_passes}")
+        print(f"     Note: Prefill passes process multiple tokens. Comparison may be less accurate.")
+        return matching_prefill_passes[0]
     else:
         print(f"\n  ✗ No matching pass found!")
         return None
