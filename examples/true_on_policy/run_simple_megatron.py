@@ -9,7 +9,7 @@ assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
 MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-0.6B")
 assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
 
-MODE = os.environ.get("SLIME_SCRIPT_MODE", "normal")
+MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
 NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "1"))
@@ -25,7 +25,7 @@ def prepare():
 
 
 def execute():
-    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
+    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}_torch_dist "
 
     rollout_args = (
         "--prompt-data /root/datasets/gsm8k/train.parquet "
@@ -117,8 +117,8 @@ def execute():
     )
     true_on_policy_envs = {
         # TODO note: "Ring" in original RL PR, "allreduce:tree" in SGLang
-        # "NCCL_ALGO": "Ring",
-        "NCCL_ALGO": "allreduce:tree",
+        "NCCL_ALGO": "Ring",
+        # "NCCL_ALGO": "allreduce:tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     }
