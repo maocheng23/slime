@@ -102,12 +102,15 @@ def get_model_provider_func(
             else:
                 # Define the decoder layer spec
                 if use_te:
+                    print(f"use_sglang: {args.use_sglang}, use_sglang_attention: {args.use_sglang_attention}")
                     transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
                         num_experts=args.num_experts,
                         moe_grouped_gemm=args.moe_grouped_gemm,
                         qk_layernorm=args.qk_layernorm,
                         multi_latent_attention=args.multi_latent_attention,
                         moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+                        use_sglang = args.use_sglang,
+                        use_sglang_attention = args.use_sglang_attention,
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
