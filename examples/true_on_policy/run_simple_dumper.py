@@ -70,8 +70,9 @@ def execute():
         "--adam-beta2 0.98 "
     )
 
-    # Tensor dump directory for debug_one_sample mode
-    tensor_dump_dir = "/tmp/sglang_tensor_dump" if MODE == "debug_one_sample" else ""
+    # Tensor dump directories for debug_one_sample mode
+    sglang_tensor_dump_dir = "/tmp/sglang_tensor_dump" if MODE == "debug_one_sample" else ""
+    fsdp_tensor_dump_dir = "/tmp/fsdp_tensor_dump" if MODE == "debug_one_sample" else ""
 
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "
@@ -80,7 +81,7 @@ def execute():
         f"--sglang-mem-fraction-static {0.2 if MODEL_NAME == 'Qwen3-4B' else 0.4} "
         f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
         # Enable tensor dump for layer-by-layer comparison
-        f"{'--sglang-debug-tensor-dump-output-folder ' + tensor_dump_dir + ' ' if MODE == 'debug_one_sample' else ''}"
+        f"{'--sglang-debug-tensor-dump-output-folder ' + sglang_tensor_dump_dir + ' ' if MODE == 'debug_one_sample' else ''}"
         f"{'--sglang-debug-tensor-dump-layers 0 1 2 ' if MODE == 'debug_one_sample' else ''}"  # Dump first 3 layers
     )
 
@@ -145,6 +146,9 @@ def execute():
             **true_on_policy_envs,
             "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
             "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
+            # FSDP tensor dump for layer-by-layer comparison
+            "FSDP_TENSOR_DUMP_DIR": fsdp_tensor_dump_dir if MODE == "debug_one_sample" else "",
+            "FSDP_TENSOR_DUMP_LAYERS": "0,1,2" if MODE == "debug_one_sample" else "",  # Dump first 3 layers
         },
     )
 

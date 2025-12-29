@@ -114,6 +114,12 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.model = model
 
+        # Register tensor dump hooks if enabled
+        if os.environ.get("FSDP_TENSOR_DUMP_DIR", ""):
+            from slime.backends.fsdp_utils.debug_tensor_dump import register_fsdp_tensor_hooks
+            register_fsdp_tensor_hooks(self.model)
+            logger.info(f"[FSDP] Registered tensor dump hooks for model (role={role})")
+
         if args.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
@@ -591,7 +597,39 @@ class FSDPTrainRayActor(TrainRayActor):
     def _train_step(self, packed_batch, reported_accum, mbs_id, grad_accum):
         # Prepare model inputs
         model_args = self._get_model_inputs_args(packed_batch)
+        
+        # Record input tokens for debugging
+        if os.environ.get("FSDP_TENSOR_DUMP_DIR", ""):
+            from slime.backends.fsdp_utils.debug_tensor_dump import get_fsdp_tensor_dumper
+            dumper = get_fsdp_tensor_dumper()
+            if dumper is not None:
+                # Set response start position based on total_lengths - response_lengths
+                if "total_lengths" in packed_batch and "response_lengths" in packed_batch:
+                    total_lengths = packed_batch["total_lengths"]
+                    response_lengths = packed_batch["response_lengths"]
+                    if total_lengths is not None and response_lengths is not None and len(total_lengths) > 0:
+                        prompt_len = total_lengths[0] - response_lengths[0]
+                        dumper._current_tensors["debug_prompt_len"] = torch.tensor([prompt_len])
+                        dumper._current_tensors["debug_total_len"] = torch.tensor([total_lengths[0]])
+                        dumper._current_tensors["debug_response_len"] = torch.tensor([response_lengths[0]])
+                        dumper.set_response_start_position(int(prompt_len))
+                        logger.info(f"[FSDP Debug] Response starts at position {prompt_len}, "
+                                   f"total_len={total_lengths[0]}, response_len={response_lengths[0]}")
+                    else:
+                        dumper.set_response_start_position(0)
+                else:
+                    dumper.set_response_start_position(0)
+                # Record input_ids
+                dumper.add_input_ids(model_args["input_ids"])
+        
         logits = self.model(**model_args).logits.squeeze(0).float()
+        
+        # Dump tensors after forward pass
+        if os.environ.get("FSDP_TENSOR_DUMP_DIR", ""):
+            from slime.backends.fsdp_utils.debug_tensor_dump import get_fsdp_tensor_dumper
+            dumper = get_fsdp_tensor_dumper()
+            if dumper is not None:
+                dumper.dump_current_tensors()
 
         # Compute log probs and entropy (unified for both CP and non-CP modes)
         log_probs, entropy_result = get_logprob_and_entropy_with_cp(
