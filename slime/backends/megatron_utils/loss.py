@@ -57,7 +57,12 @@ def get_responses(
     assert logits.dtype == torch.float32, f"{logits.dtype}"
 
     logits = logits.squeeze(0)
-    logits = logits.div(args.rollout_temperature)
+    # For true on-policy mode, match SGLang's temperature handling:
+    # logits.bfloat16().div(temp).bfloat16()
+    if getattr(args, "true_on_policy_mode", False):
+        logits = logits.bfloat16().div(args.rollout_temperature).bfloat16()
+    else:
+        logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
     end = 0
@@ -139,6 +144,7 @@ def get_log_probs_and_entropy(
             mpu.get_tensor_model_parallel_group(),
             with_entropy=with_entropy,
             chunk_size=args.log_probs_chunk_size,
+            true_on_policy_mode=getattr(args, "true_on_policy_mode", False),
         )
 
         log_probs_list.append(log_prob.squeeze(-1))
