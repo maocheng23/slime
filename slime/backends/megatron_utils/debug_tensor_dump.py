@@ -51,15 +51,39 @@ class MegatronTensorDumper:
         logger.info(f"[MegatronTensorDumper] Initialized. dump_dir={self._process_dir}, dump_layers={dump_layers}")
 
     def add_tensor(self, name: str, tensor: torch.Tensor | tuple | list) -> None:
-        """Add a tensor to the current forward pass collection."""
+        """Add a tensor to the current forward pass collection.
+        
+        Only saves the FIRST token position to match SGLang's decode phase output.
+        Megatron layout: [seq_len, batch, hidden] -> extract [0, :, :] -> [batch, hidden]
+        Then squeeze batch if batch=1 -> [hidden] or [1, hidden] for consistency
+        """
+        def extract_first_token(t: torch.Tensor) -> torch.Tensor:
+            """Extract first token from Megatron tensor layout."""
+            if t.dim() == 3:
+                # [seq_len, batch, hidden] -> [batch, hidden]
+                first_token = t[0, :, :]
+                if first_token.shape[0] == 1:
+                    # [1, hidden] - keep this shape for consistency with SGLang
+                    return first_token
+                return first_token
+            elif t.dim() == 2:
+                # [seq_len, hidden] -> [1, hidden]
+                return t[0:1, :]
+            else:
+                # Other shapes, just return as-is
+                return t
+        
         if isinstance(tensor, (tuple, list)):
-            tensors = [t.cpu() for t in tensor if t is not None and isinstance(t, torch.Tensor)]
+            tensors = []
+            for t in tensor:
+                if t is not None and isinstance(t, torch.Tensor):
+                    tensors.append(extract_first_token(t).cpu())
             if len(tensors) == 1:
                 self._current_tensors[name] = tensors[0]
             elif len(tensors) > 1:
                 self._current_tensors[name] = tensors
         elif isinstance(tensor, torch.Tensor):
-            self._current_tensors[name] = tensor.cpu()
+            self._current_tensors[name] = extract_first_token(tensor).cpu()
 
     def dump_current_tensors(self) -> None:
         """Dump all collected tensors for the current forward pass."""

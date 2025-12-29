@@ -38,22 +38,25 @@ def load_tensors(dump_file: Path) -> dict[str, torch.Tensor]:
     return torch.load(dump_file, map_location="cpu")
 
 
-def normalize_sglang_name(name: str) -> tuple[str, int | None]:
+def normalize_sglang_name(name: str) -> tuple[str, int | None, str]:
     """
     Convert SGLang tensor name to a normalized form that matches Megatron naming.
     
     SGLang naming: model.layers.0, model.layers.0.self_attn, model.layers.0.mlp, etc.
     Megatron naming: layer_0_output, layer_0_self_attention_output, etc.
     
-    Returns: (normalized_name, layer_index)
+    Returns: (normalized_name, layer_index, category)
+    Category is one of: "layer_output", "sublayer", "embedding", "logits", "metadata"
     """
     # Handle non-layer tensors first
     if name == "lm_head":
-        return "lm_head", None
+        return "lm_head", None, "logits"
     if name == "model.embed_tokens":
-        return "model.embed_tokens", None
+        return "model.embed_tokens", None, "embedding"
+    if name == "model.norm":
+        return "model.norm", None, "final_norm"
     if name.startswith("model.forward_batch_info"):
-        return name, None  # Keep as-is for metadata
+        return name, None, "metadata"
     
     # Extract layer number if present
     parts = name.split(".")
@@ -65,37 +68,38 @@ def normalize_sglang_name(name: str) -> tuple[str, int | None]:
             # Get remaining path after layer number
             remaining = ".".join(parts[i + 2:]) if i + 2 < len(parts) else ""
             
+            # Layer output (no remaining path) - THIS IS THE KEY ONE
             if remaining == "" or remaining == "model":
-                return f"layer_{layer_idx}_output", layer_idx
+                return f"layer_{layer_idx}_output", layer_idx, "layer_output"
+            
+            # Sublayers - less important for matching
             elif remaining == "self_attn" or remaining.startswith("self_attn."):
-                # Map self_attn sublayers
                 if remaining == "self_attn":
-                    return f"layer_{layer_idx}_self_attention_output", layer_idx
+                    return f"layer_{layer_idx}_self_attention_output", layer_idx, "sublayer"
                 else:
                     sublayer = remaining.replace("self_attn.", "")
-                    return f"layer_{layer_idx}_self_attention_{sublayer}", layer_idx
+                    return f"layer_{layer_idx}_self_attention_{sublayer}", layer_idx, "sublayer"
             elif remaining == "mlp" or remaining.startswith("mlp."):
-                # Map MLP sublayers
                 if remaining == "mlp":
-                    return f"layer_{layer_idx}_mlp_output", layer_idx
+                    return f"layer_{layer_idx}_mlp_output", layer_idx, "sublayer"
                 elif "gate_up_proj" in remaining:
-                    return f"layer_{layer_idx}_mlp.gate_up_proj_output", layer_idx
+                    return f"layer_{layer_idx}_mlp.gate_up_proj_output", layer_idx, "sublayer"
                 elif "down_proj" in remaining:
-                    return f"layer_{layer_idx}_mlp.down_proj_output", layer_idx
+                    return f"layer_{layer_idx}_mlp.down_proj_output", layer_idx, "sublayer"
                 elif "act_fn" in remaining:
-                    return f"layer_{layer_idx}_mlp_act_fn", layer_idx
+                    return f"layer_{layer_idx}_mlp_act_fn", layer_idx, "sublayer"
                 else:
-                    return f"layer_{layer_idx}_mlp_{remaining.replace('mlp.', '')}", layer_idx
+                    return f"layer_{layer_idx}_mlp_{remaining.replace('mlp.', '')}", layer_idx, "sublayer"
             elif "input_layernorm" in remaining:
-                return f"layer_{layer_idx}_input_layernorm_output", layer_idx
+                return f"layer_{layer_idx}_input_layernorm_output", layer_idx, "sublayer"
             elif "post_attention_layernorm" in remaining:
-                return f"layer_{layer_idx}_post_attention_layernorm_output", layer_idx
+                return f"layer_{layer_idx}_post_attention_layernorm_output", layer_idx, "sublayer"
             else:
-                return f"layer_{layer_idx}_{remaining.replace('.', '_')}", layer_idx
+                return f"layer_{layer_idx}_{remaining.replace('.', '_')}", layer_idx, "sublayer"
             break
     
     # Not a layer tensor
-    return name, None
+    return name, None, "other"
 
 
 def compute_diff_stats(t1: torch.Tensor, t2: torch.Tensor) -> dict[str, float]:
@@ -134,8 +138,8 @@ def compare_dumps(
     # Build mapping from normalized SGLang names to Megatron names
     sglang_normalized = {}
     for name in sglang_tensors.keys():
-        norm_name, layer_idx = normalize_sglang_name(name)
-        sglang_normalized[norm_name] = (name, layer_idx)
+        norm_name, layer_idx, category = normalize_sglang_name(name)
+        sglang_normalized[norm_name] = (name, layer_idx, category)
     
     def format_tensor_info(t):
         """Format tensor info, handling lists and other types."""
@@ -164,17 +168,35 @@ def compare_dumps(
         if len(megatron_tensors) > 20:
             print(f"  ... and {len(megatron_tensors) - 20} more")
         
-        print("\nNormalized SGLang -> Megatron Mapping:")
-        for norm_name, (orig_name, layer_idx) in sorted(sglang_normalized.items()):
-            in_megatron = "✓" if norm_name in megatron_tensors else "✗"
-            print(f"  {in_megatron} {norm_name} <- {orig_name}")
+        # Group by category for clearer output
+        print("\n" + "-" * 40)
+        print("KEY TENSORS (layer outputs, embeddings, logits):")
+        print("-" * 40)
+        for norm_name, (orig_name, layer_idx, category) in sorted(sglang_normalized.items()):
+            if category in ("layer_output", "layer_output_proxy", "embedding", "logits", "final_norm"):
+                in_megatron = "✓" if norm_name in megatron_tensors else "✗"
+                proxy_note = " (proxy: mlp.down_proj)" if category == "layer_output_proxy" else ""
+                print(f"  {in_megatron} {norm_name} <- {orig_name}{proxy_note}")
+        
+        print("\n" + "-" * 40)
+        print("SUBLAYERS (less important for matching):")
+        print("-" * 40)
+        sublayer_count = 0
+        for norm_name, (orig_name, layer_idx, category) in sorted(sglang_normalized.items()):
+            if category == "sublayer":
+                in_megatron = "✓" if norm_name in megatron_tensors else "✗"
+                if sublayer_count < 10:
+                    print(f"  {in_megatron} {norm_name}")
+                sublayer_count += 1
+        if sublayer_count > 10:
+            print(f"  ... and {sublayer_count - 10} more sublayers")
         
         # Also show Megatron tensors that don't have SGLang counterparts
-        print("\nMegatron tensors without SGLang mapping:")
-        sglang_norm_names = set(sglang_normalized.keys())
+        print("\n" + "-" * 40)
+        print("Megatron tensors (for reference):")
+        print("-" * 40)
         for name in sorted(megatron_tensors.keys()):
-            if name not in sglang_norm_names:
-                print(f"  {name}")
+            print(f"  {name}")
         print("=" * 80)
     
     # Compare tensors
@@ -191,7 +213,32 @@ def compare_dumps(
             return get_tensor(t[0])
         return None
     
-    for norm_name, (sglang_name, layer_idx) in sorted(sglang_normalized.items()):
+    # Build a mapping of Megatron layer outputs to comparable SGLang tensors
+    # SGLang doesn't dump layer outputs directly, so we use mlp.down_proj as proxy
+    layer_output_mapping = {}
+    for norm_name, (sglang_name, layer_idx, category) in sglang_normalized.items():
+        if layer_idx is not None:
+            # Use mlp.down_proj as proxy for layer output (it's the last sublayer before residual)
+            if "mlp.down_proj" in sglang_name or "mlp_down_proj" in norm_name:
+                megatron_layer_output = f"layer_{layer_idx}_output"
+                if megatron_layer_output in megatron_tensors:
+                    layer_output_mapping[megatron_layer_output] = (sglang_name, layer_idx, "layer_proxy")
+    
+    # First, compare KEY tensors (layer outputs, embeddings, logits)
+    print("\n" + "=" * 60)
+    print("COMPARING KEY TENSORS")
+    print("=" * 60)
+    
+    # Add layer output proxies to the comparison
+    for megatron_name, (sglang_name, layer_idx, category) in layer_output_mapping.items():
+        if megatron_name not in [n for n, _ in sglang_normalized.items()]:
+            # Add proxy mapping
+            sglang_normalized[megatron_name] = (sglang_name, layer_idx, "layer_output_proxy")
+    
+    for norm_name, (sglang_name, layer_idx, category) in sorted(sglang_normalized.items()):
+        # Skip sublayers and metadata in the main comparison
+        if category not in ("layer_output", "layer_output_proxy", "embedding", "logits", "final_norm"):
+            continue
         if norm_name not in megatron_tensors:
             if verbose:
                 print(f"  {norm_name}: NOT FOUND in Megatron")
@@ -208,16 +255,55 @@ def compare_dumps(
                 print(f"  {norm_name}: SKIPPED (not a tensor)")
             continue
         
-        # Check shape
+        # Check shape - now both should dump first token only
+        # SGLang: [1, hidden] (first token)
+        # Megatron: [1, hidden] (first token, after our fix)
+        
+        orig_sglang_shape = sglang_t.shape
+        orig_megatron_shape = megatron_t.shape
+        aligned = False
+        
+        # Try to align shapes if they still don't match
+        if sglang_t.shape != megatron_t.shape:
+            # Case 1: Megatron has extra batch dimension [batch, hidden] vs [1, hidden]
+            if len(megatron_t.shape) == 2 and len(sglang_t.shape) == 2:
+                if megatron_t.shape[-1] == sglang_t.shape[-1]:
+                    # Same hidden dim, just take first row from each
+                    megatron_t = megatron_t[0:1, :]
+                    sglang_t = sglang_t[0:1, :]
+                    aligned = True
+            
+            # Case 2: One is 1D [hidden], other is 2D [1, hidden]
+            if len(megatron_t.shape) == 1 and len(sglang_t.shape) == 2:
+                megatron_t = megatron_t.unsqueeze(0)
+                aligned = True
+            elif len(sglang_t.shape) == 1 and len(megatron_t.shape) == 2:
+                sglang_t = sglang_t.unsqueeze(0)
+                aligned = True
+            
+            # Case 3: Same dim count but different shapes - take min
+            if sglang_t.shape[-1] == megatron_t.shape[-1]:
+                min_seq = min(sglang_t.shape[0], megatron_t.shape[0])
+                sglang_t = sglang_t[:min_seq]
+                megatron_t = megatron_t[:min_seq]
+                aligned = True
+        
+        # Final shape check after alignment
         if sglang_t.shape != megatron_t.shape:
             results[norm_name] = {
                 "match": False,
                 "layer_idx": layer_idx,
-                "reason": f"Shape mismatch: SGLang {sglang_t.shape} vs Megatron {megatron_t.shape}",
+                "reason": f"Shape mismatch: SGLang {orig_sglang_shape} vs Megatron {orig_megatron_shape}",
             }
             if verbose:
-                print(f"  {norm_name}: SHAPE MISMATCH - SGLang {sglang_t.shape} vs Megatron {megatron_t.shape}")
+                print(f"  {norm_name}: SHAPE MISMATCH - SGLang {orig_sglang_shape} vs Megatron {orig_megatron_shape}")
             continue
+        
+        alignment_note = ""
+        if aligned:
+            alignment_note = f" [aligned: {orig_sglang_shape} vs {orig_megatron_shape} -> {sglang_t.shape}]"
+        if category == "layer_output_proxy":
+            alignment_note += " [proxy: mlp.down_proj ≠ layer_output, expect diff!]"
         
         # Compute stats
         stats = compute_diff_stats(sglang_t, megatron_t)
@@ -238,7 +324,7 @@ def compare_dumps(
             print(
                 f"  {color}{norm_name}: {match_str} "
                 f"max_diff={stats['max_diff']:.6e}, mean_diff={stats['mean_diff']:.6e}, "
-                f"rel_diff={stats['rel_diff']:.6e}{end_color}"
+                f"rel_diff={stats['rel_diff']:.6e}{alignment_note}{end_color}"
             )
     
     if verbose:
