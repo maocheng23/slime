@@ -218,6 +218,14 @@ def forward_only(
         packed_seq_params = batch["packed_seq_params"]
         total_lengths = batch["total_lengths"]
         response_lengths = batch["response_lengths"]
+        
+        # Record input tokens for debugging
+        if tensor_dump_enabled:
+            from slime.backends.megatron_utils.debug_tensor_dump import get_megatron_tensor_dumper
+            dumper = get_megatron_tensor_dumper()
+            if dumper is not None:
+                dumper.add_input_ids(tokens)
+        
         output_tensor = model(
             input_ids=tokens,
             position_ids=None,

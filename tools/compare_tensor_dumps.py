@@ -388,6 +388,43 @@ def main():
     print(f"  SGLang:   {len(sglang_tensors)} tensors")
     print(f"  Megatron: {len(megatron_tensors)} tensors")
     
+    # Show input token IDs if available - THIS IS KEY FOR DEBUGGING
+    print("\n" + "=" * 60)
+    print("INPUT TOKEN COMPARISON (most important!)")
+    print("=" * 60)
+    
+    sglang_token = None
+    megatron_token = None
+    
+    if "model.forward_batch_info.input_ids" in sglang_tensors:
+        input_ids = sglang_tensors["model.forward_batch_info.input_ids"]
+        sglang_token = input_ids.flatten()[0].item() if input_ids.numel() > 0 else None
+        print(f"  SGLang input_ids: {input_ids.tolist()}")
+    if "model.forward_batch_info.positions" in sglang_tensors:
+        positions = sglang_tensors["model.forward_batch_info.positions"]
+        print(f"  SGLang positions: {positions.tolist()}")
+    
+    if "megatron_first_token_id" in megatron_tensors:
+        first_token = megatron_tensors["megatron_first_token_id"]
+        megatron_token = first_token.item() if first_token.numel() > 0 else None
+        print(f"  Megatron first token: {first_token.tolist()}")
+    if "megatron_input_ids" in megatron_tensors:
+        input_ids = megatron_tensors["megatron_input_ids"]
+        # Show first few tokens
+        flat = input_ids.flatten()[:10]
+        print(f"  Megatron input_ids (first 10): {flat.tolist()}")
+    
+    # Check if tokens match
+    if sglang_token is not None and megatron_token is not None:
+        if sglang_token == megatron_token:
+            print(f"\n  ✓ TOKENS MATCH! Both processing token {sglang_token}")
+        else:
+            print(f"\n  ✗ TOKENS DIFFER!")
+            print(f"    SGLang is processing token: {sglang_token}")
+            print(f"    Megatron is processing token: {megatron_token}")
+            print(f"    This explains why hidden states are different!")
+    print("=" * 60)
+    
     # Compare
     print("\nComparing tensors...")
     results = compare_dumps(sglang_tensors, megatron_tensors, verbose=not args.quiet)

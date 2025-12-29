@@ -282,6 +282,14 @@ class MegatronTensorDumper:
 
         return hook
 
+    def add_input_ids(self, input_ids: torch.Tensor) -> None:
+        """Record the input token IDs for debugging."""
+        # Save full input_ids (not just first token) for reference
+        self._current_tensors["megatron_input_ids"] = input_ids.cpu()
+        # Also save first token specifically
+        if input_ids.dim() >= 1:
+            self._current_tensors["megatron_first_token_id"] = input_ids.flatten()[0:1].cpu()
+
     def _create_sublayer_hook(self, layer_idx: int, sublayer_name: str):
         """Create a forward hook for a sublayer (attention or MLP)."""
 
