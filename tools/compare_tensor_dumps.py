@@ -40,12 +40,21 @@ def load_tensors(dump_file: Path) -> dict[str, torch.Tensor]:
 
 def normalize_sglang_name(name: str) -> tuple[str, int | None]:
     """
-    Convert SGLang tensor name to a normalized form.
+    Convert SGLang tensor name to a normalized form that matches Megatron naming.
     
     SGLang naming: model.layers.0, model.layers.0.self_attn, model.layers.0.mlp, etc.
+    Megatron naming: layer_0_output, layer_0_self_attention_output, etc.
     
     Returns: (normalized_name, layer_index)
     """
+    # Handle non-layer tensors first
+    if name == "lm_head":
+        return "lm_head", None
+    if name == "model.embed_tokens":
+        return "model.embed_tokens", None
+    if name.startswith("model.forward_batch_info"):
+        return name, None  # Keep as-is for metadata
+    
     # Extract layer number if present
     parts = name.split(".")
     layer_idx = None
@@ -58,16 +67,31 @@ def normalize_sglang_name(name: str) -> tuple[str, int | None]:
             
             if remaining == "" or remaining == "model":
                 return f"layer_{layer_idx}_output", layer_idx
-            elif "self_attn" in remaining or "attention" in remaining:
-                return f"layer_{layer_idx}_self_attention_output", layer_idx
-            elif "mlp" in remaining:
-                return f"layer_{layer_idx}_mlp_output", layer_idx
+            elif remaining == "self_attn" or remaining.startswith("self_attn."):
+                # Map self_attn sublayers
+                if remaining == "self_attn":
+                    return f"layer_{layer_idx}_self_attention_output", layer_idx
+                else:
+                    sublayer = remaining.replace("self_attn.", "")
+                    return f"layer_{layer_idx}_self_attention_{sublayer}", layer_idx
+            elif remaining == "mlp" or remaining.startswith("mlp."):
+                # Map MLP sublayers
+                if remaining == "mlp":
+                    return f"layer_{layer_idx}_mlp_output", layer_idx
+                elif "gate_up_proj" in remaining:
+                    return f"layer_{layer_idx}_mlp.gate_up_proj_output", layer_idx
+                elif "down_proj" in remaining:
+                    return f"layer_{layer_idx}_mlp.down_proj_output", layer_idx
+                elif "act_fn" in remaining:
+                    return f"layer_{layer_idx}_mlp_act_fn", layer_idx
+                else:
+                    return f"layer_{layer_idx}_mlp_{remaining.replace('mlp.', '')}", layer_idx
             elif "input_layernorm" in remaining:
-                return f"layer_{layer_idx}_input_layernorm", layer_idx
+                return f"layer_{layer_idx}_input_layernorm_output", layer_idx
             elif "post_attention_layernorm" in remaining:
-                return f"layer_{layer_idx}_post_attention_layernorm", layer_idx
+                return f"layer_{layer_idx}_post_attention_layernorm_output", layer_idx
             else:
-                return f"layer_{layer_idx}_{remaining}", layer_idx
+                return f"layer_{layer_idx}_{remaining.replace('.', '_')}", layer_idx
             break
     
     # Not a layer tensor
@@ -113,31 +137,59 @@ def compare_dumps(
         norm_name, layer_idx = normalize_sglang_name(name)
         sglang_normalized[norm_name] = (name, layer_idx)
     
+    def format_tensor_info(t):
+        """Format tensor info, handling lists and other types."""
+        if isinstance(t, torch.Tensor):
+            return f"shape={t.shape}, dtype={t.dtype}"
+        elif isinstance(t, list):
+            if len(t) > 0 and isinstance(t[0], torch.Tensor):
+                return f"list[{len(t)}], first shape={t[0].shape}"
+            return f"list[{len(t)}]"
+        else:
+            return f"type={type(t).__name__}"
+    
     if verbose:
         print("\n" + "=" * 80)
         print("SGLang Tensors:")
         for name in sorted(sglang_tensors.keys())[:20]:
             t = sglang_tensors[name]
-            print(f"  {name}: shape={t.shape}, dtype={t.dtype}")
+            print(f"  {name}: {format_tensor_info(t)}")
         if len(sglang_tensors) > 20:
             print(f"  ... and {len(sglang_tensors) - 20} more")
         
         print("\nMegatron Tensors:")
         for name in sorted(megatron_tensors.keys())[:20]:
             t = megatron_tensors[name]
-            print(f"  {name}: shape={t.shape}, dtype={t.dtype}")
+            print(f"  {name}: {format_tensor_info(t)}")
         if len(megatron_tensors) > 20:
             print(f"  ... and {len(megatron_tensors) - 20} more")
         
-        print("\nNormalized Mapping:")
+        print("\nNormalized SGLang -> Megatron Mapping:")
         for norm_name, (orig_name, layer_idx) in sorted(sglang_normalized.items()):
-            print(f"  {norm_name} <- {orig_name}")
+            in_megatron = "✓" if norm_name in megatron_tensors else "✗"
+            print(f"  {in_megatron} {norm_name} <- {orig_name}")
+        
+        # Also show Megatron tensors that don't have SGLang counterparts
+        print("\nMegatron tensors without SGLang mapping:")
+        sglang_norm_names = set(sglang_normalized.keys())
+        for name in sorted(megatron_tensors.keys()):
+            if name not in sglang_norm_names:
+                print(f"  {name}")
         print("=" * 80)
     
     # Compare tensors
     matched = 0
     unmatched = 0
     significant_diff_layers = []
+    
+    def get_tensor(t):
+        """Extract tensor from possibly nested structure."""
+        if isinstance(t, torch.Tensor):
+            return t
+        elif isinstance(t, (list, tuple)) and len(t) > 0:
+            # Return first tensor in list
+            return get_tensor(t[0])
+        return None
     
     for norm_name, (sglang_name, layer_idx) in sorted(sglang_normalized.items()):
         if norm_name not in megatron_tensors:
@@ -147,8 +199,14 @@ def compare_dumps(
             continue
         
         matched += 1
-        sglang_t = sglang_tensors[sglang_name]
-        megatron_t = megatron_tensors[norm_name]
+        sglang_t = get_tensor(sglang_tensors[sglang_name])
+        megatron_t = get_tensor(megatron_tensors[norm_name])
+        
+        # Skip if either is not a tensor
+        if sglang_t is None or megatron_t is None:
+            if verbose:
+                print(f"  {norm_name}: SKIPPED (not a tensor)")
+            continue
         
         # Check shape
         if sglang_t.shape != megatron_t.shape:
@@ -194,7 +252,7 @@ def compare_dumps(
             print(f"   Tensor: {first_diff[1]}")
             print(f"   Max diff: {first_diff[2]:.6e}")
             
-            print(f"\nAll layers with significant differences:")
+            print("\nAll layers with significant differences:")
             for layer_idx, tensor_name, max_diff in significant_diff_layers[:10]:
                 print(f"   Layer {layer_idx}: {tensor_name} (max_diff={max_diff:.6e})")
             if len(significant_diff_layers) > 10:
@@ -232,7 +290,7 @@ def main():
         print(f"  Looking in: {args.megatron_dir}/*/Pass{args.pass_id:05d}.pt")
         sys.exit(1)
     
-    print(f"\nFound files:")
+    print("\nFound files:")
     print(f"  SGLang:   {sglang_files[0]}")
     print(f"  Megatron: {megatron_files[0]}")
     

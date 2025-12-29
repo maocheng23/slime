@@ -86,11 +86,29 @@ class MegatronTensorDumper:
         Register forward hooks on the model to capture intermediate tensors.
 
         This hooks into the TransformerLayer modules to capture:
+        - Embedding output
         - Input hidden states (before each layer)
         - Output hidden states (after each layer)
         - Attention output (after self-attention)
         - MLP output (after MLP)
+        - Final output (lm_head)
         """
+        hooks_registered = 0
+
+        # Hook embedding layer
+        embedding = getattr(model, 'embedding', None)
+        if embedding is not None:
+            embedding.register_forward_hook(self._create_named_hook("model.embed_tokens"))
+            hooks_registered += 1
+            logger.info("[MegatronTensorDumper] Hooked embedding layer")
+
+        # Hook output layer (lm_head)
+        output_layer = getattr(model, 'output_layer', None)
+        if output_layer is not None:
+            output_layer.register_forward_hook(self._create_named_hook("lm_head"))
+            hooks_registered += 1
+            logger.info("[MegatronTensorDumper] Hooked output_layer (lm_head)")
+
         # Find the decoder/transformer layers
         layers = self._find_transformer_layers(model)
 
@@ -100,45 +118,124 @@ class MegatronTensorDumper:
 
             # Hook for layer input/output
             layer.register_forward_hook(self._create_layer_hook(layer_idx))
+            hooks_registered += 1
 
             # Try to hook into attention and MLP sublayers
             self._hook_sublayers(layer, layer_idx)
 
-        logger.info(f"[MegatronTensorDumper] Registered hooks on {len(layers)} layers")
+        logger.info(f"[MegatronTensorDumper] Registered {hooks_registered} hooks on {len(layers)} layers")
+
+    def _create_named_hook(self, name: str):
+        """Create a forward hook for a named module."""
+
+        def hook(module, input_tuple, output):
+            if isinstance(output, tuple):
+                out_tensor = output[0]
+            else:
+                out_tensor = output
+
+            if isinstance(out_tensor, torch.Tensor):
+                self.add_tensor(name, out_tensor.bfloat16())
+
+        return hook
 
     def _find_transformer_layers(self, model: torch.nn.Module) -> list[torch.nn.Module]:
         """Find transformer layers in the model."""
         layers = []
+        layer_names = []
+
+        # Debug: print model structure
+        logger.info("[MegatronTensorDumper] Model structure:")
+        for name, module in model.named_modules():
+            if "layer" in name.lower() or "decoder" in name.lower():
+                logger.info(f"  {name}: {type(module).__name__}")
+
+        # Try to find decoder.layers (Megatron GPTModel structure)
+        decoder = getattr(model, 'decoder', None)
+        if decoder is not None:
+            decoder_layers = getattr(decoder, 'layers', None)
+            if decoder_layers is not None and isinstance(decoder_layers, torch.nn.ModuleList):
+                layers = list(decoder_layers)
+                layer_names = [f"decoder.layers.{i}" for i in range(len(layers))]
+                logger.info(f"[MegatronTensorDumper] Found decoder.layers with {len(layers)} layers")
+                return layers
 
         # Try different common structures
         # Megatron GPTModel structure: model.decoder.layers
         for name, module in model.named_modules():
             # Match patterns like "decoder.layers.0", "model.layers.0"
-            if ".layers." in name and name.endswith(tuple(str(i) for i in range(100))):
-                # Check if this is a transformer layer (has self_attention)
-                if hasattr(module, "self_attention") or hasattr(module, "input_layernorm"):
-                    layers.append(module)
+            if ".layers." in name:
+                # Extract the layer number from the end
+                parts = name.split(".")
+                for i, part in enumerate(parts):
+                    if part == "layers" and i + 1 < len(parts):
+                        try:
+                            int(parts[i + 1])  # Validate it's a layer number
+                            # Make sure we're at the right level (layer module, not sublayer)
+                            if i + 2 == len(parts) or (i + 2 < len(parts) and parts[i + 2] not in ["self_attention", "mlp", "input_layernorm"]):
+                                # Check if this is a transformer layer
+                                if hasattr(module, "self_attention") or hasattr(module, "input_layernorm"):
+                                    if module not in layers:
+                                        layers.append(module)
+                                        layer_names.append(name)
+                        except ValueError:
+                            pass
+                        break
 
         if not layers:
             # Fallback: try to find ModuleList named 'layers'
             for name, module in model.named_modules():
                 if name.endswith(".layers") and isinstance(module, torch.nn.ModuleList):
                     layers = list(module)
+                    layer_names = [f"{name}.{i}" for i in range(len(layers))]
                     break
 
+        logger.info(f"[MegatronTensorDumper] Found layers: {layer_names}")
         return layers
 
     def _hook_sublayers(self, layer: torch.nn.Module, layer_idx: int) -> None:
         """Hook into attention and MLP sublayers."""
+        # Hook input_layernorm output
+        if hasattr(layer, "input_layernorm"):
+            layer.input_layernorm.register_forward_hook(
+                self._create_sublayer_hook(layer_idx, "input_layernorm")
+            )
+
+        # Hook post_self_attn_layernorm output (if exists)
+        if hasattr(layer, "post_self_attn_layernorm"):
+            layer.post_self_attn_layernorm.register_forward_hook(
+                self._create_sublayer_hook(layer_idx, "post_attention_layernorm")
+            )
+        elif hasattr(layer, "pre_mlp_layernorm"):
+            layer.pre_mlp_layernorm.register_forward_hook(
+                self._create_sublayer_hook(layer_idx, "post_attention_layernorm")
+            )
+
         # Hook attention output
         if hasattr(layer, "self_attention"):
             layer.self_attention.register_forward_hook(
                 self._create_sublayer_hook(layer_idx, "self_attention")
             )
+            # Also hook core attention if available
+            if hasattr(layer.self_attention, "core_attention"):
+                layer.self_attention.core_attention.register_forward_hook(
+                    self._create_sublayer_hook(layer_idx, "core_attention")
+                )
 
         # Hook MLP output
         if hasattr(layer, "mlp"):
-            layer.mlp.register_forward_hook(self._create_sublayer_hook(layer_idx, "mlp"))
+            layer.mlp.register_forward_hook(
+                self._create_sublayer_hook(layer_idx, "mlp")
+            )
+            # Hook sublayers in MLP
+            if hasattr(layer.mlp, "linear_fc1"):
+                layer.mlp.linear_fc1.register_forward_hook(
+                    self._create_sublayer_hook(layer_idx, "mlp.gate_up_proj")
+                )
+            if hasattr(layer.mlp, "linear_fc2"):
+                layer.mlp.linear_fc2.register_forward_hook(
+                    self._create_sublayer_hook(layer_idx, "mlp.down_proj")
+                )
 
     def _create_layer_hook(self, layer_idx: int):
         """Create a forward hook for a transformer layer."""
