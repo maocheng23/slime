@@ -53,12 +53,21 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
         runtime_gather_output: bool | None = None,
     ) -> tuple[torch.Tensor, None]:
         # Cast input and weight to BF16 to match SGLang
+        # SGLang: logits = matmul(hidden_states.bfloat16(), lm_head.weight.T.bfloat16())
         input_bf16 = input_.to(torch.bfloat16)
         if weight is not None:
             weight_bf16 = weight.to(torch.bfloat16)
         else:
-            weight_bf16 = None
-        return self._original_layer(input_bf16, weight=weight_bf16, runtime_gather_output=runtime_gather_output)
+            # When weight is None, ColumnParallelLinear uses self.weight
+            # We need to cast it to BF16 to match SGLang's behavior
+            if hasattr(self._original_layer, 'weight') and self._original_layer.weight is not None:
+                weight_bf16 = self._original_layer.weight.to(torch.bfloat16)
+            else:
+                weight_bf16 = None
+        output, bias = self._original_layer(input_bf16, weight=weight_bf16, runtime_gather_output=runtime_gather_output)
+        # Ensure output is in BF16 to match SGLang's logits dtype
+        output = output.to(torch.bfloat16)
+        return output, bias
 
     # Delegate all state dict operations to the original layer for checkpoint compatibility
     def state_dict(self, *args, **kwargs):
