@@ -604,21 +604,52 @@ class FSDPTrainRayActor(TrainRayActor):
             dumper = get_fsdp_tensor_dumper()
             if dumper is not None:
                 # Set response start position based on total_lengths - response_lengths
-                if "total_lengths" in packed_batch and "response_lengths" in packed_batch:
-                    total_lengths = packed_batch["total_lengths"]
-                    response_lengths = packed_batch["response_lengths"]
-                    if total_lengths is not None and response_lengths is not None and len(total_lengths) > 0:
-                        prompt_len = total_lengths[0] - response_lengths[0]
-                        dumper._current_tensors["debug_prompt_len"] = torch.tensor([prompt_len])
-                        dumper._current_tensors["debug_total_len"] = torch.tensor([total_lengths[0]])
-                        dumper._current_tensors["debug_response_len"] = torch.tensor([response_lengths[0]])
-                        dumper.set_response_start_position(int(prompt_len))
-                        logger.info(f"[FSDP Debug] Response starts at position {prompt_len}, "
-                                   f"total_len={total_lengths[0]}, response_len={response_lengths[0]}")
-                    else:
-                        dumper.set_response_start_position(0)
-                else:
-                    dumper.set_response_start_position(0)
+                prompt_len = 0
+                total_len = 0
+                response_len = 0
+                
+                # Try to get from packed_batch
+                total_lengths = packed_batch.get("total_lengths")
+                response_lengths = packed_batch.get("response_lengths")
+                
+                # Debug: log what we found
+                logger.info(f"[FSDP Debug] packed_batch keys: {list(packed_batch.keys())}")
+                logger.info(f"[FSDP Debug] total_lengths type={type(total_lengths)}, "
+                           f"response_lengths type={type(response_lengths)}")
+                
+                if total_lengths is not None and response_lengths is not None:
+                    # Handle different formats (list, tensor, etc.)
+                    if isinstance(total_lengths, (list, tuple)) and len(total_lengths) > 0:
+                        total_len = int(total_lengths[0])
+                        response_len = int(response_lengths[0])
+                    elif isinstance(total_lengths, torch.Tensor) and total_lengths.numel() > 0:
+                        total_len = int(total_lengths.flatten()[0].item())
+                        response_len = int(response_lengths.flatten()[0].item())
+                    elif isinstance(total_lengths, (int, float)):
+                        total_len = int(total_lengths)
+                        response_len = int(response_lengths)
+                    
+                    if total_len > 0 and response_len > 0:
+                        prompt_len = total_len - response_len
+                        logger.info(f"[FSDP Debug] Computed prompt_len={prompt_len} "
+                                   f"from total_len={total_len}, response_len={response_len}")
+                
+                # Fallback: if we couldn't compute prompt_len, try to infer from input shape
+                if prompt_len == 0:
+                    input_ids = model_args["input_ids"]
+                    seq_len = input_ids.shape[-1] if input_ids.dim() > 1 else input_ids.shape[0]
+                    # Assume last few tokens are response (heuristic: use seq_len - 2 as prompt)
+                    # This is just for debugging - in real training, total_lengths should be available
+                    prompt_len = max(0, seq_len - 2)
+                    logger.warning(f"[FSDP Debug] Using fallback prompt_len={prompt_len} "
+                                  f"(inferred from seq_len={seq_len})")
+                
+                # Save debug info
+                dumper._current_tensors["debug_prompt_len"] = torch.tensor([prompt_len])
+                dumper._current_tensors["debug_total_len"] = torch.tensor([total_len])
+                dumper._current_tensors["debug_response_len"] = torch.tensor([response_len])
+                dumper.set_response_start_position(int(prompt_len))
+                
                 # Record input_ids
                 dumper.add_input_ids(model_args["input_ids"])
         

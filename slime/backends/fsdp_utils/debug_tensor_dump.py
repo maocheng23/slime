@@ -318,21 +318,50 @@ class FSDPTensorDumper:
             self._current_tensors["fsdp_compared_position"] = torch.tensor([0])
 
     def add_logits(self, logits: torch.Tensor) -> None:
-        """Record logits for debugging."""
-        # Extract logits at response start position
+        """Record logits for debugging.
+        
+        Saves logits at multiple positions for comparison:
+        - logits: at response_start_pos (for response token comparison)
+        - logits_at_prompt_end: at prompt_len - 1 (for prefill comparison with SGLang)
+        - logits_last: at the last position (alternative for prefill)
+        """
         target_pos = getattr(self, '_response_start_pos', 0)
+        
         if logits.dim() == 2:
             # [seq_len, vocab_size]
-            if target_pos < logits.shape[0]:
+            seq_len = logits.shape[0]
+            # Logits at response start position
+            if target_pos < seq_len:
                 self._current_tensors["logits"] = logits[target_pos:target_pos+1, :].cpu().bfloat16()
             else:
-                self._current_tensors["logits"] = logits[0:1, :].cpu().bfloat16()
+                self._current_tensors["logits"] = logits[-1:, :].cpu().bfloat16()
+            
+            # Logits at prompt end (last prompt position = target_pos - 1)
+            # This is what predicts the first response token
+            prompt_end_pos = max(0, target_pos - 1) if target_pos > 0 else seq_len - 1
+            self._current_tensors["logits_at_prompt_end"] = logits[prompt_end_pos:prompt_end_pos+1, :].cpu().bfloat16()
+            self._current_tensors["logits_prompt_end_pos"] = torch.tensor([prompt_end_pos])
+            
+            # Also save the very last position (for SGLang prefill matching)
+            self._current_tensors["logits_last"] = logits[-1:, :].cpu().bfloat16()
+            self._current_tensors["logits_last_pos"] = torch.tensor([seq_len - 1])
+            
         elif logits.dim() == 3:
             # [batch, seq_len, vocab_size]
-            if target_pos < logits.shape[1]:
-                self._current_tensors["logits"] = logits[:, target_pos:target_pos+1, :].cpu().bfloat16()
+            seq_len = logits.shape[1]
+            if target_pos < seq_len:
+                self._current_tensors["logits"] = logits[:, target_pos:target_pos+1, :].squeeze(1).cpu().bfloat16()
             else:
-                self._current_tensors["logits"] = logits[:, 0:1, :].cpu().bfloat16()
+                self._current_tensors["logits"] = logits[:, -1:, :].squeeze(1).cpu().bfloat16()
+            
+            # Logits at prompt end
+            prompt_end_pos = max(0, target_pos - 1) if target_pos > 0 else seq_len - 1
+            self._current_tensors["logits_at_prompt_end"] = logits[:, prompt_end_pos:prompt_end_pos+1, :].squeeze(1).cpu().bfloat16()
+            self._current_tensors["logits_prompt_end_pos"] = torch.tensor([prompt_end_pos])
+            
+            # Last position
+            self._current_tensors["logits_last"] = logits[:, -1:, :].squeeze(1).cpu().bfloat16()
+            self._current_tensors["logits_last_pos"] = torch.tensor([seq_len - 1])
         else:
             self._current_tensors["logits"] = logits.cpu().bfloat16()
 

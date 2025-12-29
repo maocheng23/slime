@@ -3,17 +3,23 @@
 Compare tensor dumps from SGLang and Megatron/FSDP for debugging numerical differences.
 
 Usage:
-    # Compare SGLang vs Megatron
+    # Compare SGLang vs Megatron (auto-match prefill or decode)
     python /root/slime/tools/compare_tensor_dumps.py \
         --sglang-dir /tmp/sglang_tensor_dump \
         --megatron-dir /tmp/megatron_tensor_dump \
         --auto-match
     
-    # Compare SGLang vs FSDP
+    # Compare ONLY decode passes (recommended for true on-policy verification)
     python /root/slime/tools/compare_tensor_dumps.py \
         --sglang-dir /tmp/sglang_tensor_dump \
         --megatron-dir /tmp/fsdp_tensor_dump \
-        --auto-match
+        --auto-match --decode-only --response-start 91
+    
+    # List all available passes to understand the dump structure
+    python /root/slime/tools/compare_tensor_dumps.py \
+        --sglang-dir /tmp/sglang_tensor_dump \
+        --megatron-dir /tmp/fsdp_tensor_dump \
+        --list-passes
 
 The script will:
 1. Load tensor dumps from both directories
@@ -21,6 +27,12 @@ The script will:
 3. Compute and display per-tensor statistics (max diff, mean diff, relative diff)
 4. Identify the first layer where differences become significant
 5. Compute and compare logprobs from logits using SGLang's formula
+
+Key arguments:
+    --decode-only: Only match decode passes (seq_len=1), skip prefill passes.
+                   Use this for true on-policy verification!
+    --response-start N: Only consider passes at position >= N.
+                        Set to prompt_len to focus on response tokens.
 """
 
 import argparse
@@ -141,20 +153,37 @@ def get_token_from_dump(dump_file: Path) -> tuple[int | None, int | None]:
     return token_id, position
 
 
-def find_matching_sglang_pass(sglang_dir: str, target_token: int, target_position: int | None = None) -> int | None:
+def find_matching_sglang_pass(
+    sglang_dir: str, 
+    target_token: int | None = None, 
+    target_position: int | None = None,
+    decode_only: bool = False,
+    min_position: int | None = None,
+) -> int | None:
     """Find a SGLang pass that has the matching token (and optionally position).
+    
+    Args:
+        sglang_dir: Directory containing SGLang dumps
+        target_token: Token ID to match (optional)
+        target_position: Position to match (optional)
+        decode_only: If True, only consider decode passes (seq_len=1)
+        min_position: If set, only consider passes with position >= min_position
+                     (useful for finding response tokens)
     
     Prefers decode passes (single token) over prefill passes (multiple tokens).
     """
     passes = list_all_passes(sglang_dir)
     
-    print(f"\n[Auto-matching] Looking for SGLang pass with token={target_token}, position={target_position}")
+    print(f"\n[Auto-matching] Looking for SGLang pass:")
+    print(f"  target_token={target_token}, target_position={target_position}")
+    print(f"  decode_only={decode_only}, min_position={min_position}")
     print(f"  Found {len(passes)} SGLang passes:")
     
     matching_decode_passes = []  # Prefer decode passes (seq_len=1)
     matching_prefill_passes = []  # Fallback to prefill passes
+    first_decode_pass = None
     
-    for pass_id, path in passes[:20]:  # Show first 20
+    for pass_id, path in passes[:30]:  # Show first 30
         tensors = torch.load(path, map_location="cpu")
         token_id, position = get_token_from_dump(path)
         
@@ -167,30 +196,48 @@ def find_matching_sglang_pass(sglang_dir: str, target_token: int, target_positio
         
         is_decode = seq_lens == 1 if seq_lens is not None else False
         
+        # Track first decode pass at a response position
+        if is_decode and first_decode_pass is None:
+            if min_position is None or (position is not None and position >= min_position):
+                first_decode_pass = pass_id
+        
         marker = ""
-        if token_id == target_token:
-            if target_position is None or position == target_position:
-                if is_decode:
-                    matching_decode_passes.append(pass_id)
-                    marker = " <-- MATCH (decode)!"
-                else:
-                    matching_prefill_passes.append(pass_id)
-                    marker = " <-- MATCH (prefill)!"
+        # Check matching criteria
+        token_matches = (target_token is None or token_id == target_token)
+        position_matches = (target_position is None or position == target_position)
+        min_pos_ok = (min_position is None or 
+                      (position is not None and position >= min_position))
+        
+        if token_matches and position_matches and min_pos_ok:
+            if is_decode:
+                matching_decode_passes.append((pass_id, position))
+                marker = " <-- MATCH (decode)!"
+            elif not decode_only:
+                matching_prefill_passes.append((pass_id, position))
+                marker = " <-- MATCH (prefill)!"
         
         pass_type = "decode" if is_decode else f"prefill(seq_len={seq_lens})"
-        print(f"    Pass {pass_id:5d}: token={token_id}, position={position}, type={pass_type}{marker}")
+        print(f"    Pass {pass_id:5d}: token={token_id}, position={position}, "
+              f"type={pass_type}{marker}")
     
-    if len(passes) > 20:
-        print(f"    ... and {len(passes) - 20} more passes")
+    if len(passes) > 30:
+        print(f"    ... and {len(passes) - 30} more passes")
     
     # Prefer decode passes
     if matching_decode_passes:
-        print(f"\n  ✓ Found {len(matching_decode_passes)} matching decode pass(es): {matching_decode_passes}")
-        return matching_decode_passes[0]
-    elif matching_prefill_passes:
-        print(f"\n  ⚠ Found {len(matching_prefill_passes)} matching prefill pass(es): {matching_prefill_passes}")
-        print(f"     Note: Prefill passes process multiple tokens. Comparison may be less accurate.")
-        return matching_prefill_passes[0]
+        best = matching_decode_passes[0]
+        print(f"\n  ✓ Found {len(matching_decode_passes)} matching decode pass(es)")
+        print(f"    Using Pass {best[0]} at position {best[1]}")
+        return best[0]
+    elif matching_prefill_passes and not decode_only:
+        best = matching_prefill_passes[0]
+        print(f"\n  ⚠ Found {len(matching_prefill_passes)} matching prefill pass(es)")
+        print(f"    Using Pass {best[0]} at position {best[1]}")
+        print(f"    Note: Prefill passes process multiple tokens. Consider using --decode-only")
+        return best[0]
+    elif first_decode_pass is not None and decode_only:
+        print(f"\n  ℹ No exact match found, using first decode pass: {first_decode_pass}")
+        return first_decode_pass
     else:
         print(f"\n  ✗ No matching pass found!")
         return None
@@ -518,10 +565,18 @@ def main():
     parser.add_argument("--sglang-dir", type=str, required=True, help="SGLang tensor dump directory")
     parser.add_argument("--megatron-dir", type=str, required=True, help="Megatron tensor dump directory")
     parser.add_argument("--pass-id", type=int, default=0, help="Forward pass ID to compare (default: 0)")
-    parser.add_argument("--sglang-pass-id", type=int, default=None, help="Override SGLang pass ID (default: same as --pass-id)")
-    parser.add_argument("--auto-match", action="store_true", help="Auto-find SGLang pass that matches Megatron's token")
-    parser.add_argument("--list-passes", action="store_true", help="List all available passes and exit")
-    parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
+    parser.add_argument("--sglang-pass-id", type=int, default=None, 
+                        help="Override SGLang pass ID (default: same as --pass-id)")
+    parser.add_argument("--auto-match", action="store_true", 
+                        help="Auto-find SGLang pass that matches Megatron's token")
+    parser.add_argument("--decode-only", action="store_true",
+                        help="Only match decode passes (seq_len=1), skip prefill passes")
+    parser.add_argument("--response-start", type=int, default=None,
+                        help="Response start position (prompt_len). Only match passes at >= this position")
+    parser.add_argument("--list-passes", action="store_true", 
+                        help="List all available passes and exit")
+    parser.add_argument("--quiet", action="store_true", 
+                        help="Suppress verbose output")
     args = parser.parse_args()
     
     # List passes mode
@@ -557,15 +612,48 @@ def main():
     # Auto-match mode: find SGLang pass with matching token
     if args.auto_match:
         megatron_token, megatron_pos = get_token_from_dump(megatron_files[0])
-        if megatron_token is not None:
-            matched_pass = find_matching_sglang_pass(args.sglang_dir, megatron_token, megatron_pos)
-            if matched_pass is not None:
-                sglang_pass_id = matched_pass
-                print(f"\n[Auto-match] Using SGLang pass {sglang_pass_id} (matches Megatron token {megatron_token})")
-            else:
-                print(f"\n[Auto-match] Could not find matching pass, using pass {sglang_pass_id}")
+        
+        # Determine response start from dump or argument
+        response_start = args.response_start
+        if response_start is None:
+            # Try to get from Megatron/FSDP dump
+            mt = load_tensors(megatron_files[0])
+            if "debug_prompt_len" in mt:
+                response_start = int(mt["debug_prompt_len"].item())
+                print(f"[Auto-match] Using response_start={response_start} from dump")
+        
+        if args.decode_only:
+            print(f"[Auto-match] decode_only=True: Only matching decode passes")
+        if response_start is not None:
+            print(f"[Auto-match] response_start={response_start}: "
+                  f"Only matching passes at position >= {response_start}")
+        
+        # For decode-only mode, we match by position (response position)
+        # rather than by token, since we want the first response token
+        if args.decode_only and response_start is not None:
+            matched_pass = find_matching_sglang_pass(
+                args.sglang_dir, 
+                target_token=None,  # Don't filter by token
+                target_position=None,
+                decode_only=True,
+                min_position=response_start,
+            )
+        elif megatron_token is not None:
+            matched_pass = find_matching_sglang_pass(
+                args.sglang_dir, 
+                target_token=megatron_token, 
+                target_position=megatron_pos,
+                decode_only=args.decode_only,
+                min_position=response_start,
+            )
         else:
-            print(f"\n[Auto-match] Could not extract Megatron token, using pass {sglang_pass_id}")
+            matched_pass = None
+            
+        if matched_pass is not None:
+            sglang_pass_id = matched_pass
+            print(f"\n[Auto-match] Using SGLang pass {sglang_pass_id}")
+        else:
+            print(f"\n[Auto-match] Could not find matching pass, using pass {sglang_pass_id}")
     
     print(f"\nComparing tensor dumps:")
     print(f"  SGLang:   pass {sglang_pass_id} from {args.sglang_dir}")
@@ -651,6 +739,30 @@ def main():
             print(f"    SGLang is processing token: {sglang_token}")
             print(f"    Megatron is processing token: {megatron_token}")
             print(f"    This explains why hidden states are different!")
+    
+    # Check for prefill vs decode mismatch
+    sglang_seq_len = None
+    if "model.forward_batch_info.input_ids" in sglang_tensors:
+        sglang_seq_len = sglang_tensors["model.forward_batch_info.input_ids"].numel()
+    
+    if sglang_seq_len is not None and sglang_seq_len > 1:
+        print(f"\n  ⚠️  WARNING: SGLang is in PREFILL mode ({sglang_seq_len} tokens)")
+        print(f"     SGLang's logits_processor outputs logits for position {sglang_seq_len}")
+        print(f"     (predicting the NEXT token after the {sglang_seq_len}-token input)")
+        
+        # Check if FSDP/Megatron compared position matches
+        compared_pos = 0
+        if compared_pos_key in megatron_tensors:
+            compared_pos = megatron_tensors[compared_pos_key].item()
+        
+        expected_pos = sglang_seq_len - 1  # Last position in prefill
+        if compared_pos != expected_pos:
+            print(f"\n  ❌ POSITION MISMATCH DETECTED!")
+            print(f"     {backend_name} is extracting at position {compared_pos}")
+            print(f"     But SGLang prefill outputs logits for position {sglang_seq_len}")
+            print(f"     To match, {backend_name} should use position {expected_pos} (last input position)")
+            print(f"     Or compare logits for position {sglang_seq_len} (next token prediction)")
+    
     print("=" * 60)
     
     # Compare logprobs computed from logits
@@ -658,15 +770,34 @@ def main():
     print("LOGPROBS COMPARISON (computed from logits)")
     print("=" * 60)
     
-    # Get target token for logprob extraction (next token after the compared position)
+    # Determine the correct position for logits comparison
+    # For SGLang prefill: logits_processor outputs logits at the LAST position
+    # We need to compare FSDP's logits at the same position
+    sglang_logits_pos = None
+    if sglang_seq_len is not None and sglang_seq_len > 1:
+        # SGLang prefill: logits are for predicting position sglang_seq_len
+        # (from hidden state at position sglang_seq_len - 1)
+        sglang_logits_pos = sglang_seq_len - 1
+        print(f"  SGLang prefill: logits from position {sglang_logits_pos} "
+              f"(predicting token at position {sglang_seq_len})")
+    
+    # Get target token for logprob extraction (next token after the logits position)
     next_token_id = None
-    if input_ids_key in megatron_tensors and compared_pos_key in megatron_tensors:
+    logits_pos = sglang_logits_pos if sglang_logits_pos is not None else 0
+    
+    if input_ids_key in megatron_tensors:
         input_ids = megatron_tensors[input_ids_key].flatten()
-        compared_pos = megatron_tensors[compared_pos_key].item()
-        # The next token is at position compared_pos + 1 (what we're predicting)
-        if compared_pos + 1 < len(input_ids):
-            next_token_id = input_ids[compared_pos + 1].item()
-            print(f"  Target (next) token ID: {next_token_id} (at position {compared_pos + 1})")
+        # For prefill comparison, use SGLang's last position
+        if sglang_logits_pos is not None and sglang_logits_pos + 1 < len(input_ids):
+            next_token_id = input_ids[sglang_logits_pos + 1].item()
+            print(f"  Target (next) token ID: {next_token_id} "
+                  f"(at position {sglang_logits_pos + 1})")
+        elif compared_pos_key in megatron_tensors:
+            compared_pos = megatron_tensors[compared_pos_key].item()
+            if compared_pos + 1 < len(input_ids):
+                next_token_id = input_ids[compared_pos + 1].item()
+                print(f"  Target (next) token ID: {next_token_id} "
+                      f"(at position {compared_pos + 1})")
     
     # Find logits tensors
     sglang_logits = None
@@ -680,13 +811,35 @@ def main():
         # lm_head in SGLang tensor dump is actually the hidden state, not logits
         print(f"  SGLang lm_head is hidden state, not logits - skipping direct comparison")
     
-    # Megatron: logits or lm_head
+    # Megatron/FSDP: logits or lm_head
+    # For prefill comparison, prefer logits_at_prompt_end or logits_last
+    megatron_logits_prefill = None
+    
+    if sglang_seq_len is not None and sglang_seq_len > 1:
+        # SGLang is in prefill mode - try to get logits at matching position
+        if "logits_at_prompt_end" in megatron_tensors:
+            megatron_logits_prefill = megatron_tensors["logits_at_prompt_end"]
+            pos = megatron_tensors.get("logits_prompt_end_pos", torch.tensor([0])).item()
+            print(f"  {backend_name} logits_at_prompt_end: shape={megatron_logits_prefill.shape}, "
+                  f"dtype={megatron_logits_prefill.dtype}, pos={pos}")
+        elif "logits_last" in megatron_tensors:
+            megatron_logits_prefill = megatron_tensors["logits_last"]
+            pos = megatron_tensors.get("logits_last_pos", torch.tensor([0])).item()
+            print(f"  {backend_name} logits_last: shape={megatron_logits_prefill.shape}, "
+                  f"dtype={megatron_logits_prefill.dtype}, pos={pos}")
+    
     if "logits" in megatron_tensors:
         megatron_logits = megatron_tensors["logits"]
-        print(f"  Megatron logits: shape={megatron_logits.shape}, dtype={megatron_logits.dtype}")
+        print(f"  {backend_name} logits: shape={megatron_logits.shape}, "
+              f"dtype={megatron_logits.dtype}")
     elif "lm_head" in megatron_tensors:
         megatron_logits = megatron_tensors["lm_head"]
-        print(f"  Megatron lm_head (logits): shape={megatron_logits.shape}, dtype={megatron_logits.dtype}")
+        print(f"  {backend_name} lm_head (logits): shape={megatron_logits.shape}, "
+              f"dtype={megatron_logits.dtype}")
+    
+    # Use prefill-matched logits if available for SGLang prefill comparison
+    if megatron_logits_prefill is not None:
+        print(f"\n  ℹ️  Using {backend_name} logits_at_prompt_end for prefill comparison")
     
     # Also check for directly dumped logprobs
     sglang_direct_logprobs = None
@@ -701,15 +854,24 @@ def main():
         print(f"  Megatron direct logprobs: shape={megatron_direct_logprobs.shape}, dtype={megatron_direct_logprobs.dtype}")
     
     # Compare logprobs
-    if sglang_logits is not None and megatron_logits is not None:
-        print("\n  Computing logprobs from logits using SGLang formula...")
-        print("    Formula: log_softmax(logits.bfloat16().div(temp).bfloat16(), dim=-1)")
+    # For prefill comparison, use the prefill-matched logits if available
+    megatron_logits_to_compare = megatron_logits
+    logits_source = "default"
+    
+    if megatron_logits_prefill is not None and sglang_seq_len is not None and sglang_seq_len > 1:
+        megatron_logits_to_compare = megatron_logits_prefill
+        logits_source = "prefill-matched (prompt_end)"
+    
+    if sglang_logits is not None and megatron_logits_to_compare is not None:
+        print(f"\n  Computing logprobs from logits using SGLang formula...")
+        print(f"    Formula: log_softmax(logits.bfloat16().div(temp).bfloat16(), dim=-1)")
+        print(f"    {backend_name} logits source: {logits_source}")
         
         sglang_logprobs_full, sglang_target_lp = compute_logprobs_from_logits(
             sglang_logits, temperature=1.0, target_token_id=next_token_id
         )
         megatron_logprobs_full, megatron_target_lp = compute_logprobs_from_logits(
-            megatron_logits, temperature=1.0, target_token_id=next_token_id
+            megatron_logits_to_compare, temperature=1.0, target_token_id=next_token_id
         )
         
         # Compare full logprob distributions (first position)
