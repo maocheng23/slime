@@ -252,6 +252,11 @@ def forward_only(
     config.timers = None
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
+    
+    # Check if tensor dumping is enabled
+    import os
+    tensor_dump_enabled = bool(os.environ.get("MEGATRON_TENSOR_DUMP_DIR", ""))
+    
     for step_id in range(num_steps_per_rollout):
         # collect_non_loss_data
         forward_data_store += forward_backward_func(
@@ -264,6 +269,11 @@ def forward_only(
             forward_only=True,
             collect_non_loss_data=True,
         )
+        
+        # Dump tensors after each forward pass if enabled
+        if tensor_dump_enabled:
+            from slime.backends.megatron_utils.debug_tensor_dump import dump_megatron_tensors
+            dump_megatron_tensors()
 
     # Move model back to the train mode.
     for model_module in model:

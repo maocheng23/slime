@@ -9,7 +9,7 @@ assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
 MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-0.6B")
 assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
 
-MODE = os.environ.get("SLIME_SCRIPT_MODE", "normal")
+MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
 NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "1"))
@@ -78,12 +78,18 @@ def execute():
         "--adam-beta2 0.98 "
     )
 
+    # Tensor dump directory for debug_one_sample mode
+    tensor_dump_dir = "/tmp/sglang_tensor_dump" if MODE == "debug_one_sample" else ""
+    
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
         f"--sglang-mem-fraction-static {0.2 if MODEL_NAME == 'Qwen3-4B' else 0.4} "
         f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
+        # Enable tensor dump for layer-by-layer comparison
+        f"{'--sglang-debug-tensor-dump-output-folder ' + tensor_dump_dir + ' ' if MODE == 'debug_one_sample' else ''}"
+        f"{'--sglang-debug-tensor-dump-layers 0 1 2 ' if MODE == 'debug_one_sample' else ''}"  # Dump first 3 layers
     )
 
     fsdp_args = (
@@ -148,6 +154,9 @@ def execute():
             **true_on_policy_envs,
             "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
             "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
+            # Megatron tensor dump for layer-by-layer comparison
+            "MEGATRON_TENSOR_DUMP_DIR": "/tmp/megatron_tensor_dump" if MODE == "debug_one_sample" else "",
+            "MEGATRON_TENSOR_DUMP_LAYERS": "0,1,2" if MODE == "debug_one_sample" else "",  # Dump first 3 layers
         },
     )
 

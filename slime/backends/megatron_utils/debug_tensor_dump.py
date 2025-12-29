@@ -1,0 +1,345 @@
+"""
+Megatron Tensor Dumper for layer-by-layer comparison with SGLang.
+
+This module provides a mechanism to dump intermediate tensors from Megatron's
+forward pass for comparison with SGLang's tensor dump.
+
+Usage:
+1. Set environment variables:
+   - MEGATRON_TENSOR_DUMP_DIR: Output directory for tensor dumps
+   - MEGATRON_TENSOR_DUMP_LAYERS: Comma-separated layer indices to dump (e.g., "0,1,2")
+
+2. Call register_forward_hooks() on your model before running inference
+3. Tensors will be saved to MEGATRON_TENSOR_DUMP_DIR
+
+The naming convention mirrors SGLang's for easy comparison:
+- Pass{pass_id:05d}.pt contains a dict of tensor_name -> tensor
+"""
+
+import logging
+import os
+from pathlib import Path
+from typing import Any, Optional
+
+import torch
+import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
+
+
+class MegatronTensorDumper:
+    """Dumps intermediate tensors from Megatron forward passes for debugging."""
+
+    def __init__(
+        self,
+        dump_dir: str,
+        dump_layers: Optional[list[int]] = None,
+        tp_rank: int = 0,
+        pp_rank: int = 0,
+        tp_size: int = 1,
+    ):
+        self._dump_dir = Path(dump_dir)
+        self._dump_layers = dump_layers
+        self._forward_pass_id = 0
+        self._current_tensors: dict[str, torch.Tensor] = {}
+        self._pid = os.getpid()
+
+        rank = tp_size * pp_rank + tp_rank
+        self._process_dir = self._dump_dir / f"TP{tp_rank}_PP{pp_rank}_Rank{rank}_pid{self._pid}"
+        self._process_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"[MegatronTensorDumper] Initialized. dump_dir={self._process_dir}, dump_layers={dump_layers}")
+
+    def add_tensor(self, name: str, tensor: torch.Tensor | tuple | list) -> None:
+        """Add a tensor to the current forward pass collection."""
+        if isinstance(tensor, (tuple, list)):
+            tensors = [t.cpu() for t in tensor if t is not None and isinstance(t, torch.Tensor)]
+            if len(tensors) == 1:
+                self._current_tensors[name] = tensors[0]
+            elif len(tensors) > 1:
+                self._current_tensors[name] = tensors
+        elif isinstance(tensor, torch.Tensor):
+            self._current_tensors[name] = tensor.cpu()
+
+    def dump_current_tensors(self) -> None:
+        """Dump all collected tensors for the current forward pass."""
+        if len(self._current_tensors) == 0:
+            return
+
+        tensor_file = self._process_dir / f"Pass{self._forward_pass_id:05d}.pt"
+        logger.info(
+            f"[MegatronTensorDumper] Dumping pass {self._forward_pass_id} "
+            f"with {len(self._current_tensors)} tensors to {tensor_file}"
+        )
+        torch.save(self._current_tensors, str(tensor_file))
+        self._current_tensors = {}
+        self._forward_pass_id += 1
+
+    def should_dump_layer(self, layer_idx: int) -> bool:
+        """Check if a layer should be dumped."""
+        if self._dump_layers is None:
+            return True
+        return layer_idx in self._dump_layers
+
+    def register_forward_hooks(self, model: torch.nn.Module) -> None:
+        """
+        Register forward hooks on the model to capture intermediate tensors.
+
+        This hooks into the TransformerLayer modules to capture:
+        - Input hidden states (before each layer)
+        - Output hidden states (after each layer)
+        - Attention output (after self-attention)
+        - MLP output (after MLP)
+        """
+        # Find the decoder/transformer layers
+        layers = self._find_transformer_layers(model)
+
+        for layer_idx, layer in enumerate(layers):
+            if not self.should_dump_layer(layer_idx):
+                continue
+
+            # Hook for layer input/output
+            layer.register_forward_hook(self._create_layer_hook(layer_idx))
+
+            # Try to hook into attention and MLP sublayers
+            self._hook_sublayers(layer, layer_idx)
+
+        logger.info(f"[MegatronTensorDumper] Registered hooks on {len(layers)} layers")
+
+    def _find_transformer_layers(self, model: torch.nn.Module) -> list[torch.nn.Module]:
+        """Find transformer layers in the model."""
+        layers = []
+
+        # Try different common structures
+        # Megatron GPTModel structure: model.decoder.layers
+        for name, module in model.named_modules():
+            # Match patterns like "decoder.layers.0", "model.layers.0"
+            if ".layers." in name and name.endswith(tuple(str(i) for i in range(100))):
+                # Check if this is a transformer layer (has self_attention)
+                if hasattr(module, "self_attention") or hasattr(module, "input_layernorm"):
+                    layers.append(module)
+
+        if not layers:
+            # Fallback: try to find ModuleList named 'layers'
+            for name, module in model.named_modules():
+                if name.endswith(".layers") and isinstance(module, torch.nn.ModuleList):
+                    layers = list(module)
+                    break
+
+        return layers
+
+    def _hook_sublayers(self, layer: torch.nn.Module, layer_idx: int) -> None:
+        """Hook into attention and MLP sublayers."""
+        # Hook attention output
+        if hasattr(layer, "self_attention"):
+            layer.self_attention.register_forward_hook(
+                self._create_sublayer_hook(layer_idx, "self_attention")
+            )
+
+        # Hook MLP output
+        if hasattr(layer, "mlp"):
+            layer.mlp.register_forward_hook(self._create_sublayer_hook(layer_idx, "mlp"))
+
+    def _create_layer_hook(self, layer_idx: int):
+        """Create a forward hook for a transformer layer."""
+
+        def hook(module, input_tuple, output):
+            # Input is typically (hidden_states, attention_mask, ...)
+            if isinstance(input_tuple, tuple) and len(input_tuple) > 0:
+                hidden_states = input_tuple[0]
+                if isinstance(hidden_states, torch.Tensor):
+                    self.add_tensor(f"layer_{layer_idx}_input", hidden_states.bfloat16())
+
+            # Output is typically (hidden_states, ...) or just hidden_states
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+            else:
+                hidden_states = output
+
+            if isinstance(hidden_states, torch.Tensor):
+                self.add_tensor(f"layer_{layer_idx}_output", hidden_states.bfloat16())
+
+        return hook
+
+    def _create_sublayer_hook(self, layer_idx: int, sublayer_name: str):
+        """Create a forward hook for a sublayer (attention or MLP)."""
+
+        def hook(module, input_tuple, output):
+            if isinstance(output, tuple):
+                out_tensor = output[0]
+            else:
+                out_tensor = output
+
+            if isinstance(out_tensor, torch.Tensor):
+                self.add_tensor(f"layer_{layer_idx}_{sublayer_name}_output", out_tensor.bfloat16())
+
+        return hook
+
+
+# Global dumper instance
+_global_dumper: Optional[MegatronTensorDumper] = None
+
+
+def get_megatron_tensor_dumper() -> Optional[MegatronTensorDumper]:
+    """Get the global Megatron tensor dumper if enabled."""
+    global _global_dumper
+
+    if _global_dumper is not None:
+        return _global_dumper
+
+    dump_dir = os.environ.get("MEGATRON_TENSOR_DUMP_DIR", "")
+    if not dump_dir:
+        return None
+
+    dump_layers_str = os.environ.get("MEGATRON_TENSOR_DUMP_LAYERS", "")
+    dump_layers = None
+    if dump_layers_str:
+        dump_layers = [int(x.strip()) for x in dump_layers_str.split(",") if x.strip()]
+
+    # Get distributed info
+    tp_rank = 0
+    pp_rank = 0
+    tp_size = 1
+
+    if dist.is_initialized():
+        tp_rank = dist.get_rank()
+        tp_size = dist.get_world_size()
+
+    _global_dumper = MegatronTensorDumper(
+        dump_dir=dump_dir,
+        dump_layers=dump_layers,
+        tp_rank=tp_rank,
+        pp_rank=pp_rank,
+        tp_size=tp_size,
+    )
+    return _global_dumper
+
+
+def register_megatron_tensor_hooks(model: torch.nn.Module) -> None:
+    """Register tensor dump hooks on a Megatron model if dumping is enabled."""
+    dumper = get_megatron_tensor_dumper()
+    if dumper is not None:
+        dumper.register_forward_hooks(model)
+
+
+def dump_megatron_tensors() -> None:
+    """Trigger dumping of collected tensors for the current forward pass."""
+    dumper = get_megatron_tensor_dumper()
+    if dumper is not None:
+        dumper.dump_current_tensors()
+
+
+def compare_tensor_dumps(
+    sglang_dump_dir: str,
+    megatron_dump_dir: str,
+    pass_id: int = 0,
+    verbose: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """
+    Compare tensor dumps from SGLang and Megatron.
+
+    Args:
+        sglang_dump_dir: Directory containing SGLang tensor dumps
+        megatron_dump_dir: Directory containing Megatron tensor dumps
+        pass_id: Forward pass ID to compare
+        verbose: Print detailed comparison results
+
+    Returns:
+        Dict mapping tensor names to comparison stats
+    """
+    sglang_path = Path(sglang_dump_dir)
+    megatron_path = Path(megatron_dump_dir)
+
+    # Find the Pass files
+    sglang_files = list(sglang_path.glob(f"*/Pass{pass_id:05d}.pt"))
+    megatron_files = list(megatron_path.glob(f"*/Pass{pass_id:05d}.pt"))
+
+    if not sglang_files:
+        print(f"No SGLang dump found for pass {pass_id} in {sglang_dump_dir}")
+        return {}
+    if not megatron_files:
+        print(f"No Megatron dump found for pass {pass_id} in {megatron_dump_dir}")
+        return {}
+
+    sglang_tensors = torch.load(sglang_files[0], map_location="cpu")
+    megatron_tensors = torch.load(megatron_files[0], map_location="cpu")
+
+    results = {}
+
+    # Create name mapping from SGLang to Megatron naming
+    # SGLang: model.layers.0, model.layers.0.self_attn, model.layers.0.mlp
+    # Megatron: layer_0_input, layer_0_output, layer_0_self_attention_output, layer_0_mlp_output
+    name_mapping = {}
+    for sglang_name in sglang_tensors.keys():
+        if "layers." in sglang_name:
+            # Extract layer number
+            parts = sglang_name.split(".")
+            for i, part in enumerate(parts):
+                if part == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                    layer_idx = int(parts[i + 1])
+                    # Determine which megatron tensor this maps to
+                    remaining = ".".join(parts[i + 2 :]) if i + 2 < len(parts) else ""
+                    if remaining == "":
+                        # Layer output
+                        name_mapping[sglang_name] = f"layer_{layer_idx}_output"
+                    elif "self_attn" in remaining or "attention" in remaining:
+                        name_mapping[sglang_name] = f"layer_{layer_idx}_self_attention_output"
+                    elif "mlp" in remaining:
+                        name_mapping[sglang_name] = f"layer_{layer_idx}_mlp_output"
+                    break
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Comparing SGLang and Megatron tensor dumps for pass {pass_id}")
+        print(f"{'='*60}")
+        print(f"SGLang tensors: {list(sglang_tensors.keys())[:10]}...")
+        print(f"Megatron tensors: {list(megatron_tensors.keys())[:10]}...")
+        print(f"Name mapping: {name_mapping}")
+        print()
+
+    for sglang_name, megatron_name in name_mapping.items():
+        if megatron_name not in megatron_tensors:
+            if verbose:
+                print(f"  {megatron_name}: NOT FOUND in Megatron dump")
+            continue
+
+        sglang_t = sglang_tensors[sglang_name]
+        megatron_t = megatron_tensors[megatron_name]
+
+        # Convert to same dtype for comparison
+        sglang_t = sglang_t.float()
+        megatron_t = megatron_t.float()
+
+        # Compute comparison stats
+        if sglang_t.shape != megatron_t.shape:
+            results[megatron_name] = {
+                "match": False,
+                "reason": f"Shape mismatch: SGLang {sglang_t.shape} vs Megatron {megatron_t.shape}",
+            }
+            if verbose:
+                print(f"  {megatron_name}: SHAPE MISMATCH - SGLang {sglang_t.shape} vs Megatron {megatron_t.shape}")
+            continue
+
+        diff = (sglang_t - megatron_t).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        rel_diff = (diff / (sglang_t.abs() + 1e-8)).mean().item()
+
+        results[megatron_name] = {
+            "match": max_diff < 1e-5,
+            "max_diff": max_diff,
+            "mean_diff": mean_diff,
+            "rel_diff": rel_diff,
+            "sglang_shape": list(sglang_t.shape),
+            "megatron_shape": list(megatron_t.shape),
+        }
+
+        if verbose:
+            match_str = "✓" if max_diff < 1e-5 else "✗"
+            print(
+                f"  {megatron_name}: {match_str} max_diff={max_diff:.6e}, "
+                f"mean_diff={mean_diff:.6e}, rel_diff={rel_diff:.6e}"
+            )
+
+    return results
+

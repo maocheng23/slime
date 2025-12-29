@@ -271,6 +271,13 @@ def get_model_provider_func(
             model.output_layer = SGLangCompatibleOutputLayer(model.output_layer)
             print("[True On-Policy] Wrapped output_layer with SGLang-compatible BF16 layer")
 
+        # Register tensor dump hooks for debugging (only when env var is set)
+        import os
+        if os.environ.get("MEGATRON_TENSOR_DUMP_DIR", ""):
+            from slime.backends.megatron_utils.debug_tensor_dump import register_megatron_tensor_hooks
+            register_megatron_tensor_hooks(model)
+            print(f"[Debug] Registered tensor dump hooks for model (role={role})")
+
         return model
 
     return model_provider
