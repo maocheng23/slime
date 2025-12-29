@@ -321,21 +321,95 @@ class MegatronTensorDumper:
             self._current_tensors["megatron_compared_position"] = torch.tensor([0])
 
     def add_logits(self, logits: torch.Tensor) -> None:
-        """Record logits for debugging."""
-        # Extract logits at response start position
-        target_pos = getattr(self, '_response_start_pos', 0)
+        """Record logits for debugging.
+        
+        For true on-policy comparison:
+        - SGLang decode at position N outputs logits predicting token at N+1
+        - Megatron logits at position N also predict token at N+1
+        
+        Saves logits at ALL response positions.
+        """
+        prompt_len = getattr(self, '_response_start_pos', 0)
+        
         if logits.dim() == 3:
             # [seq_len, batch, vocab_size] - Megatron format
-            if target_pos < logits.shape[0]:
-                self._current_tensors["logits"] = logits[target_pos:target_pos+1, :, :].cpu().bfloat16()
-            else:
-                self._current_tensors["logits"] = logits[0:1, :, :].cpu().bfloat16()
+            seq_len = logits.shape[0]
+            batch_size = logits.shape[1]
+            vocab_size = logits.shape[2]
+            
+            # Save sequence info
+            self._current_tensors["seq_len"] = torch.tensor([seq_len])
+            self._current_tensors["batch_size"] = torch.tensor([batch_size])
+            self._current_tensors["vocab_size"] = torch.tensor([vocab_size])
+            self._current_tensors["prompt_len"] = torch.tensor([prompt_len])
+            response_len = seq_len - prompt_len
+            self._current_tensors["response_len_from_logits"] = torch.tensor([response_len])
+            
+            # Save full logits tensor
+            self._current_tensors["logits_full"] = logits.cpu().bfloat16()
+            
+            # Save logits at EACH response position for decode comparison
+            response_positions = []
+            for i in range(response_len):
+                pos = prompt_len + i
+                if pos < seq_len:
+                    # Megatron format: [seq, batch, vocab] -> squeeze batch dim
+                    self._current_tensors[f"logits_pos_{pos}"] = logits[pos:pos+1, 0, :].cpu().bfloat16()
+                    response_positions.append(pos)
+            
+            self._current_tensors["response_logits_positions"] = torch.tensor(response_positions)
+            
+            # For prefill comparison: logits at prompt_len - 1
+            if prompt_len > 0 and prompt_len - 1 < seq_len:
+                self._current_tensors["logits_at_prompt_end"] = logits[prompt_len-1:prompt_len, 0, :].cpu().bfloat16()
+                self._current_tensors["logits_prompt_end_pos"] = torch.tensor([prompt_len - 1])
+            
+            # Default position for backwards compatibility
+            target_pos = prompt_len if prompt_len < seq_len else 0
+            self._current_tensors["logits"] = logits[target_pos:target_pos+1, :, :].cpu().bfloat16()
+            self._current_tensors["logits_pos"] = torch.tensor([target_pos])
+            
+            logger.info(f"[MegatronTensorDumper] Saved logits: seq_len={seq_len}, "
+                       f"prompt_len={prompt_len}, response_len={response_len}, "
+                       f"batch_size={batch_size}, vocab_size={vocab_size}")
+            
         elif logits.dim() == 2:
             # [seq_len, vocab_size]
-            if target_pos < logits.shape[0]:
-                self._current_tensors["logits"] = logits[target_pos:target_pos+1, :].cpu().bfloat16()
-            else:
-                self._current_tensors["logits"] = logits[0:1, :].cpu().bfloat16()
+            seq_len = logits.shape[0]
+            vocab_size = logits.shape[1]
+            
+            # Save sequence info
+            self._current_tensors["seq_len"] = torch.tensor([seq_len])
+            self._current_tensors["vocab_size"] = torch.tensor([vocab_size])
+            self._current_tensors["prompt_len"] = torch.tensor([prompt_len])
+            response_len = seq_len - prompt_len
+            self._current_tensors["response_len_from_logits"] = torch.tensor([response_len])
+            
+            # Save full logits tensor
+            self._current_tensors["logits_full"] = logits.cpu().bfloat16()
+            
+            # Save logits at EACH response position
+            response_positions = []
+            for i in range(response_len):
+                pos = prompt_len + i
+                if pos < seq_len:
+                    self._current_tensors[f"logits_pos_{pos}"] = logits[pos:pos+1, :].cpu().bfloat16()
+                    response_positions.append(pos)
+            
+            self._current_tensors["response_logits_positions"] = torch.tensor(response_positions)
+            
+            # Prefill comparison
+            if prompt_len > 0 and prompt_len - 1 < seq_len:
+                self._current_tensors["logits_at_prompt_end"] = logits[prompt_len-1:prompt_len, :].cpu().bfloat16()
+                self._current_tensors["logits_prompt_end_pos"] = torch.tensor([prompt_len - 1])
+            
+            # Default position
+            target_pos = prompt_len if prompt_len < seq_len else 0
+            self._current_tensors["logits"] = logits[target_pos:target_pos+1, :].cpu().bfloat16()
+            self._current_tensors["logits_pos"] = torch.tensor([target_pos])
+            
+            logger.info(f"[MegatronTensorDumper] Saved logits: seq_len={seq_len}, "
+                       f"prompt_len={prompt_len}, response_len={response_len}, vocab_size={vocab_size}")
         else:
             self._current_tensors["logits"] = logits.cpu().bfloat16()
 

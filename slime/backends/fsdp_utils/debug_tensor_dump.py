@@ -325,26 +325,33 @@ class FSDPTensorDumper:
         - FSDP logits at position N also predict token at N+1
         - So we need to compare FSDP logits at position N with SGLang decode pass at position N
         
-        Saves logits at multiple positions:
+        Saves logits at ALL response positions:
         - logits_pos_X: logits at each response position (for decode comparison)
         - logits_at_prompt_end: at prompt_len - 1 (for prefill comparison)
+        - logits_full: the complete logits tensor for all positions
         """
         prompt_len = getattr(self, '_response_start_pos', 0)
         
         if logits.dim() == 2:
             # [seq_len, vocab_size]
             seq_len = logits.shape[0]
+            vocab_size = logits.shape[1]
             
-            # Save logits at each response position for decode comparison
-            # Response tokens are at positions [prompt_len, prompt_len+1, ...]
-            # Logits at position i predict token at position i+1
+            # Save sequence info
+            self._current_tensors["seq_len"] = torch.tensor([seq_len])
+            self._current_tensors["vocab_size"] = torch.tensor([vocab_size])
+            self._current_tensors["prompt_len"] = torch.tensor([prompt_len])
+            response_len = seq_len - prompt_len
+            self._current_tensors["response_len"] = torch.tensor([response_len])
+            
+            # Save full logits tensor
+            self._current_tensors["logits_full"] = logits.cpu().bfloat16()
+            
+            # Save logits at EACH response position for decode comparison
             response_positions = []
-            for i in range(min(10, seq_len - prompt_len)):  # Save up to 10 response positions
+            for i in range(response_len):  # Save ALL response positions
                 pos = prompt_len + i
                 if pos < seq_len:
-                    # Logits at position (pos-1) predict token at position pos
-                    # But for decode comparison, SGLang decode at pos outputs logits for pos+1
-                    # So we save logits at position pos which predicts pos+1
                     self._current_tensors[f"logits_pos_{pos}"] = logits[pos:pos+1, :].cpu().bfloat16()
                     response_positions.append(pos)
             
@@ -362,13 +369,30 @@ class FSDPTensorDumper:
             self._current_tensors["logits"] = logits[target_pos:target_pos+1, :].cpu().bfloat16()
             self._current_tensors["logits_pos"] = torch.tensor([target_pos])
             
+            logger.info(f"[FSDPTensorDumper] Saved logits: seq_len={seq_len}, "
+                       f"prompt_len={prompt_len}, response_len={response_len}, "
+                       f"vocab_size={vocab_size}")
+            
         elif logits.dim() == 3:
             # [batch, seq_len, vocab_size]
+            batch_size = logits.shape[0]
             seq_len = logits.shape[1]
+            vocab_size = logits.shape[2]
             
-            # Save logits at each response position
+            # Save sequence info
+            self._current_tensors["batch_size"] = torch.tensor([batch_size])
+            self._current_tensors["seq_len"] = torch.tensor([seq_len])
+            self._current_tensors["vocab_size"] = torch.tensor([vocab_size])
+            self._current_tensors["prompt_len"] = torch.tensor([prompt_len])
+            response_len = seq_len - prompt_len
+            self._current_tensors["response_len"] = torch.tensor([response_len])
+            
+            # Save full logits tensor
+            self._current_tensors["logits_full"] = logits.cpu().bfloat16()
+            
+            # Save logits at EACH response position
             response_positions = []
-            for i in range(min(10, seq_len - prompt_len)):
+            for i in range(response_len):
                 pos = prompt_len + i
                 if pos < seq_len:
                     self._current_tensors[f"logits_pos_{pos}"] = logits[:, pos:pos+1, :].squeeze(1).cpu().bfloat16()
@@ -385,6 +409,9 @@ class FSDPTensorDumper:
             target_pos = prompt_len if prompt_len < seq_len else 0
             self._current_tensors["logits"] = logits[:, target_pos:target_pos+1, :].squeeze(1).cpu().bfloat16()
             self._current_tensors["logits_pos"] = torch.tensor([target_pos])
+            
+            logger.info(f"[FSDPTensorDumper] Saved logits: batch={batch_size}, seq_len={seq_len}, "
+                       f"prompt_len={prompt_len}, response_len={response_len}, vocab_size={vocab_size}")
         else:
             self._current_tensors["logits"] = logits.cpu().bfloat16()
 

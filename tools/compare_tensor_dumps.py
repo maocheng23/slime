@@ -730,6 +730,22 @@ def main():
         print(f"    total_len: {megatron_tensors['debug_total_len'].item()}")
         print(f"    response_len: {megatron_tensors['debug_response_len'].item()}")
     
+    # Show logits info
+    if "seq_len" in megatron_tensors:
+        print(f"\n  Logits info from {backend_name}:")
+        print(f"    seq_len: {megatron_tensors['seq_len'].item()}")
+        if "prompt_len" in megatron_tensors:
+            print(f"    prompt_len: {megatron_tensors['prompt_len'].item()}")
+        if "response_len" in megatron_tensors:
+            print(f"    response_len: {megatron_tensors['response_len'].item()}")
+        elif "response_len_from_logits" in megatron_tensors:
+            print(f"    response_len: {megatron_tensors['response_len_from_logits'].item()}")
+        if "vocab_size" in megatron_tensors:
+            print(f"    vocab_size: {megatron_tensors['vocab_size'].item()}")
+        if "response_logits_positions" in megatron_tensors:
+            positions = megatron_tensors["response_logits_positions"].tolist()
+            print(f"    response_logits_positions: {positions}")
+    
     # Check if tokens match
     if sglang_token is not None and megatron_token is not None:
         if sglang_token == megatron_token:
