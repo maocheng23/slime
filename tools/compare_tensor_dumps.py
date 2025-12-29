@@ -854,11 +854,31 @@ def main():
         print(f"  Megatron direct logprobs: shape={megatron_direct_logprobs.shape}, dtype={megatron_direct_logprobs.dtype}")
     
     # Compare logprobs
-    # For prefill comparison, use the prefill-matched logits if available
+    # For decode comparison, find FSDP logits at the matching position
     megatron_logits_to_compare = megatron_logits
     logits_source = "default"
     
-    if megatron_logits_prefill is not None and sglang_seq_len is not None and sglang_seq_len > 1:
+    # Get SGLang position for this decode pass
+    sglang_position = None
+    if "model.forward_batch_info.positions" in sglang_tensors:
+        positions = sglang_tensors["model.forward_batch_info.positions"]
+        if positions.numel() == 1:  # Decode pass (single token)
+            sglang_position = positions.item()
+    
+    # For decode passes, try to find FSDP logits at the matching position
+    if sglang_position is not None and sglang_seq_len == 1:  # Decode pass
+        pos_key = f"logits_pos_{sglang_position}"
+        if pos_key in megatron_tensors:
+            megatron_logits_to_compare = megatron_tensors[pos_key]
+            logits_source = f"decode-matched (position {sglang_position})"
+            print(f"\n  ✓ Found {backend_name} logits at position {sglang_position} for decode comparison")
+        else:
+            # List available positions
+            available_pos = [k for k in megatron_tensors.keys() if k.startswith("logits_pos_")]
+            print(f"\n  ⚠️ {pos_key} not found in {backend_name} dump")
+            print(f"     Available: {available_pos[:5]}...")
+    elif megatron_logits_prefill is not None and sglang_seq_len is not None and sglang_seq_len > 1:
+        # Prefill comparison
         megatron_logits_to_compare = megatron_logits_prefill
         logits_source = "prefill-matched (prompt_end)"
     
