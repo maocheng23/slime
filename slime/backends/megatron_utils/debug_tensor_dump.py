@@ -53,37 +53,50 @@ class MegatronTensorDumper:
     def add_tensor(self, name: str, tensor: torch.Tensor | tuple | list) -> None:
         """Add a tensor to the current forward pass collection.
         
-        Only saves the FIRST token position to match SGLang's decode phase output.
-        Megatron layout: [seq_len, batch, hidden] -> extract [0, :, :] -> [batch, hidden]
-        Then squeeze batch if batch=1 -> [hidden] or [1, hidden] for consistency
+        Saves the FIRST RESPONSE token position to match SGLang's decode phase.
+        Megatron layout: [seq_len, batch, hidden]
+        
+        If response_start_position is set, extract from that position.
+        Otherwise, extract from position 0 as fallback.
         """
-        def extract_first_token(t: torch.Tensor) -> torch.Tensor:
-            """Extract first token from Megatron tensor layout."""
+        target_pos = getattr(self, '_response_start_pos', 0)
+        
+        def extract_token_at_position(t: torch.Tensor, pos: int) -> torch.Tensor:
+            """Extract token at specified position from Megatron tensor layout."""
             if t.dim() == 3:
-                # [seq_len, batch, hidden] -> [batch, hidden]
-                first_token = t[0, :, :]
-                if first_token.shape[0] == 1:
-                    # [1, hidden] - keep this shape for consistency with SGLang
-                    return first_token
-                return first_token
+                # [seq_len, batch, hidden]
+                seq_len = t.shape[0]
+                if pos >= seq_len:
+                    pos = seq_len - 1  # Use last token if pos is out of bounds
+                token = t[pos:pos+1, :, :]  # Keep dim: [1, batch, hidden]
+                if token.shape[1] == 1:
+                    return token[:, 0, :]  # [1, hidden]
+                return token[0, :, :]  # [batch, hidden]
             elif t.dim() == 2:
-                # [seq_len, hidden] -> [1, hidden]
-                return t[0:1, :]
+                # [seq_len, hidden]
+                seq_len = t.shape[0]
+                if pos >= seq_len:
+                    pos = seq_len - 1
+                return t[pos:pos+1, :]  # [1, hidden]
             else:
-                # Other shapes, just return as-is
                 return t
         
         if isinstance(tensor, (tuple, list)):
             tensors = []
             for t in tensor:
                 if t is not None and isinstance(t, torch.Tensor):
-                    tensors.append(extract_first_token(t).cpu())
+                    tensors.append(extract_token_at_position(t, target_pos).cpu())
             if len(tensors) == 1:
                 self._current_tensors[name] = tensors[0]
             elif len(tensors) > 1:
                 self._current_tensors[name] = tensors
         elif isinstance(tensor, torch.Tensor):
-            self._current_tensors[name] = extract_first_token(tensor).cpu()
+            self._current_tensors[name] = extract_token_at_position(tensor, target_pos).cpu()
+
+    def set_response_start_position(self, pos: int) -> None:
+        """Set the response start position for token extraction."""
+        self._response_start_pos = pos
+        logger.info(f"[MegatronTensorDumper] Set response_start_pos={pos}")
 
     def dump_current_tensors(self) -> None:
         """Dump all collected tensors for the current forward pass."""
@@ -284,11 +297,19 @@ class MegatronTensorDumper:
 
     def add_input_ids(self, input_ids: torch.Tensor) -> None:
         """Record the input token IDs for debugging."""
-        # Save full input_ids (not just first token) for reference
+        # Save full input_ids for reference
         self._current_tensors["megatron_input_ids"] = input_ids.cpu()
-        # Also save first token specifically
-        if input_ids.dim() >= 1:
-            self._current_tensors["megatron_first_token_id"] = input_ids.flatten()[0:1].cpu()
+        
+        # Save the token at the response start position (what we're actually comparing)
+        target_pos = getattr(self, '_response_start_pos', 0)
+        flat_ids = input_ids.flatten()
+        if target_pos < len(flat_ids):
+            self._current_tensors["megatron_compared_token_id"] = flat_ids[target_pos:target_pos+1].cpu()
+            self._current_tensors["megatron_compared_position"] = torch.tensor([target_pos])
+        else:
+            # Fallback to first token
+            self._current_tensors["megatron_compared_token_id"] = flat_ids[0:1].cpu()
+            self._current_tensors["megatron_compared_position"] = torch.tensor([0])
 
     def _create_sublayer_hook(self, layer_idx: int, sublayer_name: str):
         """Create a forward hook for a sublayer (attention or MLP)."""

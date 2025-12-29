@@ -404,13 +404,15 @@ def main():
         positions = sglang_tensors["model.forward_batch_info.positions"]
         print(f"  SGLang positions: {positions.tolist()}")
     
-    if "megatron_first_token_id" in megatron_tensors:
-        first_token = megatron_tensors["megatron_first_token_id"]
-        megatron_token = first_token.item() if first_token.numel() > 0 else None
-        print(f"  Megatron first token: {first_token.tolist()}")
+    if "megatron_compared_token_id" in megatron_tensors:
+        compared_token = megatron_tensors["megatron_compared_token_id"]
+        megatron_token = compared_token.item() if compared_token.numel() > 0 else None
+        print(f"  Megatron compared token: {compared_token.tolist()}")
+    if "megatron_compared_position" in megatron_tensors:
+        pos = megatron_tensors["megatron_compared_position"]
+        print(f"  Megatron compared position: {pos.tolist()}")
     if "megatron_input_ids" in megatron_tensors:
         input_ids = megatron_tensors["megatron_input_ids"]
-        # Show first few tokens
         flat = input_ids.flatten()[:10]
         print(f"  Megatron input_ids (first 10): {flat.tolist()}")
     

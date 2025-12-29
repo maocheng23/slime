@@ -225,6 +225,14 @@ def forward_only(
             dumper = get_megatron_tensor_dumper()
             if dumper is not None:
                 dumper.add_input_ids(tokens)
+                # Set response start position based on total_lengths - response_lengths
+                # This is the position where response starts in the sequence
+                if total_lengths is not None and response_lengths is not None:
+                    # Use the first sample's response start position
+                    prompt_len = total_lengths[0] - response_lengths[0]
+                    dumper.set_response_start_position(int(prompt_len))
+                    logger.info(f"[Debug] Response starts at position {prompt_len}, "
+                               f"total_len={total_lengths[0]}, response_len={response_lengths[0]}")
         
         output_tensor = model(
             input_ids=tokens,
