@@ -253,6 +253,13 @@ def forward_only(
             loss_mask=batch["full_loss_masks"],
             **(batch["multimodal_inputs"] if batch["multimodal_inputs"] is not None else {}),
         )
+        
+        # Save logits for debugging
+        if tensor_dump_enabled:
+            from slime.backends.megatron_utils.debug_tensor_dump import get_megatron_tensor_dumper
+            dumper = get_megatron_tensor_dumper()
+            if dumper is not None and hasattr(output_tensor, 'logits'):
+                dumper.add_logits(output_tensor.logits)
 
         return output_tensor, partial(
             f,

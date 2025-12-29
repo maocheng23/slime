@@ -624,13 +624,13 @@ class FSDPTrainRayActor(TrainRayActor):
         
         logits = self.model(**model_args).logits.squeeze(0).float()
         
-        # Dump tensors after forward pass
+        # Save logits for debugging
         if os.environ.get("FSDP_TENSOR_DUMP_DIR", ""):
             from slime.backends.fsdp_utils.debug_tensor_dump import get_fsdp_tensor_dumper
             dumper = get_fsdp_tensor_dumper()
             if dumper is not None:
-                dumper.dump_current_tensors()
-
+                dumper.add_logits(logits)
+        
         # Compute log probs and entropy (unified for both CP and non-CP modes)
         log_probs, entropy_result = get_logprob_and_entropy_with_cp(
             logits=logits,
@@ -642,6 +642,15 @@ class FSDPTrainRayActor(TrainRayActor):
             allow_compile=not self.args.true_on_policy_mode,
             temperature=self.args.rollout_temperature,
         )
+        
+        # Save logprobs for debugging
+        if os.environ.get("FSDP_TENSOR_DUMP_DIR", ""):
+            from slime.backends.fsdp_utils.debug_tensor_dump import get_fsdp_tensor_dumper
+            dumper = get_fsdp_tensor_dumper()
+            if dumper is not None:
+                dumper.add_logprobs(log_probs)
+                # Dump all tensors (including logits and logprobs) after forward pass
+                dumper.dump_current_tensors()
         packed_batch["cur_log_probs"] = log_probs
         packed_batch["entropy"] = entropy_result
 

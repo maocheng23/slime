@@ -235,6 +235,18 @@ class FSDPTensorDumper:
 
     def _hook_sublayers(self, layer: torch.nn.Module, layer_idx: int) -> None:
         """Hook into attention and MLP sublayers."""
+        # Hook input_layernorm output (to match Megatron naming)
+        if hasattr(layer, 'input_layernorm'):
+            layer.input_layernorm.register_forward_hook(
+                self._create_sublayer_hook(layer_idx, "input_layernorm")
+            )
+        
+        # Hook post_attention_layernorm output (to match Megatron naming)
+        if hasattr(layer, 'post_attention_layernorm'):
+            layer.post_attention_layernorm.register_forward_hook(
+                self._create_sublayer_hook(layer_idx, "post_attention_layernorm")
+            )
+        
         # Hook self-attention
         if hasattr(layer, 'self_attn'):
             layer.self_attn.register_forward_hook(
@@ -246,19 +258,31 @@ class FSDPTensorDumper:
             layer.mlp.register_forward_hook(
                 self._create_sublayer_hook(layer_idx, "mlp")
             )
-
-        # Hook layer norms
-        if hasattr(layer, 'input_layernorm'):
-            layer.input_layernorm.register_forward_hook(
-                self._create_sublayer_hook(layer_idx, "input_layernorm")
-            )
-        if hasattr(layer, 'post_attention_layernorm'):
-            layer.post_attention_layernorm.register_forward_hook(
-                self._create_sublayer_hook(layer_idx, "post_attention_layernorm")
-            )
+            # Hook MLP sublayers to match Megatron naming
+            if hasattr(layer.mlp, 'gate_proj') and hasattr(layer.mlp, 'up_proj'):
+                # For models with separate gate/up projections
+                layer.mlp.gate_proj.register_forward_hook(
+                    self._create_sublayer_hook(layer_idx, "mlp.gate_up_proj")
+                )
+                layer.mlp.up_proj.register_forward_hook(
+                    self._create_sublayer_hook(layer_idx, "mlp.gate_up_proj")
+                )
+            if hasattr(layer.mlp, 'down_proj'):
+                layer.mlp.down_proj.register_forward_hook(
+                    self._create_sublayer_hook(layer_idx, "mlp.down_proj")
+                )
 
     def _create_sublayer_hook(self, layer_idx: int, sublayer_name: str):
-        """Create a forward hook for a sublayer (attention or MLP)."""
+        """Create a forward hook for a sublayer (attention or MLP).
+        
+        Naming convention matches Megatron:
+        - layer_{idx}_input_layernorm_output
+        - layer_{idx}_post_attention_layernorm_output
+        - layer_{idx}_self_attention_output
+        - layer_{idx}_mlp_output
+        - layer_{idx}_mlp.gate_up_proj_output
+        - layer_{idx}_mlp.down_proj_output
+        """
 
         def hook(module, input_tuple, output):
             if isinstance(output, tuple):
@@ -267,9 +291,13 @@ class FSDPTensorDumper:
                 out_tensor = output
 
             if isinstance(out_tensor, torch.Tensor):
-                self.add_tensor(
-                    f"layer_{layer_idx}_{sublayer_name}_output", out_tensor.bfloat16()
-                )
+                # Use Megatron naming convention
+                if "." in sublayer_name:
+                    # For nested names like "mlp.gate_up_proj"
+                    tensor_name = f"layer_{layer_idx}_{sublayer_name}_output"
+                else:
+                    tensor_name = f"layer_{layer_idx}_{sublayer_name}_output"
+                self.add_tensor(tensor_name, out_tensor.bfloat16())
 
         return hook
 
@@ -288,6 +316,44 @@ class FSDPTensorDumper:
             # Fallback to first token
             self._current_tensors["fsdp_compared_token_id"] = flat_ids[0:1].cpu()
             self._current_tensors["fsdp_compared_position"] = torch.tensor([0])
+
+    def add_logits(self, logits: torch.Tensor) -> None:
+        """Record logits for debugging."""
+        # Extract logits at response start position
+        target_pos = getattr(self, '_response_start_pos', 0)
+        if logits.dim() == 2:
+            # [seq_len, vocab_size]
+            if target_pos < logits.shape[0]:
+                self._current_tensors["logits"] = logits[target_pos:target_pos+1, :].cpu().bfloat16()
+            else:
+                self._current_tensors["logits"] = logits[0:1, :].cpu().bfloat16()
+        elif logits.dim() == 3:
+            # [batch, seq_len, vocab_size]
+            if target_pos < logits.shape[1]:
+                self._current_tensors["logits"] = logits[:, target_pos:target_pos+1, :].cpu().bfloat16()
+            else:
+                self._current_tensors["logits"] = logits[:, 0:1, :].cpu().bfloat16()
+        else:
+            self._current_tensors["logits"] = logits.cpu().bfloat16()
+
+    def add_logprobs(self, logprobs: torch.Tensor) -> None:
+        """Record log probabilities for debugging."""
+        # Extract logprobs at response start position
+        target_pos = getattr(self, '_response_start_pos', 0)
+        if logprobs.dim() == 1:
+            # [seq_len]
+            if target_pos < logprobs.shape[0]:
+                self._current_tensors["logprobs"] = logprobs[target_pos:target_pos+1].cpu().bfloat16()
+            else:
+                self._current_tensors["logprobs"] = logprobs[0:1].cpu().bfloat16()
+        elif logprobs.dim() == 2:
+            # [batch, seq_len]
+            if target_pos < logprobs.shape[1]:
+                self._current_tensors["logprobs"] = logprobs[:, target_pos:target_pos+1].cpu().bfloat16()
+            else:
+                self._current_tensors["logprobs"] = logprobs[:, 0:1].cpu().bfloat16()
+        else:
+            self._current_tensors["logprobs"] = logprobs.cpu().bfloat16()
 
 
 def register_fsdp_tensor_hooks(model: torch.nn.Module) -> None:

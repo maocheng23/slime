@@ -3,7 +3,7 @@
 Check SGLang tensor dump passes to see what tokens are being processed.
 
 Usage:
-    python check_sglang_passes.py /tmp/sglang_tensor_dump
+    python /root/slime/tools/check_sglang_passes.py /tmp/sglang_tensor_dump
 """
 
 import sys

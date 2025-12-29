@@ -3,7 +3,7 @@
 Check Megatron tensor dump passes to see what tokens are being processed.
 
 Usage:
-    python check_megatron_passes.py /tmp/megatron_tensor_dump
+    python /root/slime/tools/check_megatron_passes.py /tmp/megatron_tensor_dump
 """
 
 import sys

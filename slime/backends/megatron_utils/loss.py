@@ -149,6 +149,17 @@ def get_log_probs_and_entropy(
 
         log_probs_list.append(log_prob.squeeze(-1))
         entropy_list.append(entropy)
+        
+        # Save logprobs for debugging (save first sample's first response token)
+        import os
+        if os.environ.get("MEGATRON_TENSOR_DUMP_DIR", "") and len(log_probs_list) == 1:
+            from slime.backends.megatron_utils.debug_tensor_dump import get_megatron_tensor_dumper
+            dumper = get_megatron_tensor_dumper()
+            if dumper is not None and len(log_probs_list) > 0:
+                # log_prob is [R] where R is response length
+                # We want the first token of the response
+                first_logprob = log_probs_list[0][0:1] if len(log_probs_list[0]) > 0 else log_probs_list[0]
+                dumper.add_logprobs(first_logprob)
 
     res = {
         "log_probs": log_probs_list,

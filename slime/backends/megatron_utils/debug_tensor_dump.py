@@ -320,6 +320,48 @@ class MegatronTensorDumper:
             self._current_tensors["megatron_compared_token_id"] = flat_ids[0:1].cpu()
             self._current_tensors["megatron_compared_position"] = torch.tensor([0])
 
+    def add_logits(self, logits: torch.Tensor) -> None:
+        """Record logits for debugging."""
+        # Extract logits at response start position
+        target_pos = getattr(self, '_response_start_pos', 0)
+        if logits.dim() == 3:
+            # [seq_len, batch, vocab_size] - Megatron format
+            if target_pos < logits.shape[0]:
+                self._current_tensors["logits"] = logits[target_pos:target_pos+1, :, :].cpu().bfloat16()
+            else:
+                self._current_tensors["logits"] = logits[0:1, :, :].cpu().bfloat16()
+        elif logits.dim() == 2:
+            # [seq_len, vocab_size]
+            if target_pos < logits.shape[0]:
+                self._current_tensors["logits"] = logits[target_pos:target_pos+1, :].cpu().bfloat16()
+            else:
+                self._current_tensors["logits"] = logits[0:1, :].cpu().bfloat16()
+        else:
+            self._current_tensors["logits"] = logits.cpu().bfloat16()
+
+    def add_logprobs(self, logprobs: torch.Tensor) -> None:
+        """Record log probabilities for debugging."""
+        # Extract logprobs at response start position
+        target_pos = getattr(self, '_response_start_pos', 0)
+        if logprobs.dim() == 1:
+            # [seq_len]
+            if target_pos < logprobs.shape[0]:
+                self._current_tensors["logprobs"] = logprobs[target_pos:target_pos+1].cpu().bfloat16()
+            else:
+                self._current_tensors["logprobs"] = logprobs[0:1].cpu().bfloat16()
+        elif logprobs.dim() == 2:
+            # [batch, seq_len] or [seq_len, batch]
+            # Try to handle both cases
+            if target_pos < logprobs.shape[-1]:
+                if logprobs.shape[0] == 1:
+                    self._current_tensors["logprobs"] = logprobs[:, target_pos:target_pos+1].cpu().bfloat16()
+                else:
+                    self._current_tensors["logprobs"] = logprobs[target_pos:target_pos+1, :].cpu().bfloat16()
+            else:
+                self._current_tensors["logprobs"] = logprobs[:, 0:1].cpu().bfloat16() if logprobs.shape[0] == 1 else logprobs[0:1, :].cpu().bfloat16()
+        else:
+            self._current_tensors["logprobs"] = logprobs.cpu().bfloat16()
+
     def _create_sublayer_hook(self, layer_idx: int, sublayer_name: str):
         """Create a forward hook for a sublayer (attention or MLP)."""
 

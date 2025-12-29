@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-Compare tensor dumps from SGLang and Megatron for debugging numerical differences.
+Compare tensor dumps from SGLang and Megatron/FSDP for debugging numerical differences.
 
 Usage:
-    python compare_tensor_dumps.py \
+    # Compare SGLang vs Megatron
+    python /root/slime/tools/compare_tensor_dumps.py \
         --sglang-dir /tmp/sglang_tensor_dump \
         --megatron-dir /tmp/megatron_tensor_dump \
-        --pass-id 0
+        --auto-match
+    
+    # Compare SGLang vs FSDP
+    python /root/slime/tools/compare_tensor_dumps.py \
+        --sglang-dir /tmp/sglang_tensor_dump \
+        --megatron-dir /tmp/fsdp_tensor_dump \
+        --auto-match
 
 The script will:
 1. Load tensor dumps from both directories
-2. Map SGLang tensor names to Megatron tensor names
+2. Map SGLang tensor names to Megatron/FSDP tensor names
 3. Compute and display per-tensor statistics (max diff, mean diff, relative diff)
 4. Identify the first layer where differences become significant
+5. Compute and compare logprobs from logits using SGLang's formula
 """
 
 import argparse
@@ -21,6 +29,47 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+
+def compute_logprobs_from_logits(
+    logits: torch.Tensor, 
+    temperature: float = 1.0,
+    target_token_id: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Compute log probabilities from logits using SGLang's true on-policy formula.
+    
+    SGLang formula (when rl_on_policy_target is enabled):
+        logits_bf16 = logits.bfloat16()
+        logits_div_temp = logits_bf16.div(temperature).bfloat16()
+        logprobs = torch.log_softmax(logits_div_temp, dim=-1)
+    
+    Args:
+        logits: Raw logits tensor, shape [seq_len, vocab_size] or [batch, seq_len, vocab_size]
+        temperature: Temperature for softmax (default 1.0)
+        target_token_id: If provided, also return the logprob for this specific token
+        
+    Returns:
+        (full_logprobs, target_logprob) where target_logprob is the logprob for target_token_id
+    """
+    # Apply SGLang's exact formula
+    logits_bf16 = logits.bfloat16()
+    logits_div_temp = logits_bf16.div(temperature).bfloat16()
+    logprobs = torch.log_softmax(logits_div_temp, dim=-1)
+    
+    target_logprob = None
+    if target_token_id is not None:
+        # Get the logprob for the specific target token
+        if logprobs.dim() == 1:
+            target_logprob = logprobs[target_token_id]
+        elif logprobs.dim() == 2:
+            # [seq_len, vocab_size] -> get first position's target token logprob
+            target_logprob = logprobs[0, target_token_id]
+        elif logprobs.dim() == 3:
+            # [batch, seq_len, vocab_size] -> get first batch, first position
+            target_logprob = logprobs[0, 0, target_token_id]
+    
+    return logprobs, target_logprob
 
 
 def find_dump_files(dump_dir: str, pass_id: int) -> list[Path]:
@@ -76,6 +125,16 @@ def get_token_from_dump(dump_file: Path) -> tuple[int | None, int | None]:
             token_id = ids.item()
     if "megatron_compared_position" in tensors:
         pos = tensors["megatron_compared_position"]
+        if pos.numel() > 0:
+            position = pos.item()
+    
+    # FSDP format
+    if "fsdp_compared_token_id" in tensors:
+        ids = tensors["fsdp_compared_token_id"]
+        if ids.numel() > 0:
+            token_id = ids.item()
+    if "fsdp_compared_position" in tensors:
+        pos = tensors["fsdp_compared_position"]
         if pos.numel() > 0:
             position = pos.item()
     
@@ -553,21 +612,32 @@ def main():
         positions = sglang_tensors["model.forward_batch_info.positions"]
         print(f"  SGLang positions: {positions.tolist()}")
     
-    if "megatron_compared_token_id" in megatron_tensors:
-        compared_token = megatron_tensors["megatron_compared_token_id"]
+    # Detect backend type (Megatron or FSDP)
+    backend_name = "Megatron"
+    token_key_prefix = "megatron"
+    if "fsdp_compared_token_id" in megatron_tensors:
+        backend_name = "FSDP"
+        token_key_prefix = "fsdp"
+    
+    compared_token_key = f"{token_key_prefix}_compared_token_id"
+    compared_pos_key = f"{token_key_prefix}_compared_position"
+    input_ids_key = f"{token_key_prefix}_input_ids"
+    
+    if compared_token_key in megatron_tensors:
+        compared_token = megatron_tensors[compared_token_key]
         megatron_token = compared_token.item() if compared_token.numel() > 0 else None
-        print(f"  Megatron compared token: {compared_token.tolist()}")
-    if "megatron_compared_position" in megatron_tensors:
-        pos = megatron_tensors["megatron_compared_position"]
-        print(f"  Megatron compared position: {pos.tolist()}")
-    if "megatron_input_ids" in megatron_tensors:
-        input_ids = megatron_tensors["megatron_input_ids"]
+        print(f"  {backend_name} compared token: {compared_token.tolist()}")
+    if compared_pos_key in megatron_tensors:
+        pos = megatron_tensors[compared_pos_key]
+        print(f"  {backend_name} compared position: {pos.tolist()}")
+    if input_ids_key in megatron_tensors:
+        input_ids = megatron_tensors[input_ids_key]
         flat = input_ids.flatten()[:10]
-        print(f"  Megatron input_ids (first 10): {flat.tolist()}")
+        print(f"  {backend_name} input_ids (first 10): {flat.tolist()}")
     
     # Show sequence length debug info
     if "debug_prompt_len" in megatron_tensors:
-        print(f"\n  Debug info from Megatron:")
+        print(f"\n  Debug info from {backend_name}:")
         print(f"    prompt_len: {megatron_tensors['debug_prompt_len'].item()}")
         print(f"    total_len: {megatron_tensors['debug_total_len'].item()}")
         print(f"    response_len: {megatron_tensors['debug_response_len'].item()}")
@@ -581,6 +651,122 @@ def main():
             print(f"    SGLang is processing token: {sglang_token}")
             print(f"    Megatron is processing token: {megatron_token}")
             print(f"    This explains why hidden states are different!")
+    print("=" * 60)
+    
+    # Compare logprobs computed from logits
+    print("\n" + "=" * 60)
+    print("LOGPROBS COMPARISON (computed from logits)")
+    print("=" * 60)
+    
+    # Get target token for logprob extraction (next token after the compared position)
+    next_token_id = None
+    if input_ids_key in megatron_tensors and compared_pos_key in megatron_tensors:
+        input_ids = megatron_tensors[input_ids_key].flatten()
+        compared_pos = megatron_tensors[compared_pos_key].item()
+        # The next token is at position compared_pos + 1 (what we're predicting)
+        if compared_pos + 1 < len(input_ids):
+            next_token_id = input_ids[compared_pos + 1].item()
+            print(f"  Target (next) token ID: {next_token_id} (at position {compared_pos + 1})")
+    
+    # Find logits tensors
+    sglang_logits = None
+    megatron_logits = None
+    
+    # SGLang: lm_head contains the hidden state before logits, or logits_processor contains logits
+    if "logits_processor" in sglang_tensors:
+        sglang_logits = sglang_tensors["logits_processor"]
+        print(f"  SGLang logits (from logits_processor): shape={sglang_logits.shape}, dtype={sglang_logits.dtype}")
+    elif "lm_head" in sglang_tensors:
+        # lm_head in SGLang tensor dump is actually the hidden state, not logits
+        print(f"  SGLang lm_head is hidden state, not logits - skipping direct comparison")
+    
+    # Megatron: logits or lm_head
+    if "logits" in megatron_tensors:
+        megatron_logits = megatron_tensors["logits"]
+        print(f"  Megatron logits: shape={megatron_logits.shape}, dtype={megatron_logits.dtype}")
+    elif "lm_head" in megatron_tensors:
+        megatron_logits = megatron_tensors["lm_head"]
+        print(f"  Megatron lm_head (logits): shape={megatron_logits.shape}, dtype={megatron_logits.dtype}")
+    
+    # Also check for directly dumped logprobs
+    sglang_direct_logprobs = None
+    megatron_direct_logprobs = None
+    
+    if "logprobs" in sglang_tensors:
+        sglang_direct_logprobs = sglang_tensors["logprobs"]
+        print(f"  SGLang direct logprobs: shape={sglang_direct_logprobs.shape}, dtype={sglang_direct_logprobs.dtype}")
+    
+    if "logprobs" in megatron_tensors:
+        megatron_direct_logprobs = megatron_tensors["logprobs"]
+        print(f"  Megatron direct logprobs: shape={megatron_direct_logprobs.shape}, dtype={megatron_direct_logprobs.dtype}")
+    
+    # Compare logprobs
+    if sglang_logits is not None and megatron_logits is not None:
+        print("\n  Computing logprobs from logits using SGLang formula...")
+        print("    Formula: log_softmax(logits.bfloat16().div(temp).bfloat16(), dim=-1)")
+        
+        sglang_logprobs_full, sglang_target_lp = compute_logprobs_from_logits(
+            sglang_logits, temperature=1.0, target_token_id=next_token_id
+        )
+        megatron_logprobs_full, megatron_target_lp = compute_logprobs_from_logits(
+            megatron_logits, temperature=1.0, target_token_id=next_token_id
+        )
+        
+        # Compare full logprob distributions (first position)
+        sg_lp = sglang_logprobs_full.flatten()[:10] if sglang_logprobs_full.dim() > 1 else sglang_logprobs_full[:10]
+        mg_lp = megatron_logprobs_full.flatten()[:10] if megatron_logprobs_full.dim() > 1 else megatron_logprobs_full[:10]
+        
+        print(f"\n  Logprob samples (first 10 vocab entries):")
+        print(f"    SGLang:   {sg_lp.tolist()}")
+        print(f"    Megatron: {mg_lp.tolist()}")
+        
+        # Compare shapes
+        print(f"\n  Full logprobs shapes:")
+        print(f"    SGLang:   {sglang_logprobs_full.shape}")
+        print(f"    Megatron: {megatron_logprobs_full.shape}")
+        
+        # Compare target token logprob
+        if sglang_target_lp is not None and megatron_target_lp is not None:
+            diff = abs(sglang_target_lp.float().item() - megatron_target_lp.float().item())
+            print(f"\n  Logprob for target token {next_token_id}:")
+            print(f"    SGLang:   {sglang_target_lp.item():.8f}")
+            print(f"    Megatron: {megatron_target_lp.item():.8f}")
+            print(f"    Diff:     {diff:.8e}")
+            if diff < 1e-5:
+                print(f"    ✓ Logprobs MATCH!")
+            else:
+                print(f"    ✗ Logprobs DIFFER!")
+        
+        # Overall distribution comparison
+        if sglang_logprobs_full.shape == megatron_logprobs_full.shape:
+            sg_flat = sglang_logprobs_full.float().flatten()
+            mg_flat = megatron_logprobs_full.float().flatten()
+            max_diff = (sg_flat - mg_flat).abs().max().item()
+            mean_diff = (sg_flat - mg_flat).abs().mean().item()
+            print(f"\n  Full logprob distribution comparison:")
+            print(f"    Max diff:  {max_diff:.8e}")
+            print(f"    Mean diff: {mean_diff:.8e}")
+    else:
+        print("\n  ⚠️  Could not find logits for comparison")
+        if sglang_logits is None:
+            print("    - SGLang logits not found")
+        if megatron_logits is None:
+            print("    - Megatron logits not found")
+    
+    # Compare directly dumped logprobs if available
+    if sglang_direct_logprobs is not None and megatron_direct_logprobs is not None:
+        print("\n  Comparing directly dumped logprobs:")
+        sg_lp = sglang_direct_logprobs.float().flatten()
+        mg_lp = megatron_direct_logprobs.float().flatten()
+        if sg_lp.shape == mg_lp.shape:
+            diff = (sg_lp - mg_lp).abs()
+            print(f"    Max diff:  {diff.max().item():.8e}")
+            print(f"    Mean diff: {diff.mean().item():.8e}")
+            print(f"    SGLang:   {sg_lp.tolist()}")
+            print(f"    Megatron: {mg_lp.tolist()}")
+        else:
+            print(f"    Shape mismatch: SGLang {sg_lp.shape} vs Megatron {mg_lp.shape}")
+    
     print("=" * 60)
     
     # Compare
