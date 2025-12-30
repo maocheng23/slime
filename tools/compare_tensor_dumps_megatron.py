@@ -756,23 +756,20 @@ def compare_first_response_token(
               f"{sglang_prefill_last_pos}")
         megatron_hidden_pos = sglang_prefill_last_pos
 
-    # Load decode pass tensors for position 91 comparison
-    sglang_decode_for_hidden = None
-    decode_result = find_sglang_decode_pass(sglang_dir, first_response_pos)
-    if decode_result is not None:
-        decode_id, decode_path = decode_result
-        sglang_decode_for_hidden = torch.load(decode_path, map_location="cpu")
-        print(f"    Also comparing with decode pass {decode_id} "
-              f"(first_pos={first_response_pos})")
+    # For hidden states, compare PREFILL (position 90) vs Megatron base (pos 90)
+    # NOT decode pass - that's a different forward pass with only 1 token!
+    print(f"    Comparing: SGLang prefill[{sglang_prefill_last_pos}] vs "
+          f"Megatron base[{megatron_hidden_pos}]")
 
     # Compare hidden states using PREFILL tensors for SGLang
+    # Pass sglang_decode_tensors=None to use prefill only
     compare_hidden_states_at_position(
         sglang_prefill_tensors,  # Use prefill for hidden states
         megatron_tensors,
         sglang_position=sglang_prefill_last_pos,
         megatron_position=megatron_hidden_pos,
         verbose=verbose,
-        sglang_decode_tensors=sglang_decode_for_hidden,
+        sglang_decode_tensors=None,  # DON'T use decode - use prefill!
     )
 
     # =========================================================================
