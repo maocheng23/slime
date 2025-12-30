@@ -31,30 +31,30 @@ import torch
 
 
 def compute_logprobs_from_logits(
-    logits: torch.Tensor,
+    logits: torch.Tensor, 
     temperature: float = 1.0,
     target_token_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Compute log probabilities from logits using SGLang's formula.
-
+    
     SGLang formula (when rl_on_policy_target is enabled):
         logits_bf16 = logits.bfloat16()
         logits_div_temp = logits_bf16.div(temperature).bfloat16()
         logprobs = torch.log_softmax(logits_div_temp, dim=-1)
-
+    
     Args:
         logits: Raw logits tensor
         temperature: Temperature for softmax (default 1.0)
         target_token_id: If provided, return logprob for this token
-
+        
     Returns:
         (full_logprobs, target_logprob)
     """
     logits_bf16 = logits.bfloat16()
     logits_div_temp = logits_bf16.div(temperature).bfloat16()
     logprobs = torch.log_softmax(logits_div_temp, dim=-1)
-
+    
     target_logprob = None
     if target_token_id is not None:
         if logprobs.dim() == 1:
@@ -63,8 +63,79 @@ def compute_logprobs_from_logits(
             target_logprob = logprobs[0, target_token_id]
         elif logprobs.dim() == 3:
             target_logprob = logprobs[0, 0, target_token_id]
-
+    
     return logprobs, target_logprob
+
+
+def print_top_logprobs(
+    logits: torch.Tensor,
+    actual_token_id: int | None,
+    label: str,
+    top_k: int = 10,
+    temperature: float = 1.0,
+) -> None:
+    """
+    Print top-k logprobs and the logprob for the actual predicted token.
+
+    Args:
+        logits: Raw logits tensor (vocab_size,) or (1, vocab_size)
+        actual_token_id: The token that was actually generated/in the sequence
+        label: Label for printing (e.g., "SGLang pos 90" or "FSDP pos 90")
+        top_k: Number of top tokens to show
+        temperature: Temperature for softmax
+    """
+    logprobs, _ = compute_logprobs_from_logits(logits, temperature)
+    logprobs_flat = logprobs.flatten().float()
+
+    # Get top-k tokens by logprob
+    k = min(top_k, len(logprobs_flat))
+    top_values, top_indices = torch.topk(logprobs_flat, k)
+
+    print(f"\n  {label}:")
+    print(f"    Top {top_k} tokens by logprob:")
+    for i, (val, idx) in enumerate(zip(top_values, top_indices)):
+        is_actual = (actual_token_id is not None
+                     and idx.item() == actual_token_id)
+        marker = " <-- ACTUAL" if is_actual else ""
+        tok_id = idx.item()
+        lp = val.item()
+        print(f"      {i+1:2d}. token={tok_id:6d} lp={lp:10.6f}{marker}")
+
+    # Show actual token if not in top-k
+    if actual_token_id is not None:
+        if actual_token_id not in top_indices.tolist():
+            actual_lp = logprobs_flat[actual_token_id].item()
+            rank = (logprobs_flat > actual_lp).sum().item() + 1
+            print(f"    Actual token {actual_token_id}: "
+                  f"logprob={actual_lp:.6f} (rank {rank})")
+        else:
+            actual_lp = logprobs_flat[actual_token_id].item()
+            print(f"    Actual token {actual_token_id}: "
+                  f"logprob={actual_lp:.6f}")
+
+
+def find_sglang_decode_pass(
+    sglang_dir: str, decode_position: int
+) -> tuple[int, Path] | None:
+    """
+    Find the SGLang decode pass for a specific position.
+
+    Each decode pass processes ONE token and outputs logits for the next.
+    The decode pass for position X has:
+    - seq_len = 1
+    - first_position = X (the position being processed)
+    """
+    passes = list_all_passes(sglang_dir)
+
+    for pass_id, path in passes:
+        info = get_sglang_pass_info(path)
+
+        if info.get("is_decode", False):
+            first_pos = info.get("first_position", -1)
+            if first_pos == decode_position:
+                return (pass_id, path)
+
+    return None
 
 
 def list_all_passes(dump_dir: str) -> list[tuple[int, Path]]:
@@ -72,7 +143,7 @@ def list_all_passes(dump_dir: str) -> list[tuple[int, Path]]:
     dump_path = Path(dump_dir)
     if not dump_path.exists():
         return []
-
+    
     passes = []
     for f in dump_path.glob("*/Pass*.pt"):
         name = f.stem
@@ -98,7 +169,7 @@ def find_dump_files(dump_dir: str, pass_id: int) -> list[Path]:
 def load_tensors(dump_file: Path) -> dict[str, torch.Tensor]:
     """Load tensors from a dump file."""
     return torch.load(dump_file, map_location="cpu")
-
+    
 
 def get_sglang_pass_info(path: Path) -> dict[str, Any]:
     """Extract information from a SGLang dump file."""
@@ -120,13 +191,13 @@ def get_sglang_pass_info(path: Path) -> dict[str, Any]:
             info["first_position"] = pos.flatten()[0].item()
             info["last_position"] = pos.flatten()[-1].item()
 
-    if "model.forward_batch_info.seq_lens" in tensors:
-        seq_lens = tensors["model.forward_batch_info.seq_lens"]
-        if seq_lens.numel() > 0:
-            if seq_lens.numel() == 1:
-                info["batch_seq_len"] = seq_lens.item()
-            else:
-                info["batch_seq_len"] = seq_lens.tolist()
+        if "model.forward_batch_info.seq_lens" in tensors:
+            seq_lens = tensors["model.forward_batch_info.seq_lens"]
+            if seq_lens.numel() > 0:
+                if seq_lens.numel() == 1:
+                    info["batch_seq_len"] = seq_lens.item()
+                else:
+                    info["batch_seq_len"] = seq_lens.tolist()
 
     info["is_prefill"] = info.get("seq_len", 0) > 1
     info["is_decode"] = info.get("seq_len", 0) == 1
@@ -214,9 +285,9 @@ def compute_diff_stats(t1: torch.Tensor, t2: torch.Tensor) -> dict[str, float]:
     """Compute difference statistics between two tensors."""
     t1_f = t1.float()
     t2_f = t2.float()
-
+    
     diff = (t1_f - t2_f).abs()
-
+    
     return {
         "max_diff": diff.max().item(),
         "mean_diff": diff.mean().item(),
@@ -248,7 +319,7 @@ def compare_hidden_states_at_position(
     These should match because both represent the same position.
     """
     results = {}
-
+    
     print("\n" + "=" * 70)
     print("LAYER-BY-LAYER HIDDEN STATE COMPARISON")
     print(f"SGLang pos: {sglang_position}, FSDP pos: {fsdp_position}")
@@ -294,7 +365,7 @@ def compare_hidden_states_at_position(
     all_layers = sorted(set(sglang_layers.keys()) | set(fsdp_layers.keys()))
 
     significant_diff_layers = []
-
+    
     for layer_idx in all_layers:
         if layer_idx not in sglang_layers:
             if verbose:
@@ -304,7 +375,7 @@ def compare_hidden_states_at_position(
             if verbose:
                 print(f"  Layer {layer_idx:2d}: NOT IN FSDP dump")
             continue
-
+        
         sglang_hidden = sglang_layers[layer_idx]
         fsdp_hidden = fsdp_layers[layer_idx]
 
@@ -359,7 +430,7 @@ def compare_hidden_states_at_position(
         print("\n✓ All layers match (diff < 1e-5)")
 
     print("=" * 70)
-
+    
     return results
 
 
@@ -431,13 +502,13 @@ def compare_first_response_token(
     sglang_pass_id, sglang_path = prefill_result
     sglang_info = get_sglang_pass_info(sglang_path)
     sglang_tensors = torch.load(sglang_path, map_location="cpu")
-
+    
     print("\nSGLang Info:")
     print(f"  Using Pass {sglang_pass_id} (prefill)")
     print(f"  Sequence length: {sglang_info.get('seq_len', 'N/A')}")
     print(f"  First position: {sglang_info.get('first_position', 'N/A')}")
     print(f"  Last position: {sglang_info.get('last_position', 'N/A')}")
-
+    
     # Position analysis
     comparison_pos = prompt_len - 1  # Position of last prompt token
     first_response_pos = prompt_len   # Position of first response token
@@ -483,7 +554,7 @@ def compare_first_response_token(
     print("\n" + "=" * 70)
     print("LOGITS COMPARISON FOR FIRST RESPONSE TOKEN")
     print("=" * 70)
-
+    
     # Get first response token ID
     first_response_token = None
     input_ids_key = fsdp_info.get("input_ids_key", "fsdp_input_ids")
@@ -495,7 +566,7 @@ def compare_first_response_token(
                 f"\nFirst response token ID: {first_response_token} "
                 f"(at position {first_response_pos})"
             )
-
+    
     # Get SGLang logits
     sglang_logits = None
     if "logits_processor" in sglang_tensors:
@@ -525,7 +596,7 @@ def compare_first_response_token(
         print(f"WARNING: Could not find {logits_key} in FSDP dump")
         available = [k for k in fsdp_tensors.keys() if "logits" in k.lower()]
         print(f"  Available logits keys: {available}")
-
+    
     # Compare logits
     if sglang_logits is not None and fsdp_logits is not None:
         sg_flat = sglang_logits.flatten()
@@ -551,7 +622,7 @@ def compare_first_response_token(
             print("  ✓ Logits MATCH!")
         else:
             print("  ✗ Logits DIFFER!")
-
+    
         # Compare specific token logit
         if first_response_token is not None:
             sg_tok = sglang_logits.flatten()
@@ -576,10 +647,10 @@ def compare_first_response_token(
                 print(f"    Diff:   {diff:.8e}")
 
         # =====================================================================
-        # 3. Compare logprobs
+        # 3. Compare logprobs (computed from logits)
         # =====================================================================
         print("\n" + "-" * 50)
-        print("LOGPROBS COMPARISON")
+        print("LOGPROBS COMPARISON (computed from logits)")
         print("-" * 50)
 
         tok_id = first_response_token
@@ -618,6 +689,173 @@ def compare_first_response_token(
                 print("    ✓ Logprobs MATCH!")
             else:
                 print("    ✗ Logprobs DIFFER!")
+    
+        # =====================================================================
+        # 4. Compare directly-dumped logprobs (if available)
+        # =====================================================================
+        print("\n" + "-" * 50)
+        print("DIRECTLY-DUMPED LOGPROBS COMPARISON")
+        print("-" * 50)
+        
+        # Check FSDP dumped logprobs
+        fsdp_direct_lp = None
+        if "logprobs" in fsdp_tensors:
+            fsdp_direct_lp = fsdp_tensors["logprobs"]
+            print(f"\n  FSDP dumped logprobs: {fsdp_direct_lp}")
+            print(f"    shape: {fsdp_direct_lp.shape}")
+            print(f"    dtype: {fsdp_direct_lp.dtype}")
+
+        if "logprobs_full" in fsdp_tensors:
+            full_lp = fsdp_tensors["logprobs_full"]
+            print(f"\n  FSDP full logprobs shape: {full_lp.shape}")
+            print(f"    First 5 values: {full_lp.flatten()[:5].tolist()}")
+
+        if "logprobs_extracted_idx" in fsdp_tensors:
+            idx = fsdp_tensors["logprobs_extracted_idx"].item()
+            print(f"    Extracted at index: {idx}")
+
+        if "logprobs_prompt_len" in fsdp_tensors:
+            pl = fsdp_tensors["logprobs_prompt_len"].item()
+            print(f"    prompt_len used: {pl}")
+
+        if "response_logprobs_first5" in fsdp_tensors:
+            resp_lp = fsdp_tensors["response_logprobs_first5"]
+            print(f"    First 5 response logprobs: {resp_lp.tolist()}")
+
+        # Check if FSDP logprob is zero (common bug symptom)
+        if fsdp_direct_lp is not None:
+            if fsdp_direct_lp.abs().max().item() < 1e-10:
+                print("\n  ⚠️  WARNING: FSDP dumped logprobs are ALL ZEROS!")
+                print("     This indicates a bug in the dumper.")
+                print("     Possible causes:")
+                print("     - Wrong index used for extraction")
+                print("     - Position out of bounds")
+                print("     - log_probs tensor is empty/wrong shape")
+
+    # =========================================================================
+    # 5. Detailed logprob comparison at TWO positions
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("DETAILED LOGPROBS: POSITION prompt_len-1 AND prompt_len")
+    print("=" * 70)
+    print("\nThis shows top-10 logprobs and actual token at TWO positions:")
+    print(f"  Position {comparison_pos} (prompt_len-1): "
+          "predicts first response token")
+    print(f"  Position {first_response_pos} (prompt_len): "
+          "predicts second response token")
+
+    # Get tokens for both positions
+    second_response_token = None
+    input_ids_key = fsdp_info.get("input_ids_key", "fsdp_input_ids")
+    if input_ids_key in fsdp_tensors:
+        input_ids = fsdp_tensors[input_ids_key].flatten()
+        next_pos = first_response_pos + 1
+        if next_pos < len(input_ids):
+            second_response_token = input_ids[next_pos].item()
+
+    # --- Position prompt_len-1 (last prompt, predicts first response) ---
+    print("\n" + "-" * 50)
+    print(f"POSITION {comparison_pos} (prompt_len-1)")
+    print(f"Predicts token at position {first_response_pos}: "
+          f"{first_response_token}")
+    print("-" * 50)
+
+    # SGLang at prompt_len-1 (from prefill pass)
+    if sglang_logits is not None:
+        print_top_logprobs(
+            sglang_logits,
+            actual_token_id=first_response_token,
+            label=f"SGLang (prefill, pos {comparison_pos})",
+            top_k=10,
+        )
+
+    # FSDP at prompt_len-1
+    if fsdp_logits is not None:
+        print_top_logprobs(
+            fsdp_logits,
+            actual_token_id=first_response_token,
+            label=f"FSDP (pos {comparison_pos})",
+            top_k=10,
+        )
+
+    # --- Position prompt_len (first response token, predicts second) ---
+    print("\n" + "-" * 50)
+    print(f"POSITION {first_response_pos} (prompt_len)")
+    print(f"Predicts token at position {first_response_pos + 1}: "
+          f"{second_response_token}")
+    print("-" * 50)
+
+    # SGLang at prompt_len (from first decode pass)
+    decode_pos = first_response_pos
+    sglang_decode_pass = find_sglang_decode_pass(sglang_dir, decode_pos)
+    sglang_decode_logits = None
+    if sglang_decode_pass is not None:
+        decode_pass_id, decode_path = sglang_decode_pass
+        decode_tensors = torch.load(decode_path, map_location="cpu")
+        if "logits_processor" in decode_tensors:
+            sglang_decode_logits = decode_tensors["logits_processor"]
+            print(f"\n  Found SGLang decode pass {decode_pass_id} "
+                  f"for position {first_response_pos}")
+        else:
+            print(f"\n  SGLang decode pass {decode_pass_id} "
+                  "has no logits_processor")
+    else:
+        print(f"\n  Could not find SGLang decode pass "
+              f"for position {first_response_pos}")
+        # List available decode passes
+        passes = list_all_passes(sglang_dir)
+        decode_passes = []
+        for pid, ppath in passes:
+            info = get_sglang_pass_info(ppath)
+            if info.get("is_decode", False):
+                decode_passes.append((pid, info.get("first_position", "?")))
+        if decode_passes:
+            print(f"  Available decode passes: {decode_passes[:5]}...")
+
+    if sglang_decode_logits is not None:
+        print_top_logprobs(
+            sglang_decode_logits,
+            actual_token_id=second_response_token,
+            label=f"SGLang (decode, pos {first_response_pos})",
+            top_k=10,
+        )
+
+    # FSDP at prompt_len
+    fsdp_logits_pos2 = None
+    logits_key_pos2 = f"logits_pos_{first_response_pos}"
+    if logits_key_pos2 in fsdp_tensors:
+        fsdp_logits_pos2 = fsdp_tensors[logits_key_pos2]
+        print(f"\n  FSDP has logits at position {first_response_pos}")
+    else:
+        print(f"\n  FSDP does not have {logits_key_pos2}")
+        # Check available logits positions
+        avail = [k for k in fsdp_tensors.keys() if k.startswith("logits_pos_")]
+        if avail:
+            print(f"  Available: {avail[:5]}...")
+
+    if fsdp_logits_pos2 is not None:
+        print_top_logprobs(
+            fsdp_logits_pos2,
+            actual_token_id=second_response_token,
+            label=f"FSDP (pos {first_response_pos})",
+            top_k=10,
+        )
+
+    # Compare the two positions if both are available
+    if sglang_decode_logits is not None and fsdp_logits_pos2 is not None:
+        print("\n  Comparison at position prompt_len:")
+        sg_flat = sglang_decode_logits.flatten()
+        fsdp_flat = fsdp_logits_pos2.flatten()
+        if sg_flat.shape == fsdp_flat.shape:
+            stats = compute_diff_stats(sg_flat, fsdp_flat)
+            print(f"    Max diff:  {stats['max_diff']:.8e}")
+            print(f"    Mean diff: {stats['mean_diff']:.8e}")
+            if stats["max_diff"] < 1e-5:
+                print("    ✓ Logits at prompt_len MATCH!")
+            else:
+                print("    ✗ Logits at prompt_len DIFFER!")
+        else:
+            print(f"    Shape mismatch: {sg_flat.shape} vs {fsdp_flat.shape}")
 
     print("\n" + "=" * 70)
 
@@ -697,8 +935,8 @@ def main():
     parser.add_argument(
         "--quiet", action="store_true",
         help="Suppress verbose output"
-    )
-
+                        )
+                        
     # Legacy arguments for backwards compatibility
     parser.add_argument("--pass-id", type=int, default=0)
     parser.add_argument("--auto-match", action="store_true")
@@ -714,7 +952,7 @@ def main():
     if args.list_passes:
         list_passes_detailed(args.sglang_dir, args.fsdp_dir)
         sys.exit(0)
-
+    
     # Default to compare-first-token
     compare_first_response_token(
         args.sglang_dir,

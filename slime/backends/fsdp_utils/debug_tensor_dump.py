@@ -439,19 +439,107 @@ class FSDPTensorDumper:
             self._current_tensors["logits"] = logits.cpu().bfloat16()
 
     def add_logprobs(self, logprobs: torch.Tensor) -> None:
-        """Record log probabilities for debugging."""
-        # Extract logprobs at response start position
-        target_pos = getattr(self, '_response_start_pos', 0)
+        """Record log probabilities for debugging.
+
+        IMPORTANT: log_probs from get_logprob_and_entropy_with_cp is SHIFTED:
+        - log_probs has shape [total_seq_len - 1]
+        - log_probs[i] = logprob of token at position (i + 1)
+
+        For first response token at position prompt_len:
+        - We need log_probs[prompt_len - 1]
+
+        For comparison with SGLang prefill:
+        - SGLang prefill outputs logits predicting position prompt_len
+        - So we need the logprob for token at prompt_len
+        - Which is log_probs[prompt_len - 1]
+        """
+        prompt_len = getattr(self, '_response_start_pos', 0)
+
+        # For first response token: index = prompt_len - 1 (due to shift)
+        first_response_idx = max(0, prompt_len - 1)
+
+        # Save debug info
+        self._current_tensors["logprobs_prompt_len"] = torch.tensor([prompt_len])
+        self._current_tensors["logprobs_input_shape"] = torch.tensor(list(logprobs.shape))
+
         if logprobs.dim() == 1:
-            # [seq_len]
-            if target_pos < logprobs.shape[0]:
-                self._current_tensors["logprobs"] = logprobs[target_pos:target_pos+1].cpu().bfloat16()
+            # [seq_len - 1] (shifted)
+            seq_len = logprobs.shape[0]
+            self._current_tensors["logprobs_seq_len"] = torch.tensor([seq_len])
+
+            # Check if logprobs is all zeros (bug indicator)
+            is_all_zero = (logprobs.abs() < 1e-10).all().item()
+            if is_all_zero:
+                logger.warning(
+                    f"[FSDPTensorDumper] WARNING: logprobs tensor is ALL ZEROS! "
+                    f"shape={logprobs.shape}, prompt_len={prompt_len}"
+                )
             else:
+                non_zero_count = (logprobs.abs() > 1e-10).sum().item()
+                logger.info(
+                    f"[FSDPTensorDumper] logprobs: shape={logprobs.shape}, "
+                    f"non_zero={non_zero_count}/{seq_len}, "
+                    f"min={logprobs.min().item():.6f}, max={logprobs.max().item():.6f}"
+                )
+
+            # Save full logprobs for debugging
+            self._current_tensors["logprobs_full"] = logprobs.cpu().bfloat16()
+
+            # Extract first response token logprob
+            if first_response_idx < seq_len:
+                first_resp_lp = logprobs[first_response_idx]
+                lp_val = first_resp_lp.item()
+                self._current_tensors["logprobs"] = first_resp_lp.cpu().bfloat16().unsqueeze(0)
+                self._current_tensors["logprobs_extracted_idx"] = torch.tensor(
+                    [first_response_idx]
+                )
+                self._current_tensors["logprobs_extracted_value"] = torch.tensor([lp_val])
+
+                if abs(lp_val) < 1e-10:
+                    logger.warning(
+                        f"[FSDPTensorDumper] WARNING: Extracted logprob is ZERO! "
+                        f"idx={first_response_idx}, prompt_len={prompt_len}, "
+                        f"seq_len={seq_len}"
+                    )
+                else:
+                    logger.info(
+                        f"[FSDPTensorDumper] Extracted first response logprob: "
+                        f"idx={first_response_idx}, value={lp_val:.8f}"
+                    )
+            else:
+                logger.warning(
+                    f"[FSDPTensorDumper] first_response_idx={first_response_idx} "
+                    f">= seq_len={seq_len}, using idx 0"
+                )
                 self._current_tensors["logprobs"] = logprobs[0:1].cpu().bfloat16()
+                self._current_tensors["logprobs_extracted_idx"] = torch.tensor([0])
+
+            # Also save first few response logprobs for comparison
+            response_start_idx = first_response_idx
+            response_end_idx = min(seq_len, first_response_idx + 5)
+            if response_start_idx < seq_len:
+                resp_logprobs = logprobs[response_start_idx:response_end_idx]
+                self._current_tensors["response_logprobs_first5"] = (
+                    resp_logprobs.cpu().bfloat16()
+                )
+                logger.info(
+                    f"[FSDPTensorDumper] First 5 response logprobs "
+                    f"(indices {response_start_idx}-{response_end_idx-1}): "
+                    f"{resp_logprobs.tolist()}"
+                )
+
         elif logprobs.dim() == 2:
-            # [batch, seq_len]
-            if target_pos < logprobs.shape[1]:
-                self._current_tensors["logprobs"] = logprobs[:, target_pos:target_pos+1].cpu().bfloat16()
+            # [batch, seq_len - 1]
+            seq_len = logprobs.shape[1]
+            self._current_tensors["logprobs_seq_len"] = torch.tensor([seq_len])
+            self._current_tensors["logprobs_full"] = logprobs.cpu().bfloat16()
+
+            if first_response_idx < seq_len:
+                first_resp_lp = logprobs[:, first_response_idx].cpu().bfloat16()
+                self._current_tensors["logprobs"] = first_resp_lp
+                self._current_tensors["logprobs_extracted_idx"] = torch.tensor(
+                    [first_response_idx]
+                )
             else:
                 self._current_tensors["logprobs"] = logprobs[:, 0:1].cpu().bfloat16()
         else:

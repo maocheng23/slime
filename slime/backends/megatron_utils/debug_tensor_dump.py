@@ -437,25 +437,76 @@ class MegatronTensorDumper:
             self._current_tensors["logits"] = logits.cpu().bfloat16()
 
     def add_logprobs(self, logprobs: torch.Tensor) -> None:
-        """Record log probabilities for debugging."""
-        # Extract logprobs at response start position
-        target_pos = getattr(self, '_response_start_pos', 0)
+        """Record log probabilities for debugging.
+
+        IMPORTANT: log_probs is SHIFTED for next-token prediction:
+        - log_probs has shape [total_seq_len - 1]
+        - log_probs[i] = logprob of token at position (i + 1)
+
+        For first response token at position prompt_len:
+        - We need log_probs[prompt_len - 1]
+        """
+        prompt_len = getattr(self, '_response_start_pos', 0)
+
+        # For first response token: index = prompt_len - 1 (due to shift)
+        first_response_idx = max(0, prompt_len - 1)
+
+        # Save debug info
+        self._current_tensors["logprobs_prompt_len"] = torch.tensor([prompt_len])
+
         if logprobs.dim() == 1:
-            # [seq_len]
-            if target_pos < logprobs.shape[0]:
-                self._current_tensors["logprobs"] = logprobs[target_pos:target_pos+1].cpu().bfloat16()
+            # [seq_len - 1] (shifted)
+            seq_len = logprobs.shape[0]
+            self._current_tensors["logprobs_seq_len"] = torch.tensor([seq_len])
+            self._current_tensors["logprobs_full"] = logprobs.cpu().bfloat16()
+
+            if first_response_idx < seq_len:
+                first_resp_lp = logprobs[first_response_idx].cpu().bfloat16()
+                self._current_tensors["logprobs"] = first_resp_lp.unsqueeze(0)
+                self._current_tensors["logprobs_extracted_idx"] = torch.tensor(
+                    [first_response_idx]
+                )
+                logger.info(
+                    f"[MegatronTensorDumper] Saved logprob for first response: "
+                    f"idx={first_response_idx}, value={first_resp_lp.item():.6f}"
+                )
             else:
                 self._current_tensors["logprobs"] = logprobs[0:1].cpu().bfloat16()
+
+            # Save first few response logprobs
+            resp_end = min(seq_len, first_response_idx + 5)
+            if first_response_idx < seq_len:
+                self._current_tensors["response_logprobs_first5"] = (
+                    logprobs[first_response_idx:resp_end].cpu().bfloat16()
+                )
+
         elif logprobs.dim() == 2:
-            # [batch, seq_len] or [seq_len, batch]
-            # Try to handle both cases
-            if target_pos < logprobs.shape[-1]:
-                if logprobs.shape[0] == 1:
-                    self._current_tensors["logprobs"] = logprobs[:, target_pos:target_pos+1].cpu().bfloat16()
+            # Megatron format: [seq_len, batch] or [batch, seq_len]
+            # Determine layout
+            if logprobs.shape[1] == 1:
+                # [seq_len, 1] - Megatron layout
+                seq_len = logprobs.shape[0]
+                self._current_tensors["logprobs_seq_len"] = torch.tensor([seq_len])
+                self._current_tensors["logprobs_full"] = logprobs.cpu().bfloat16()
+
+                if first_response_idx < seq_len:
+                    self._current_tensors["logprobs"] = (
+                        logprobs[first_response_idx:first_response_idx+1, :].cpu()
+                    )
                 else:
-                    self._current_tensors["logprobs"] = logprobs[target_pos:target_pos+1, :].cpu().bfloat16()
+                    self._current_tensors["logprobs"] = logprobs[0:1, :].cpu()
             else:
-                self._current_tensors["logprobs"] = logprobs[:, 0:1].cpu().bfloat16() if logprobs.shape[0] == 1 else logprobs[0:1, :].cpu().bfloat16()
+                # [1, seq_len] or [batch, seq_len]
+                seq_len = logprobs.shape[1]
+                self._current_tensors["logprobs_seq_len"] = torch.tensor([seq_len])
+                self._current_tensors["logprobs_full"] = logprobs.cpu().bfloat16()
+
+                if first_response_idx < seq_len:
+                    self._current_tensors["logprobs"] = (
+                        logprobs[:, first_response_idx:first_response_idx+1].cpu()
+                    )
+                else:
+                    self._current_tensors["logprobs"] = logprobs[:, 0:1].cpu()
         else:
             self._current_tensors["logprobs"] = logprobs.cpu().bfloat16()
 
