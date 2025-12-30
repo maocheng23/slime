@@ -499,27 +499,50 @@ def compare_first_response_token(
             )
         return
 
-    sglang_pass_id, sglang_path = prefill_result
-    sglang_info = get_sglang_pass_info(sglang_path)
-    sglang_tensors = torch.load(sglang_path, map_location="cpu")
-    
-    print("\nSGLang Info:")
-    print(f"  Using Pass {sglang_pass_id} (prefill)")
-    print(f"  Sequence length: {sglang_info.get('seq_len', 'N/A')}")
-    print(f"  First position: {sglang_info.get('first_position', 'N/A')}")
-    print(f"  Last position: {sglang_info.get('last_position', 'N/A')}")
-    
+    sglang_prefill_id, sglang_prefill_path = prefill_result
+    sglang_prefill_info = get_sglang_pass_info(sglang_prefill_path)
+    sglang_prefill_tensors = torch.load(
+        sglang_prefill_path, map_location="cpu"
+    )
+
+    print("\nSGLang Prefill Info:")
+    print(f"  Using Pass {sglang_prefill_id} (prefill)")
+    seq_len = sglang_prefill_info.get('seq_len', 'N/A')
+    first_pos = sglang_prefill_info.get('first_position', 'N/A')
+    last_pos = sglang_prefill_info.get('last_position', 'N/A')
+    print(f"  Sequence length: {seq_len}")
+    print(f"  First position: {first_pos}")
+    print(f"  Last position: {last_pos}")
+
     # Position analysis
     comparison_pos = prompt_len - 1  # Position of last prompt token
     first_response_pos = prompt_len   # Position of first response token
 
-    print("\nComparison Position Analysis:")
-    print(f"  Last prompt token position: {comparison_pos}")
-    print(f"  First response token position: {first_response_pos}")
-    print(
-        f"  Both systems compute logits at pos {comparison_pos} "
-        f"to predict token at {first_response_pos}"
+    print("\nPosition Mapping (IMPORTANT):")
+    print("  SGLang decode at first_position=X predicts token at X")
+    print("  FSDP logits_pos_N predicts token at N+1")
+    print(f"  To compare first response token (pos {first_response_pos}):")
+    print(f"    - FSDP: use logits_pos_{comparison_pos}")
+    print(f"    - SGLang: decode pass first_position={first_response_pos}")
+
+    # Find the correct SGLang decode pass for first response token
+    # SGLang decode at first_position=X predicts token at position X
+    sglang_decode_result = find_sglang_decode_pass(
+        sglang_dir, first_response_pos
     )
+    if sglang_decode_result is not None:
+        sg_decode_id, sg_decode_path = sglang_decode_result
+        sglang_tensors = torch.load(sg_decode_path, map_location="cpu")
+        sglang_info = get_sglang_pass_info(sg_decode_path)
+        print(f"\n  Using SGLang decode pass {sg_decode_id} "
+              f"(first_position={first_response_pos})")
+    else:
+        # Fallback to prefill if decode pass not found
+        print(f"\n  WARNING: Could not find SGLang decode pass "
+              f"for position {first_response_pos}")
+        print("  Falling back to prefill (may have position mismatch!)")
+        sglang_tensors = sglang_prefill_tensors
+        sglang_info = sglang_prefill_info
 
     # =========================================================================
     # 1. Compare hidden states at each layer
@@ -736,73 +759,77 @@ def compare_first_response_token(
     # 5. Detailed logprob comparison at TWO positions
     # =========================================================================
     print("\n" + "=" * 70)
-    print("DETAILED LOGPROBS: POSITION prompt_len-1 AND prompt_len")
+    print("DETAILED LOGPROBS: FIRST AND SECOND RESPONSE TOKENS")
     print("=" * 70)
-    print("\nThis shows top-10 logprobs and actual token at TWO positions:")
-    print(f"  Position {comparison_pos} (prompt_len-1): "
-          "predicts first response token")
-    print(f"  Position {first_response_pos} (prompt_len): "
-          "predicts second response token")
+    print("\nPosition Mapping:")
+    print("  SGLang decode at first_position=X predicts token at X")
+    print("  FSDP logits_pos_N predicts token at N+1")
+    print("\nComparing predictions for:")
+    second_resp_pos = first_response_pos + 1
+    p1 = first_response_pos
+    p2 = second_resp_pos
+    print(f"  1. First response token (pos {p1}):")
+    print(f"     FSDP pos {comparison_pos} vs SGLang first_pos {p1}")
+    print(f"  2. Second response token (pos {p2}):")
+    print(f"     FSDP pos {p1} vs SGLang first_pos {p2}")
 
     # Get tokens for both positions
     second_response_token = None
     input_ids_key = fsdp_info.get("input_ids_key", "fsdp_input_ids")
     if input_ids_key in fsdp_tensors:
         input_ids = fsdp_tensors[input_ids_key].flatten()
-        next_pos = first_response_pos + 1
-        if next_pos < len(input_ids):
-            second_response_token = input_ids[next_pos].item()
+        if second_resp_pos < len(input_ids):
+            second_response_token = input_ids[second_resp_pos].item()
 
-    # --- Position prompt_len-1 (last prompt, predicts first response) ---
+    # =========================================================
+    # FIRST RESPONSE TOKEN (position prompt_len)
+    # =========================================================
     print("\n" + "-" * 50)
-    print(f"POSITION {comparison_pos} (prompt_len-1)")
-    print(f"Predicts token at position {first_response_pos}: "
-          f"{first_response_token}")
+    print(f"FIRST RESPONSE TOKEN (position {first_response_pos})")
+    print(f"Actual token: {first_response_token}")
     print("-" * 50)
 
-    # SGLang at prompt_len-1 (from prefill pass)
+    # SGLang: use decode pass at first_position = prompt_len
+    # (We already loaded this as sglang_logits above)
     if sglang_logits is not None:
         print_top_logprobs(
             sglang_logits,
             actual_token_id=first_response_token,
-            label=f"SGLang (prefill, pos {comparison_pos})",
+            label=f"SGLang (decode, first_pos={first_response_pos})",
             top_k=10,
         )
 
-    # FSDP at prompt_len-1
+    # FSDP: use logits_pos_{prompt_len - 1}
     if fsdp_logits is not None:
         print_top_logprobs(
             fsdp_logits,
             actual_token_id=first_response_token,
-            label=f"FSDP (pos {comparison_pos})",
+            label=f"FSDP (logits_pos_{comparison_pos})",
             top_k=10,
         )
 
-    # --- Position prompt_len (first response token, predicts second) ---
+    # =========================================================
+    # SECOND RESPONSE TOKEN (position prompt_len + 1)
+    # =========================================================
     print("\n" + "-" * 50)
-    print(f"POSITION {first_response_pos} (prompt_len)")
-    print(f"Predicts token at position {first_response_pos + 1}: "
-          f"{second_response_token}")
+    print(f"SECOND RESPONSE TOKEN (position {second_resp_pos})")
+    print(f"Actual token: {second_response_token}")
     print("-" * 50)
 
-    # SGLang at prompt_len (from first decode pass)
-    decode_pos = first_response_pos
-    sglang_decode_pass = find_sglang_decode_pass(sglang_dir, decode_pos)
-    sglang_decode_logits = None
-    if sglang_decode_pass is not None:
-        decode_pass_id, decode_path = sglang_decode_pass
-        decode_tensors = torch.load(decode_path, map_location="cpu")
-        if "logits_processor" in decode_tensors:
-            sglang_decode_logits = decode_tensors["logits_processor"]
-            print(f"\n  Found SGLang decode pass {decode_pass_id} "
-                  f"for position {first_response_pos}")
+    # SGLang: use decode pass at first_position = prompt_len + 1
+    sglang_decode2 = find_sglang_decode_pass(sglang_dir, second_resp_pos)
+    sglang_logits2 = None
+    if sglang_decode2 is not None:
+        decode2_id, decode2_path = sglang_decode2
+        decode2_tensors = torch.load(decode2_path, map_location="cpu")
+        if "logits_processor" in decode2_tensors:
+            sglang_logits2 = decode2_tensors["logits_processor"]
+            print(f"\n  SGLang: decode pass {decode2_id} "
+                  f"(first_pos={second_resp_pos})")
         else:
-            print(f"\n  SGLang decode pass {decode_pass_id} "
-                  "has no logits_processor")
+            print(f"\n  SGLang pass {decode2_id} has no logits_processor")
     else:
-        print(f"\n  Could not find SGLang decode pass "
-              f"for position {first_response_pos}")
-        # List available decode passes
+        print(f"\n  No SGLang decode pass for pos {second_resp_pos}")
         passes = list_all_passes(sglang_dir)
         decode_passes = []
         for pid, ppath in passes:
@@ -812,48 +839,47 @@ def compare_first_response_token(
         if decode_passes:
             print(f"  Available decode passes: {decode_passes[:5]}...")
 
-    if sglang_decode_logits is not None:
+    if sglang_logits2 is not None:
         print_top_logprobs(
-            sglang_decode_logits,
+            sglang_logits2,
             actual_token_id=second_response_token,
-            label=f"SGLang (decode, pos {first_response_pos})",
+            label=f"SGLang (decode, first_pos={second_resp_pos})",
             top_k=10,
         )
 
-    # FSDP at prompt_len
-    fsdp_logits_pos2 = None
-    logits_key_pos2 = f"logits_pos_{first_response_pos}"
-    if logits_key_pos2 in fsdp_tensors:
-        fsdp_logits_pos2 = fsdp_tensors[logits_key_pos2]
-        print(f"\n  FSDP has logits at position {first_response_pos}")
+    # FSDP: use logits_pos_{prompt_len} to predict position prompt_len + 1
+    fsdp_logits2 = None
+    logits_key2 = f"logits_pos_{first_response_pos}"
+    if logits_key2 in fsdp_tensors:
+        fsdp_logits2 = fsdp_tensors[logits_key2]
+        print(f"\n  FSDP: logits_pos_{first_response_pos}")
     else:
-        print(f"\n  FSDP does not have {logits_key_pos2}")
-        # Check available logits positions
+        print(f"\n  FSDP does not have {logits_key2}")
         avail = [k for k in fsdp_tensors.keys() if k.startswith("logits_pos_")]
         if avail:
             print(f"  Available: {avail[:5]}...")
 
-    if fsdp_logits_pos2 is not None:
+    if fsdp_logits2 is not None:
         print_top_logprobs(
-            fsdp_logits_pos2,
+            fsdp_logits2,
             actual_token_id=second_response_token,
-            label=f"FSDP (pos {first_response_pos})",
+            label=f"FSDP (logits_pos_{first_response_pos})",
             top_k=10,
         )
 
-    # Compare the two positions if both are available
-    if sglang_decode_logits is not None and fsdp_logits_pos2 is not None:
-        print("\n  Comparison at position prompt_len:")
-        sg_flat = sglang_decode_logits.flatten()
-        fsdp_flat = fsdp_logits_pos2.flatten()
+    # Compare second response token predictions
+    if sglang_logits2 is not None and fsdp_logits2 is not None:
+        print("\n  Second response token comparison:")
+        sg_flat = sglang_logits2.flatten()
+        fsdp_flat = fsdp_logits2.flatten()
         if sg_flat.shape == fsdp_flat.shape:
             stats = compute_diff_stats(sg_flat, fsdp_flat)
             print(f"    Max diff:  {stats['max_diff']:.8e}")
             print(f"    Mean diff: {stats['mean_diff']:.8e}")
             if stats["max_diff"] < 1e-5:
-                print("    ✓ Logits at prompt_len MATCH!")
+                print("    ✓ Second response token logits MATCH!")
             else:
-                print("    ✗ Logits at prompt_len DIFFER!")
+                print("    ✗ Second response token logits DIFFER!")
         else:
             print(f"    Shape mismatch: {sg_flat.shape} vs {fsdp_flat.shape}")
 
