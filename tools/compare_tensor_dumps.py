@@ -451,6 +451,16 @@ def compare_hidden_states_at_position(
 
     significant_diff_layers = []
 
+    # IMPORTANT: When using SGLang decode tensors (position prompt_len),
+    # we need FSDP's _at_response_start tensors (also at prompt_len).
+    # When using SGLang prefill tensors (position prompt_len-1),
+    # we use FSDP's base tensors (also at prompt_len-1).
+    use_fsdp_response_start = sglang_decode_tensors is not None
+
+    if use_fsdp_response_start:
+        print("\n  NOTE: Using SGLang decode, comparing with FSDP at")
+        print("        response_start position (prompt_len)")
+
     for layer_idx in all_layers:
         if layer_idx not in sglang_layers:
             if verbose:
@@ -460,10 +470,20 @@ def compare_hidden_states_at_position(
             if verbose:
                 print(f"  Layer {layer_idx:2d}: NOT IN FSDP dump")
             continue
-        
+
         # Extract tensor from (name, tensor) tuple
         sg_name, sglang_hidden = sglang_layers[layer_idx]
         fsdp_name, fsdp_hidden = fsdp_layers[layer_idx]
+
+        # When using decode, try to get FSDP's _at_response_start tensor
+        if use_fsdp_response_start:
+            if fsdp_name.endswith("_output"):
+                resp_key = f"{fsdp_name[:-7]}_at_response_start"
+            else:
+                resp_key = f"{fsdp_name}_at_response_start"
+            if resp_key in fsdp_tensors:
+                fsdp_hidden = fsdp_tensors[resp_key]
+                fsdp_name = resp_key
 
         # Helper to convert list/tuple to tensor
         def to_tensor(x):
@@ -822,7 +842,17 @@ def compare_first_response_token(
             print("  ✓ Logits MATCH!")
         else:
             print("  ✗ Logits DIFFER!")
-    
+
+        # Print first 10 logits values
+        print("\n  First 10 logits values:")
+        sg_first10 = sg_flat[:10].float().tolist()
+        fsdp_first10 = fsdp_flat[:10].float().tolist()
+        diff_vals = (sg_flat[:10].float() - fsdp_flat[:10].float()).abs()
+        diff_first10 = diff_vals.tolist()
+        print(f"    SGLang: {[f'{v:.4f}' for v in sg_first10]}")
+        print(f"    FSDP:   {[f'{v:.4f}' for v in fsdp_first10]}")
+        print(f"    Diff:   {[f'{v:.4f}' for v in diff_first10]}")
+
         # Compare specific token logit
         if first_response_token is not None:
             sg_tok = sglang_logits.flatten()

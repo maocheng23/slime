@@ -446,6 +446,16 @@ def compare_hidden_states_at_position(
 
     significant_diff_layers = []
 
+    # IMPORTANT: When using SGLang decode tensors (position prompt_len),
+    # we need Megatron's _at_response_start tensors (also at prompt_len).
+    # When using SGLang prefill tensors (position prompt_len-1),
+    # we use Megatron's base tensors (also at prompt_len-1).
+    use_megatron_response_start = sglang_decode_tensors is not None
+
+    if use_megatron_response_start:
+        print("\n  NOTE: Using SGLang decode, comparing with Megatron at")
+        print("        response_start position (prompt_len)")
+
     for layer_idx in all_layers:
         if layer_idx not in sglang_layers:
             if verbose:
@@ -459,6 +469,16 @@ def compare_hidden_states_at_position(
         # Extract tensor from (name, tensor) tuple
         sg_name, sglang_hidden = sglang_layers[layer_idx]
         megatron_name, megatron_hidden = megatron_layers[layer_idx]
+
+        # When using decode, try to get Megatron's _at_response_start tensor
+        if use_megatron_response_start:
+            if megatron_name.endswith("_output"):
+                resp_key = f"{megatron_name[:-7]}_at_response_start"
+            else:
+                resp_key = f"{megatron_name}_at_response_start"
+            if resp_key in megatron_tensors:
+                megatron_hidden = megatron_tensors[resp_key]
+                megatron_name = resp_key
 
         # Helper to convert list/tuple to tensor
         def to_tensor(x):
@@ -817,6 +837,15 @@ def compare_first_response_token(
             print("  ✓ Logits MATCH!")
         else:
             print("  ✗ Logits DIFFER!")
+
+        # Print first 10 logits values
+        print("\n  First 10 logits values:")
+        sg_first10 = sg_flat[:10].float().tolist()
+        meg_first10 = megatron_flat[:10].float().tolist()
+        diff_first10 = (sg_flat[:10].float() - megatron_flat[:10].float()).abs().tolist()
+        print(f"    SGLang:   {[f'{v:.4f}' for v in sg_first10]}")
+        print(f"    Megatron: {[f'{v:.4f}' for v in meg_first10]}")
+        print(f"    Diff:     {[f'{v:.4f}' for v in diff_first10]}")
 
         # Compare specific token logit
         if first_response_token is not None:
