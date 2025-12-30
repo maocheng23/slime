@@ -479,42 +479,61 @@ def compare_hidden_states_at_position(
         sglang_hidden = to_tensor(sglang_hidden)
         fsdp_hidden = to_tensor(fsdp_hidden)
 
-        if sglang_hidden is None:
-            if verbose:
-                print(f"  Layer {layer_idx:2d}: SGLang tensor is None/empty")
-            continue
         if fsdp_hidden is None:
             if verbose:
                 print(f"  Layer {layer_idx:2d}: FSDP tensor is None/empty")
             continue
-        
-        # Extract the specific position from each tensor
-        sg_at_pos = sglang_hidden
+
+        # FSDP hidden state (already extracted at prompt_len position)
         fsdp_at_pos = fsdp_hidden
-
-        # Handle SGLang tensor - extract at position if needed
-        if sg_at_pos.dim() == 3:
-            # [batch, seq_len, hidden]
-            if sglang_position < sg_at_pos.shape[1]:
-                sg_at_pos = sg_at_pos[:, sglang_position:sglang_position+1, :]
-        elif sg_at_pos.dim() == 2:
-            # [seq_len, hidden]
-            if sglang_position < sg_at_pos.shape[0]:
-                sg_at_pos = sg_at_pos[sglang_position:sglang_position+1, :]
-
-        # Handle FSDP tensor - extract at position if needed
         if fsdp_at_pos.dim() == 3:
-            # [batch, seq_len, hidden]
             if fsdp_position < fsdp_at_pos.shape[1]:
                 fsdp_at_pos = fsdp_at_pos[:, fsdp_position:fsdp_position+1, :]
         elif fsdp_at_pos.dim() == 2:
-            # [seq_len, hidden]
             if fsdp_position < fsdp_at_pos.shape[0]:
                 fsdp_at_pos = fsdp_at_pos[fsdp_position:fsdp_position+1, :]
-
-        # Flatten for comparison
-        sg_flat = sg_at_pos.flatten()
         fsdp_flat = fsdp_at_pos.flatten()
+
+        # For SGLang, use DECODE pass (position 91), not prefill!
+        # The prefill tensor has positions 0-90, decode pass has position 91
+        sg_flat = None
+        sg_source = "prefill"
+
+        if sglang_decode_tensors is not None:
+            # Find matching layer in decode tensors
+            sg_parts = sg_name.split(".")
+            if "layers" in sg_parts:
+                layer_str = sg_parts[sg_parts.index("layers") + 1]
+                component = sg_parts[-1]
+
+                for dname in sglang_decode_tensors.keys():
+                    if f"layers.{layer_str}." in dname and component in dname:
+                        dh = sglang_decode_tensors[dname]
+                        if isinstance(dh, (list, tuple)):
+                            dh = dh[0] if dh else None
+                        if isinstance(dh, torch.Tensor):
+                            # Decode pass: shape [1, hidden] for single token
+                            sg_flat = dh.flatten()
+                            sg_source = "decode"
+                            break
+
+        # Fallback to prefill if decode not found
+        if sg_flat is None and sglang_hidden is not None:
+            sg_at_pos = sglang_hidden
+            if sg_at_pos.dim() == 3:
+                if sglang_position < sg_at_pos.shape[1]:
+                    pos = sglang_position
+                    sg_at_pos = sg_at_pos[:, pos:pos+1, :]
+            elif sg_at_pos.dim() == 2:
+                if sglang_position < sg_at_pos.shape[0]:
+                    sg_at_pos = sg_at_pos[sglang_position:sglang_position+1, :]
+            sg_flat = sg_at_pos.flatten()
+            sg_source = "prefill"
+
+        if sg_flat is None:
+            if verbose:
+                print(f"  Layer {layer_idx:2d}: SGLang tensor not found")
+            continue
 
         # Align shapes if needed
         if sg_flat.shape != fsdp_flat.shape:
@@ -536,80 +555,27 @@ def compare_hidden_states_at_position(
             print(
                 f"  {color}Layer {layer_idx:2d}: {match_str} "
                 f"max_diff={stats['max_diff']:.6e}, "
-                f"mean_diff={stats['mean_diff']:.6e}{end_color}"
+                f"mean_diff={stats['mean_diff']:.6e} "
+                f"(SGLang {sg_source}){end_color}"
             )
 
             # Always show tensor shapes
-            print(f"    SGLang shape: {sglang_hidden.shape}, "
-                  f"FSDP shape: {fsdp_hidden.shape}")
+            sg_shape = sg_flat.shape
+            fsdp_shape = fsdp_flat.shape
+            print(f"    SGLang shape: {sg_shape}, FSDP shape: {fsdp_shape}")
 
-            # Show first 10 values if there's a significant difference
-            if stats["max_diff"] >= 1e-5:
-                n_show = min(10, len(fsdp_flat))
+            # Show first 10 values
+            n_show = min(10, len(fsdp_flat), len(sg_flat))
+            sg_vals = sg_flat[:n_show].float().tolist()
+            fsdp_vals = fsdp_flat[:n_show].float().tolist()
+            diff_vals = [(sg_flat[i] - fsdp_flat[i]).abs().float().item()
+                         for i in range(n_show)]
+            max_diff_shown = max(diff_vals) if diff_vals else 0
 
-                # We know: FSDP extracts at position prompt_len (91)
-                # So we compare with SGLang DECODE pass at position 91
-                next_pos = sglang_position + 1
-                print(f"\n    Comparing FSDP vs SGLang decode[{next_pos}]:")
-
-                # Get FSDP values (already extracted at position 91)
-                fsdp_vals = fsdp_flat[:n_show].float().tolist()
-                print(f"    FSDP:    {[f'{v:.4f}' for v in fsdp_vals]}")
-
-                # SGLang DECODE pass for position 91
-                if sglang_decode_tensors is not None:
-                    # Find matching layer in decode tensors
-                    # Try multiple matching strategies
-                    decode_hidden = None
-                    decode_key_used = None
-
-                    # Strategy 1: Match by layer index and component
-                    # SGLang prefill key: model.layers.{N}.{component}
-                    # SGLang decode key should be similar
-                    sg_parts = sg_name.split(".")
-                    if "layers" in sg_parts:
-                        layer_str = sg_parts[sg_parts.index("layers") + 1]
-                        component = sg_parts[-1]
-
-                        # Try exact match
-                        for dname in sglang_decode_tensors.keys():
-                            if f"layers.{layer_str}." in dname:
-                                if component in dname:
-                                    dh = sglang_decode_tensors[dname]
-                                    if isinstance(dh, (list, tuple)):
-                                        dh = dh[0] if dh else None
-                                    if isinstance(dh, torch.Tensor):
-                                        decode_hidden = dh
-                                        decode_key_used = dname
-                                        break
-
-                    if decode_hidden is not None:
-                        # Decode pass has shape [1, hidden] - single token
-                        if decode_hidden.dim() == 2:
-                            dh_flat = decode_hidden[0, :n_show]
-                        elif decode_hidden.dim() == 1:
-                            dh_flat = decode_hidden[:n_show]
-                        else:
-                            dh_flat = decode_hidden.flatten()[:n_show]
-
-                        dh_vals = dh_flat.float().tolist()
-                        diff1 = (dh_flat.float() - fsdp_flat[:n_show].float())
-                        diff1 = diff1.abs().tolist()
-                        max_diff1 = max(diff1) if diff1 else 0
-                        print(f"    SGLang: {[f'{v:.4f}' for v in dh_vals]}")
-                        print(f"    Diff:   {[f'{v:.4f}' for v in diff1]} "
-                              f"(max={max_diff1:.4f})")
-                        print(f"    Decode key: {decode_key_used}")
-                    else:
-                        print(f"    SGLang decode[{next_pos}]: "
-                              f"layer {layer_idx} NOT FOUND!")
-                        # Show available decode keys for this layer
-                        avail = [k for k in sglang_decode_tensors.keys()
-                                 if f"layers.{layer_idx}." in k]
-                        if avail:
-                            print(f"    Available: {avail[:5]}")
-                else:
-                    print("    SGLang decode tensors not loaded!")
+            print(f"    FSDP:   {[f'{v:.4f}' for v in fsdp_vals]}")
+            print(f"    SGLang: {[f'{v:.4f}' for v in sg_vals]}")
+            print(f"    Diff:   {[f'{v:.4f}' for v in diff_vals]} "
+                  f"(max={max_diff_shown:.4f})")
 
     # Summary
     if significant_diff_layers:
