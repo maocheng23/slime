@@ -414,6 +414,29 @@ def compare_hidden_states_at_position(
         sg_name, sglang_hidden = sglang_layers[layer_idx]
         fsdp_name, fsdp_hidden = fsdp_layers[layer_idx]
 
+        # Helper to convert list/tuple to tensor
+        def to_tensor(x):
+            if isinstance(x, (list, tuple)):
+                if len(x) == 0:
+                    return None
+                # Take first element if list
+                x = x[0]
+            if not isinstance(x, torch.Tensor):
+                return None
+            return x
+
+        sglang_hidden = to_tensor(sglang_hidden)
+        fsdp_hidden = to_tensor(fsdp_hidden)
+
+        if sglang_hidden is None:
+            if verbose:
+                print(f"  Layer {layer_idx:2d}: SGLang tensor is None/empty")
+            continue
+        if fsdp_hidden is None:
+            if verbose:
+                print(f"  Layer {layer_idx:2d}: FSDP tensor is None/empty")
+            continue
+
         # Extract the specific position from each tensor
         sg_at_pos = sglang_hidden
         fsdp_at_pos = fsdp_hidden
