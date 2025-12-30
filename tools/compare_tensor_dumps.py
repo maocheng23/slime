@@ -757,20 +757,123 @@ def compare_first_response_token(
         print(f"    Loaded SGLang decode pass {decode_id} "
               f"(first_pos={first_response_pos})")
 
-    # Compare: SGLang decode[91] vs FSDP base[90]
-    # The decode pass processes token 91 as input
-    print(f"    Comparing: SGLang decode[{first_response_pos}] vs "
-          f"FSDP base[{fsdp_hidden_pos}]")
+    # =========================================================================
+    # COMPREHENSIVE HIDDEN STATE COMPARISON
+    # Compare SGLang decode[91] vs FSDP at positions 90, 91, 92
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("COMPREHENSIVE HIDDEN STATE COMPARISON")
+    print("SGLang decode[91] vs FSDP at positions 90, 91, 92")
+    print("=" * 70)
 
-    # Compare hidden states
-    compare_hidden_states_at_position(
-        sglang_prefill_tensors,  # Prefill tensors (fallback)
-        fsdp_tensors,
-        sglang_position=sglang_prefill_last_pos,
-        fsdp_position=fsdp_hidden_pos,  # FSDP at position 90
-        verbose=verbose,
-        sglang_decode_tensors=sglang_decode_for_hidden,  # Use decode[91]
-    )
+    # First, show exactly what keys we have
+    print("\n  SGLang decode tensor keys (layer-related):")
+    if sglang_decode_for_hidden:
+        sg_keys = sorted([k for k in sglang_decode_for_hidden.keys()
+                          if "layer" in k.lower()])
+        for k in sg_keys[:10]:
+            t = sglang_decode_for_hidden[k]
+            if isinstance(t, torch.Tensor):
+                print(f"    {k}: shape={t.shape}")
+            elif isinstance(t, (list, tuple)):
+                print(f"    {k}: list[{len(t)}]")
+
+    print("\n  FSDP tensor keys (layer-related, showing pos variations):")
+    fsdp_keys = sorted([k for k in fsdp_tensors.keys()
+                        if "layer_0" in k.lower()])
+    for k in fsdp_keys:
+        t = fsdp_tensors[k]
+        if isinstance(t, torch.Tensor):
+            print(f"    {k}: shape={t.shape}")
+
+    # Compare layer 0 at different positions
+    print("\n  LAYER 0 COMPARISON (SGLang decode vs FSDP at 90/91/92):")
+
+    # Get SGLang decode layer 0 post_attention_layernorm
+    sg_hidden = None
+    sg_key_used = None
+    if sglang_decode_for_hidden:
+        for k in sglang_decode_for_hidden.keys():
+            if "layers.0" in k and "post_attention_layernorm" in k:
+                sg_hidden = sglang_decode_for_hidden[k]
+                sg_key_used = k
+                break
+
+    if sg_hidden is not None:
+        if isinstance(sg_hidden, (list, tuple)):
+            sg_hidden = sg_hidden[-1]  # Take output, not input
+        sg_flat = sg_hidden.flatten()
+        print(f"    SGLang key: {sg_key_used}")
+        print(f"    SGLang shape: {sg_flat.shape}")
+        sg_vals = sg_flat[:10].float().tolist()
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_vals]}")
+
+        # Try FSDP at position 90 (base tensor)
+        fsdp_key_90 = "layer_0_post_attention_layernorm_output"
+        if fsdp_key_90 in fsdp_tensors:
+            fsdp_90 = fsdp_tensors[fsdp_key_90].flatten()
+            fsdp_vals_90 = fsdp_90[:10].float().tolist()
+            diff_90 = (sg_flat[:10].float() - fsdp_90[:10].float()).abs()
+            max_diff_90 = diff_90.max().item()
+            print(f"\n    FSDP pos 90 ({fsdp_key_90}):")
+            print(f"    FSDP first 10: {[f'{v:.4f}' for v in fsdp_vals_90]}")
+            print(f"    Max diff: {max_diff_90:.6e}")
+
+        # Try FSDP at position 91 (_at_response_start)
+        fsdp_key_91 = "layer_0_post_attention_layernorm_output" \
+                      "_at_response_start"
+        if fsdp_key_91 in fsdp_tensors:
+            fsdp_91 = fsdp_tensors[fsdp_key_91].flatten()
+            fsdp_vals_91 = fsdp_91[:10].float().tolist()
+            diff_91 = (sg_flat[:10].float() - fsdp_91[:10].float()).abs()
+            max_diff_91 = diff_91.max().item()
+            print(f"\n    FSDP pos 91 ({fsdp_key_91}):")
+            print(f"    FSDP first 10: {[f'{v:.4f}' for v in fsdp_vals_91]}")
+            print(f"    Max diff: {max_diff_91:.6e}")
+
+        # Check if we have logits_full to extract pos 92
+        if "logits_full" in fsdp_tensors:
+            print("\n    Note: For pos 92, would need to check next position")
+    else:
+        print("    Could not find SGLang decode layer 0 tensor")
+
+    # Also compare input_layernorm to double-check layer alignment
+    print("\n  LAYER 0 INPUT_LAYERNORM COMPARISON:")
+    sg_input_ln = None
+    if sglang_decode_for_hidden:
+        for k in sglang_decode_for_hidden.keys():
+            if "layers.0" in k and "input_layernorm" in k:
+                sg_input_ln = sglang_decode_for_hidden[k]
+                print(f"    SGLang key: {k}")
+                break
+
+    if sg_input_ln is not None:
+        if isinstance(sg_input_ln, (list, tuple)):
+            sg_input_ln = sg_input_ln[-1]
+        if isinstance(sg_input_ln, torch.Tensor):
+            sg_ln_flat = sg_input_ln.flatten()
+            sg_ln_vals = sg_ln_flat[:10].float().tolist()
+            print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_ln_vals]}")
+
+            fsdp_ln_90 = "layer_0_input_layernorm_output"
+            if fsdp_ln_90 in fsdp_tensors:
+                fsdp_ln = fsdp_tensors[fsdp_ln_90].flatten()
+                fsdp_ln_vals = fsdp_ln[:10].float().tolist()
+                diff_ln = (sg_ln_flat[:10].float() - fsdp_ln[:10].float())
+                diff_ln = diff_ln.abs()
+                max_diff_ln = diff_ln.max().item()
+                print(f"    FSDP90: {[f'{v:.4f}' for v in fsdp_ln_vals]}")
+                print(f"    Max diff: {max_diff_ln:.6e}")
+
+            fsdp_ln_91 = "layer_0_input_layernorm_output_at_response_start"
+            if fsdp_ln_91 in fsdp_tensors:
+                fsdp_ln = fsdp_tensors[fsdp_ln_91].flatten()
+                fsdp_ln_vals = fsdp_ln[:10].float().tolist()
+                diff_ln = (sg_ln_flat[:10].float() - fsdp_ln[:10].float())
+                diff_ln = diff_ln.abs()
+                max_diff_ln = diff_ln.max().item()
+                print(f"    FSDP91: {[f'{v:.4f}' for v in fsdp_ln_vals]}")
+                print(f"    Max diff: {max_diff_ln:.6e}")
 
     # =========================================================================
     # 2. Compare logits for first response token
