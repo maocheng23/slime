@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -326,46 +327,79 @@ def compare_hidden_states_at_position(
     print("=" * 70)
 
     # Find all layer outputs in both dumps
+    # Try multiple key patterns for SGLang
     sglang_layers = {}
-    for name in sglang_tensors.keys():
-        if "model.layers." in name and name.endswith(".model"):
-            # SGLang format: model.layers.0.model, model.layers.1.model, etc.
-            parts = name.split(".")
-            for i, part in enumerate(parts):
-                if part == "layers" and i + 1 < len(parts):
-                    try:
-                        layer_idx = int(parts[i + 1])
-                        sglang_layers[layer_idx] = sglang_tensors[name]
-                    except ValueError:
-                        pass
 
+    # SGLang uses module names like:
+    #   model.layers.0.input_layernorm
+    #   model.layers.0.self_attn.o_proj
+    #   model.layers.0.post_attention_layernorm
+    # We prefer the output of each layer (e.g., after post_attention_layernorm)
+    sglang_priority_patterns = [
+        "post_attention_layernorm",  # After full layer
+        "mlp",                       # After MLP
+        "self_attn.o_proj",          # After attention output projection
+        "self_attn",                 # After attention
+        "input_layernorm",           # Layer input
+    ]
+
+    for pattern in sglang_priority_patterns:
+        if sglang_layers:
+            break  # Found layers with previous pattern
+        for name in sglang_tensors.keys():
+            if "layers." in name and pattern in name:
+                # Extract layer index from name like "model.layers.5.xxx"
+                match = re.search(r"layers\.(\d+)\.", name)
+                if match:
+                    layer_idx = int(match.group(1))
+                    if layer_idx not in sglang_layers:
+                        tensor = sglang_tensors[name]
+                        sglang_layers[layer_idx] = (name, tensor)
+
+    # Try multiple key patterns for FSDP
     fsdp_layers = {}
-    for name in fsdp_tensors.keys():
-        if name.startswith("layer_") and name.endswith("_output"):
-            # FSDP format: layer_0_output, layer_1_output, etc.
-            parts = name.split("_")
-            try:
-                layer_idx = int(parts[1])
-                if parts[2] == "output":
-                    fsdp_layers[layer_idx] = fsdp_tensors[name]
-            except (ValueError, IndexError):
-                pass
+
+    # FSDP uses patterns like:
+    #   layer_0_output (main layer output)
+    #   layer_0_input_layernorm_output (sublayer output)
+    fsdp_priority_patterns = [
+        r"^layer_(\d+)_output$",           # Main layer output
+        r"^layer_(\d+)_[a-z_]+_output$",   # Sublayer output
+    ]
+
+    for pattern in fsdp_priority_patterns:
+        if fsdp_layers:
+            break
+        for name in fsdp_tensors.keys():
+            match = re.match(pattern, name)
+            if match:
+                layer_idx = int(match.group(1))
+                if layer_idx not in fsdp_layers:
+                    fsdp_layers[layer_idx] = (name, fsdp_tensors[name])
 
     if not sglang_layers:
         print("  No layer outputs found in SGLang dump!")
         layer_keys = [k for k in sglang_tensors.keys() if "layer" in k.lower()]
-        print(f"  Available keys: {layer_keys[:10]}")
+        print(f"  Available keys: {layer_keys[:15]}")
 
     if not fsdp_layers:
         print("  No layer outputs found in FSDP dump!")
         layer_keys = [k for k in fsdp_tensors.keys() if "layer" in k.lower()]
-        print(f"  Available keys: {layer_keys[:10]}")
+        print(f"  Available keys: {layer_keys[:15]}")
+
+    # Show which pattern matched
+    if sglang_layers:
+        sample_key = list(sglang_layers.values())[0][0]
+        print(f"  SGLang using key pattern: {sample_key}")
+    if fsdp_layers:
+        sample_key = list(fsdp_layers.values())[0][0]
+        print(f"  FSDP using key pattern: {sample_key}")
 
     # Compare each layer
     all_layers = sorted(set(sglang_layers.keys()) | set(fsdp_layers.keys()))
 
     significant_diff_layers = []
-    
+
     for layer_idx in all_layers:
         if layer_idx not in sglang_layers:
             if verbose:
@@ -375,9 +409,10 @@ def compare_hidden_states_at_position(
             if verbose:
                 print(f"  Layer {layer_idx:2d}: NOT IN FSDP dump")
             continue
-        
-        sglang_hidden = sglang_layers[layer_idx]
-        fsdp_hidden = fsdp_layers[layer_idx]
+
+        # Extract tensor from (name, tensor) tuple
+        sg_name, sglang_hidden = sglang_layers[layer_idx]
+        fsdp_name, fsdp_hidden = fsdp_layers[layer_idx]
 
         # Extract the specific position from each tensor
         sg_at_pos = sglang_hidden
@@ -392,6 +427,16 @@ def compare_hidden_states_at_position(
             # [seq_len, hidden]
             if sglang_position < sg_at_pos.shape[0]:
                 sg_at_pos = sg_at_pos[sglang_position:sglang_position+1, :]
+
+        # Handle FSDP tensor - extract at position if needed
+        if fsdp_at_pos.dim() == 3:
+            # [batch, seq_len, hidden]
+            if fsdp_position < fsdp_at_pos.shape[1]:
+                fsdp_at_pos = fsdp_at_pos[:, fsdp_position:fsdp_position+1, :]
+        elif fsdp_at_pos.dim() == 2:
+            # [seq_len, hidden]
+            if fsdp_position < fsdp_at_pos.shape[0]:
+                fsdp_at_pos = fsdp_at_pos[fsdp_position:fsdp_position+1, :]
 
         # Flatten for comparison
         sg_flat = sg_at_pos.flatten()
@@ -533,7 +578,6 @@ def compare_first_response_token(
     if sglang_decode_result is not None:
         sg_decode_id, sg_decode_path = sglang_decode_result
         sglang_tensors = torch.load(sg_decode_path, map_location="cpu")
-        sglang_info = get_sglang_pass_info(sg_decode_path)
         print(f"\n  Using SGLang decode pass {sg_decode_id} "
               f"(first_position={first_response_pos})")
     else:
@@ -542,32 +586,35 @@ def compare_first_response_token(
               f"for position {first_response_pos}")
         print("  Falling back to prefill (may have position mismatch!)")
         sglang_tensors = sglang_prefill_tensors
-        sglang_info = sglang_prefill_info
 
     # =========================================================================
     # 1. Compare hidden states at each layer
     # =========================================================================
-    sglang_last_pos = sglang_info.get("seq_len", 1) - 1
+    # For hidden states, use PREFILL pass (has full prompt context)
+    # SGLang prefill processes positions [0, ..., prompt_len-1]
+    # FSDP processes full sequence, extract at prompt_len - 1
+    sglang_prefill_last_pos = sglang_prefill_info.get("seq_len", 1) - 1
 
-    print(f"\n  SGLang prefill last position: {sglang_last_pos}")
-    print(f"  FSDP extraction position: {fsdp_info.get('prompt_len', 0)}")
+    print("\n  Hidden state comparison:")
+    print(f"    SGLang: prefill pass, position {sglang_prefill_last_pos}")
+    print(f"    FSDP: position {comparison_pos}")
 
     # Check what position FSDP extracted at
     if "fsdp_compared_position" in fsdp_tensors:
-        fsdp_extracted_pos = fsdp_tensors["fsdp_compared_position"].item()
-        print(f"  FSDP compared position: {fsdp_extracted_pos}")
+        fsdp_hidden_pos = fsdp_tensors["fsdp_compared_position"].item()
+        print(f"    FSDP compared position: {fsdp_hidden_pos}")
     elif "megatron_compared_position" in fsdp_tensors:
-        fsdp_extracted_pos = fsdp_tensors["megatron_compared_position"].item()
-        print(f"  Megatron compared position: {fsdp_extracted_pos}")
+        fsdp_hidden_pos = fsdp_tensors["megatron_compared_position"].item()
+        print(f"    Megatron compared position: {fsdp_hidden_pos}")
     else:
-        fsdp_extracted_pos = prompt_len  # Assume default
+        fsdp_hidden_pos = comparison_pos  # Use prompt_len - 1
 
-    # Compare hidden states
+    # Compare hidden states using PREFILL tensors for SGLang
     compare_hidden_states_at_position(
-        sglang_tensors,
+        sglang_prefill_tensors,  # Use prefill for hidden states
         fsdp_tensors,
-        sglang_position=sglang_last_pos,
-        fsdp_position=fsdp_extracted_pos,
+        sglang_position=sglang_prefill_last_pos,
+        fsdp_position=fsdp_hidden_pos,
         verbose=verbose,
     )
 
