@@ -488,6 +488,25 @@ def compare_hidden_states_at_position(
                 f"mean_diff={stats['mean_diff']:.6e}{end_color}"
             )
 
+            # Show first 10 values if there's a significant difference
+            if stats["max_diff"] >= 1e-5:
+                n_show = min(10, len(sg_flat))
+                sg_vals = sg_flat[:n_show].float().tolist()
+                fsdp_vals = fsdp_flat[:n_show].float().tolist()
+                diff_vals = (sg_flat[:n_show] - fsdp_flat[:n_show]).abs()
+                diff_vals = diff_vals.float().tolist()
+
+                print(f"    SGLang first {n_show}: "
+                      f"{[f'{v:.4f}' for v in sg_vals]}")
+                print(f"    FSDP   first {n_show}: "
+                      f"{[f'{v:.4f}' for v in fsdp_vals]}")
+                print(f"    Diff   first {n_show}: "
+                      f"{[f'{v:.4f}' for v in diff_vals]}")
+
+                # Show tensor shapes for debugging
+                print(f"    SGLang tensor shape: {sglang_hidden.shape}")
+                print(f"    FSDP tensor shape: {fsdp_hidden.shape}")
+
     # Summary
     if significant_diff_layers:
         first_layer = significant_diff_layers[0][0]
@@ -619,18 +638,26 @@ def compare_first_response_token(
     sglang_prefill_last_pos = sglang_prefill_info.get("seq_len", 1) - 1
 
     print("\n  Hidden state comparison:")
-    print(f"    SGLang: prefill pass, position {sglang_prefill_last_pos}")
-    print(f"    FSDP: position {comparison_pos}")
+    print(f"    SGLang: prefill last position = {sglang_prefill_last_pos}")
+    print(f"    FSDP: position {comparison_pos} (prompt_len - 1)")
 
-    # Check what position FSDP extracted at
+    # Check what position FSDP extracted at (for info only)
     if "fsdp_compared_position" in fsdp_tensors:
-        fsdp_hidden_pos = fsdp_tensors["fsdp_compared_position"].item()
-        print(f"    FSDP compared position: {fsdp_hidden_pos}")
-    elif "megatron_compared_position" in fsdp_tensors:
-        fsdp_hidden_pos = fsdp_tensors["megatron_compared_position"].item()
-        print(f"    Megatron compared position: {fsdp_hidden_pos}")
-    else:
-        fsdp_hidden_pos = comparison_pos  # Use prompt_len - 1
+        fsdp_dump_pos = fsdp_tensors["fsdp_compared_position"].item()
+        print(f"    FSDP dump extracted at: {fsdp_dump_pos}")
+        if fsdp_dump_pos != comparison_pos:
+            print(f"    WARNING: Dump position {fsdp_dump_pos} != "
+                  f"comparison_pos {comparison_pos}")
+
+    # IMPORTANT: Use comparison_pos (prompt_len - 1) for FSDP
+    # This matches SGLang prefill's last position
+    fsdp_hidden_pos = comparison_pos
+
+    # Both should be the same position for apples-to-apples comparison
+    if sglang_prefill_last_pos != fsdp_hidden_pos:
+        print(f"    ⚠️ Position mismatch! Adjusting FSDP to "
+              f"{sglang_prefill_last_pos}")
+        fsdp_hidden_pos = sglang_prefill_last_pos
 
     # Compare hidden states using PREFILL tensors for SGLang
     compare_hidden_states_at_position(
