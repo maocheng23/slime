@@ -309,6 +309,7 @@ def compare_hidden_states_at_position(
     sglang_position: int,
     fsdp_position: int,
     verbose: bool = True,
+    sglang_decode_tensors: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
     Compare hidden states at a specific position across all layers.
@@ -506,7 +507,10 @@ def compare_hidden_states_at_position(
                 print(f"    FSDP (extracted): "
                       f"{[f'{v:.4f}' for v in fsdp_vals]}")
 
-                # SGLang at sglang_position
+                # SGLang PREFILL at sglang_position (last token of prefill)
+                max_diff0 = float('inf')
+                max_diff1 = float('inf')
+
                 if sglang_hidden.dim() == 2:
                     seq_len = sglang_hidden.shape[0]
                     if sglang_position < seq_len:
@@ -515,40 +519,73 @@ def compare_hidden_states_at_position(
                         diff0 = (sg_pos0.float() - fsdp_flat[:n_show].float())
                         diff0 = diff0.abs().tolist()
                         max_diff0 = max(diff0) if diff0 else 0
-                        print(f"    SGLang[{sglang_position}]:    "
+                        print(f"    SGLang prefill[{sglang_position}]: "
                               f"{[f'{v:.4f}' for v in sg_pos0_vals]}")
-                        print(f"    Diff[{sglang_position}]:      "
+                        print(f"    Diff prefill[{sglang_position}]:   "
                               f"{[f'{v:.4f}' for v in diff0]} "
                               f"(max={max_diff0:.4f})")
-
-                    # SGLang at sglang_position + 1
-                    next_pos = sglang_position + 1
-                    if next_pos < seq_len:
-                        sg_pos1 = sglang_hidden[next_pos, :n_show]
-                        sg_pos1_vals = sg_pos1.float().tolist()
-                        diff1 = (sg_pos1.float() - fsdp_flat[:n_show].float())
-                        diff1 = diff1.abs().tolist()
-                        max_diff1 = max(diff1) if diff1 else 0
-                        print(f"    SGLang[{next_pos}]:    "
-                              f"{[f'{v:.4f}' for v in sg_pos1_vals]}")
-                        print(f"    Diff[{next_pos}]:      "
-                              f"{[f'{v:.4f}' for v in diff1]} "
-                              f"(max={max_diff1:.4f})")
-
-                        # Suggest which position matches better
-                        if max_diff1 < max_diff0:
-                            print(f"    → SGLang[{next_pos}] matches FSDP "
-                                  f"better!")
-                        elif max_diff0 < max_diff1:
-                            print(f"    → SGLang[{sglang_position}] matches "
-                                  f"FSDP better!")
                 elif sglang_hidden.dim() == 3:
-                    # [batch, seq_len, hidden]
                     seq_len = sglang_hidden.shape[1]
                     if sglang_position < seq_len:
                         sg_pos0 = sglang_hidden[0, sglang_position, :n_show]
-                        print(f"    SGLang[0,{sglang_position}]: "
-                              f"{sg_pos0.float().tolist()}")
+                        sg_pos0_vals = sg_pos0.float().tolist()
+                        diff0 = (sg_pos0.float() - fsdp_flat[:n_show].float())
+                        diff0 = diff0.abs().tolist()
+                        max_diff0 = max(diff0) if diff0 else 0
+                        print(f"    SGLang prefill[{sglang_position}]: "
+                              f"{[f'{v:.4f}' for v in sg_pos0_vals]}")
+                        print(f"    Diff prefill[{sglang_position}]:   "
+                              f"{[f'{v:.4f}' for v in diff0]} "
+                              f"(max={max_diff0:.4f})")
+
+                # SGLang DECODE pass for next position
+                # (position 91 is in the first decode pass, not prefill)
+                next_pos = sglang_position + 1
+                if sglang_decode_tensors is not None:
+                    # Find matching layer in decode tensors
+                    decode_hidden = None
+                    for dname in sglang_decode_tensors.keys():
+                        if sg_name.split(".")[-1] in dname:
+                            # Found matching layer
+                            dh = sglang_decode_tensors[dname]
+                            if isinstance(dh, (list, tuple)):
+                                dh = dh[0] if len(dh) > 0 else None
+                            if isinstance(dh, torch.Tensor):
+                                decode_hidden = dh
+                                break
+
+                    if decode_hidden is not None:
+                        # Decode pass has shape [1, hidden] - single token
+                        if decode_hidden.dim() == 2:
+                            dh_flat = decode_hidden[0, :n_show]
+                        elif decode_hidden.dim() == 1:
+                            dh_flat = decode_hidden[:n_show]
+                        else:
+                            dh_flat = decode_hidden.flatten()[:n_show]
+
+                        dh_vals = dh_flat.float().tolist()
+                        diff1 = (dh_flat.float() - fsdp_flat[:n_show].float())
+                        diff1 = diff1.abs().tolist()
+                        max_diff1 = max(diff1) if diff1 else 0
+                        print(f"    SGLang decode[{next_pos}]:  "
+                              f"{[f'{v:.4f}' for v in dh_vals]}")
+                        print(f"    Diff decode[{next_pos}]:    "
+                              f"{[f'{v:.4f}' for v in diff1]} "
+                              f"(max={max_diff1:.4f})")
+                    else:
+                        print(f"    SGLang decode[{next_pos}]: "
+                              f"(layer not found in decode tensors)")
+                else:
+                    print(f"    SGLang decode[{next_pos}]: "
+                          f"(decode tensors not loaded)")
+
+                # Suggest which position matches better
+                if max_diff1 < max_diff0:
+                    print(f"    → SGLang decode[{next_pos}] matches FSDP "
+                          f"better!")
+                elif max_diff0 < max_diff1:
+                    print(f"    → SGLang prefill[{sglang_position}] matches "
+                          f"FSDP better!")
 
     # Summary
     if significant_diff_layers:
@@ -702,6 +739,15 @@ def compare_first_response_token(
               f"{sglang_prefill_last_pos}")
         fsdp_hidden_pos = sglang_prefill_last_pos
 
+    # Load decode pass tensors for position 91 comparison
+    sglang_decode_for_hidden = None
+    decode_result = find_sglang_decode_pass(sglang_dir, first_response_pos)
+    if decode_result is not None:
+        decode_id, decode_path = decode_result
+        sglang_decode_for_hidden = torch.load(decode_path, map_location="cpu")
+        print(f"    Also comparing with decode pass {decode_id} "
+              f"(first_pos={first_response_pos})")
+
     # Compare hidden states using PREFILL tensors for SGLang
     compare_hidden_states_at_position(
         sglang_prefill_tensors,  # Use prefill for hidden states
@@ -709,6 +755,7 @@ def compare_first_response_token(
         sglang_position=sglang_prefill_last_pos,
         fsdp_position=fsdp_hidden_pos,
         verbose=verbose,
+        sglang_decode_tensors=sglang_decode_for_hidden,
     )
 
     # =========================================================================
