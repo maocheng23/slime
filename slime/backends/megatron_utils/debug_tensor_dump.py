@@ -58,7 +58,7 @@ class MegatronTensorDumper:
         - These logits predict the token at position prompt_len
         - So we need hidden states at position (prompt_len - 1), not prompt_len
 
-        Megatron layout: [seq_len, batch, hidden]
+        Megatron layout: Could be [seq_len, batch, hidden] or [batch, seq, hidden]
 
         Saves hidden states at BOTH positions:
         - {name}: at position (prompt_len - 1) for prefill comparison
@@ -71,16 +71,30 @@ class MegatronTensorDumper:
         decode_pos = prompt_len
 
         def extract_token_at_position(t: torch.Tensor, pos: int) -> torch.Tensor:
-            """Extract token at specified position from Megatron tensor layout."""
+            """Extract token at specified position.
+
+            Handles both formats:
+            - [seq_len, batch, hidden] - Megatron default
+            - [batch, seq_len, hidden] - Alternative format
+            """
             if t.dim() == 3:
-                # [seq_len, batch, hidden]
-                seq_len = t.shape[0]
-                if pos >= seq_len:
-                    pos = seq_len - 1
-                token = t[pos:pos+1, :, :]
-                if token.shape[1] == 1:
-                    return token[:, 0, :]  # [1, hidden]
-                return token[0, :, :]  # [batch, hidden]
+                d0, d1, d2 = t.shape
+                # Detect format: [batch=1, seq, hidden] vs [seq, batch=1, hidden]
+                if d0 == 1 and d1 > 1:
+                    # [batch=1, seq_len, hidden] format
+                    seq_len = d1
+                    if pos >= seq_len:
+                        pos = seq_len - 1
+                    return t[0, pos:pos+1, :]  # [1, hidden]
+                else:
+                    # [seq_len, batch, hidden] format
+                    seq_len = d0
+                    if pos >= seq_len:
+                        pos = seq_len - 1
+                    token = t[pos:pos+1, :, :]
+                    if token.shape[1] == 1:
+                        return token[:, 0, :]  # [1, hidden]
+                    return token[0, :, :]  # [batch, hidden]
             elif t.dim() == 2:
                 # [seq_len, hidden]
                 seq_len = t.shape[0]
