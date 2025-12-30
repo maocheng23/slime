@@ -328,51 +328,66 @@ def compare_hidden_states_at_position(
     print("=" * 70)
 
     # Find all layer outputs in both dumps
-    # Try multiple key patterns for SGLang
-    sglang_layers = {}
+    # IMPORTANT: Match SAME component between SGLang and FSDP!
+    #
+    # SGLang keys: model.layers.{N}.{component}
+    # FSDP keys: layer_{N}_{component}_output
+    #
+    # Component mapping:
+    #   SGLang                      FSDP
+    #   ------                      ----
+    #   input_layernorm          -> layer_N_input_layernorm_output
+    #   post_attention_layernorm -> layer_N_post_attention_layernorm_output
+    #   self_attn                -> layer_N_self_attention_output
+    #   mlp                      -> layer_N_mlp_output
+    #   (final layer output)     -> layer_N_output
 
-    # SGLang uses module names like:
-    #   model.layers.0.input_layernorm
-    #   model.layers.0.self_attn.o_proj
-    #   model.layers.0.post_attention_layernorm
-    # We prefer the output of each layer (e.g., after post_attention_layernorm)
-    sglang_priority_patterns = [
-        "post_attention_layernorm",  # After full layer
-        "mlp",                       # After MLP
-        "self_attn.o_proj",          # After attention output projection
-        "self_attn",                 # After attention
-        "input_layernorm",           # Layer input
+    sglang_layers = {}
+    fsdp_layers = {}
+
+    # Define component pairs to try (SGLang pattern, FSDP pattern)
+    component_pairs = [
+        ("post_attention_layernorm", "post_attention_layernorm"),
+        ("input_layernorm", "input_layernorm"),
+        ("self_attn", "self_attention"),
+        ("mlp", "mlp"),
     ]
 
-    for pattern in sglang_priority_patterns:
-        if sglang_layers:
-            break  # Found layers with previous pattern
+    # Try each component pair
+    for sg_comp, fsdp_comp in component_pairs:
+        if sglang_layers and fsdp_layers:
+            break  # Found matching components
+
+        # Find SGLang layers with this component
+        sg_temp = {}
         for name in sglang_tensors.keys():
-            if "layers." in name and pattern in name:
-                # Extract layer index from name like "model.layers.5.xxx"
+            if "layers." in name and sg_comp in name:
                 match = re.search(r"layers\.(\d+)\.", name)
                 if match:
                     layer_idx = int(match.group(1))
-                    if layer_idx not in sglang_layers:
-                        tensor = sglang_tensors[name]
-                        sglang_layers[layer_idx] = (name, tensor)
+                    if layer_idx not in sg_temp:
+                        sg_temp[layer_idx] = (name, sglang_tensors[name])
 
-    # Try multiple key patterns for FSDP
-    fsdp_layers = {}
-
-    # FSDP uses patterns like:
-    #   layer_0_output (main layer output)
-    #   layer_0_input_layernorm_output (sublayer output)
-    fsdp_priority_patterns = [
-        r"^layer_(\d+)_output$",           # Main layer output
-        r"^layer_(\d+)_[a-z_]+_output$",   # Sublayer output
-    ]
-
-    for pattern in fsdp_priority_patterns:
-        if fsdp_layers:
-            break
+        # Find FSDP layers with matching component
+        fsdp_temp = {}
+        fsdp_pattern = f"layer_(\\d+)_{fsdp_comp}_output"
         for name in fsdp_tensors.keys():
-            match = re.match(pattern, name)
+            match = re.match(fsdp_pattern, name)
+            if match:
+                layer_idx = int(match.group(1))
+                if layer_idx not in fsdp_temp:
+                    fsdp_temp[layer_idx] = (name, fsdp_tensors[name])
+
+        # Use this pair if we found matches in both
+        if sg_temp and fsdp_temp:
+            sglang_layers = sg_temp
+            fsdp_layers = fsdp_temp
+            break
+
+    # Fallback to layer_N_output if no sublayer match
+    if not fsdp_layers:
+        for name in fsdp_tensors.keys():
+            match = re.match(r"^layer_(\d+)_output$", name)
             if match:
                 layer_idx = int(match.group(1))
                 if layer_idx not in fsdp_layers:
