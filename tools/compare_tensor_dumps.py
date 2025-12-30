@@ -488,24 +488,67 @@ def compare_hidden_states_at_position(
                 f"mean_diff={stats['mean_diff']:.6e}{end_color}"
             )
 
+            # Always show tensor shapes
+            print(f"    SGLang shape: {sglang_hidden.shape}, "
+                  f"FSDP shape: {fsdp_hidden.shape}")
+
             # Show first 10 values if there's a significant difference
             if stats["max_diff"] >= 1e-5:
-                n_show = min(10, len(sg_flat))
-                sg_vals = sg_flat[:n_show].float().tolist()
+                n_show = min(10, len(fsdp_flat))
+
+                # Show SGLang at BOTH positions (90 and 91) vs FSDP
+                # to figure out which position FSDP extracted at
+                print(f"\n    Comparing SGLang pos {sglang_position} "
+                      f"and {sglang_position + 1} vs FSDP:")
+
+                # Get FSDP values (already extracted)
                 fsdp_vals = fsdp_flat[:n_show].float().tolist()
-                diff_vals = (sg_flat[:n_show] - fsdp_flat[:n_show]).abs()
-                diff_vals = diff_vals.float().tolist()
-
-                print(f"    SGLang first {n_show}: "
-                      f"{[f'{v:.4f}' for v in sg_vals]}")
-                print(f"    FSDP   first {n_show}: "
+                print(f"    FSDP (extracted): "
                       f"{[f'{v:.4f}' for v in fsdp_vals]}")
-                print(f"    Diff   first {n_show}: "
-                      f"{[f'{v:.4f}' for v in diff_vals]}")
 
-                # Show tensor shapes for debugging
-                print(f"    SGLang tensor shape: {sglang_hidden.shape}")
-                print(f"    FSDP tensor shape: {fsdp_hidden.shape}")
+                # SGLang at sglang_position
+                if sglang_hidden.dim() == 2:
+                    seq_len = sglang_hidden.shape[0]
+                    if sglang_position < seq_len:
+                        sg_pos0 = sglang_hidden[sglang_position, :n_show]
+                        sg_pos0_vals = sg_pos0.float().tolist()
+                        diff0 = (sg_pos0.float() - fsdp_flat[:n_show].float())
+                        diff0 = diff0.abs().tolist()
+                        max_diff0 = max(diff0) if diff0 else 0
+                        print(f"    SGLang[{sglang_position}]:    "
+                              f"{[f'{v:.4f}' for v in sg_pos0_vals]}")
+                        print(f"    Diff[{sglang_position}]:      "
+                              f"{[f'{v:.4f}' for v in diff0]} "
+                              f"(max={max_diff0:.4f})")
+
+                    # SGLang at sglang_position + 1
+                    next_pos = sglang_position + 1
+                    if next_pos < seq_len:
+                        sg_pos1 = sglang_hidden[next_pos, :n_show]
+                        sg_pos1_vals = sg_pos1.float().tolist()
+                        diff1 = (sg_pos1.float() - fsdp_flat[:n_show].float())
+                        diff1 = diff1.abs().tolist()
+                        max_diff1 = max(diff1) if diff1 else 0
+                        print(f"    SGLang[{next_pos}]:    "
+                              f"{[f'{v:.4f}' for v in sg_pos1_vals]}")
+                        print(f"    Diff[{next_pos}]:      "
+                              f"{[f'{v:.4f}' for v in diff1]} "
+                              f"(max={max_diff1:.4f})")
+
+                        # Suggest which position matches better
+                        if max_diff1 < max_diff0:
+                            print(f"    → SGLang[{next_pos}] matches FSDP "
+                                  f"better!")
+                        elif max_diff0 < max_diff1:
+                            print(f"    → SGLang[{sglang_position}] matches "
+                                  f"FSDP better!")
+                elif sglang_hidden.dim() == 3:
+                    # [batch, seq_len, hidden]
+                    seq_len = sglang_hidden.shape[1]
+                    if sglang_position < seq_len:
+                        sg_pos0 = sglang_hidden[0, sglang_position, :n_show]
+                        print(f"    SGLang[0,{sglang_position}]: "
+                              f"{sg_pos0.float().tolist()}")
 
     # Summary
     if significant_diff_layers:
