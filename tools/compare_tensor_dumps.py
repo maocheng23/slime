@@ -486,15 +486,23 @@ def compare_hidden_states_at_position(
                 fsdp_name = resp_key
 
         # Helper to convert list/tuple to tensor
-        def to_tensor(x):
+        def to_tensor(x, prefer_last=True):
             if isinstance(x, (list, tuple)):
                 if len(x) == 0:
                     return None
-                # Take first element if list
-                x = x[0]
+                # For layernorm hooks, list is often (input, output)
+                # Take LAST element to get the OUTPUT, not input
+                if prefer_last:
+                    x = x[-1]  # Last element is typically the output
+                else:
+                    x = x[0]
             if not isinstance(x, torch.Tensor):
                 return None
             return x
+
+        # Check if SGLang tensor is a list and show info
+        sg_was_list = isinstance(sglang_hidden, (list, tuple))
+        sg_list_len = len(sglang_hidden) if sg_was_list else 0
 
         sglang_hidden = to_tensor(sglang_hidden)
         fsdp_hidden = to_tensor(fsdp_hidden)
@@ -530,7 +538,8 @@ def compare_hidden_states_at_position(
                     if f"layers.{layer_str}." in dname and component in dname:
                         dh = sglang_decode_tensors[dname]
                         if isinstance(dh, (list, tuple)):
-                            dh = dh[0] if dh else None
+                            # Use last element (output) not first (input)
+                            dh = dh[-1] if dh else None
                         if isinstance(dh, torch.Tensor):
                             # Decode pass: shape [1, hidden] for single token
                             sg_flat = dh.flatten()
@@ -572,11 +581,14 @@ def compare_hidden_states_at_position(
         end_color = "\033[0m" if color else ""
 
         if verbose:
+            list_info = ""
+            if sg_was_list:
+                list_info = f", was list[{sg_list_len}], used [-1]"
             print(
                 f"  {color}Layer {layer_idx:2d}: {match_str} "
                 f"max_diff={stats['max_diff']:.6e}, "
                 f"mean_diff={stats['mean_diff']:.6e} "
-                f"(SGLang {sg_source}){end_color}"
+                f"(SGLang {sg_source}{list_info}){end_color}"
             )
 
             # Always show tensor shapes
