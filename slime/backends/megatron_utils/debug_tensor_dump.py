@@ -52,23 +52,32 @@ class MegatronTensorDumper:
 
     def add_tensor(self, name: str, tensor: torch.Tensor | tuple | list) -> None:
         """Add a tensor to the current forward pass collection.
-        
-        Saves the FIRST RESPONSE token position to match SGLang's decode phase.
+
+        For first response token comparison with SGLang prefill:
+        - SGLang prefill outputs logits from position (prompt_len - 1)
+        - These logits predict the token at position prompt_len
+        - So we need hidden states at position (prompt_len - 1), not prompt_len
+
         Megatron layout: [seq_len, batch, hidden]
-        
-        If response_start_position is set, extract from that position.
-        Otherwise, extract from position 0 as fallback.
+
+        Saves hidden states at BOTH positions:
+        - {name}: at position (prompt_len - 1) for prefill comparison
+        - {name}_at_response_start: at position prompt_len for decode comparison
         """
-        target_pos = getattr(self, '_response_start_pos', 0)
-        
+        prompt_len = getattr(self, '_response_start_pos', 0)
+        # For prefill comparison, we need position (prompt_len - 1)
+        prefill_pos = max(0, prompt_len - 1)
+        # For decode comparison, we need position prompt_len
+        decode_pos = prompt_len
+
         def extract_token_at_position(t: torch.Tensor, pos: int) -> torch.Tensor:
             """Extract token at specified position from Megatron tensor layout."""
             if t.dim() == 3:
                 # [seq_len, batch, hidden]
                 seq_len = t.shape[0]
                 if pos >= seq_len:
-                    pos = seq_len - 1  # Use last token if pos is out of bounds
-                token = t[pos:pos+1, :, :]  # Keep dim: [1, batch, hidden]
+                    pos = seq_len - 1
+                token = t[pos:pos+1, :, :]
                 if token.shape[1] == 1:
                     return token[:, 0, :]  # [1, hidden]
                 return token[0, :, :]  # [batch, hidden]
@@ -80,21 +89,35 @@ class MegatronTensorDumper:
                 return t[pos:pos+1, :]  # [1, hidden]
             else:
                 return t
-        
+
+        def save_at_position(t: torch.Tensor, pos: int, suffix: str = ""):
+            key = f"{name}{suffix}"
+            extracted = extract_token_at_position(t, pos).cpu()
+            self._current_tensors[key] = extracted
+
         if isinstance(tensor, (tuple, list)):
             tensors = []
             for t in tensor:
                 if t is not None and isinstance(t, torch.Tensor):
-                    tensors.append(extract_token_at_position(t, target_pos).cpu())
+                    tensors.append(extract_token_at_position(t, prefill_pos).cpu())
             if len(tensors) == 1:
                 self._current_tensors[name] = tensors[0]
             elif len(tensors) > 1:
                 self._current_tensors[name] = tensors
         elif isinstance(tensor, torch.Tensor):
-            self._current_tensors[name] = extract_token_at_position(tensor, target_pos).cpu()
+            # Save at prefill comparison position (prompt_len - 1)
+            save_at_position(tensor, prefill_pos, "")
+            # Also save at decode position (prompt_len) for reference
+            if prefill_pos != decode_pos:
+                save_at_position(tensor, decode_pos, "_at_response_start")
 
     def set_response_start_position(self, pos: int) -> None:
-        """Set the response start position for token extraction."""
+        """Set the response start position (prompt_len).
+
+        This is used to determine extraction positions:
+        - prefill comparison: position (pos - 1)
+        - decode comparison: position pos
+        """
         self._response_start_pos = pos
         logger.info(f"[MegatronTensorDumper] Set response_start_pos={pos}")
 
