@@ -752,19 +752,193 @@ def compare_first_response_token(
         print(f"    Loaded SGLang decode pass {decode_id} "
               f"(first_pos={first_response_pos})")
 
-    # Compare: SGLang decode[91] vs Megatron base[90]
-    print(f"    Comparing: SGLang decode[{first_response_pos}] vs "
-          f"Megatron base[{megatron_hidden_pos}]")
+    # =========================================================================
+    # COMPREHENSIVE HIDDEN STATE COMPARISON
+    # Compare SGLang decode[91] vs Megatron at positions 90, 91
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("COMPREHENSIVE HIDDEN STATE COMPARISON")
+    print("SGLang decode[91] vs Megatron at positions 90, 91")
+    print("=" * 70)
 
-    # Compare hidden states
-    compare_hidden_states_at_position(
-        sglang_prefill_tensors,  # Prefill tensors (fallback)
-        megatron_tensors,
-        sglang_position=sglang_prefill_last_pos,
-        megatron_position=megatron_hidden_pos,  # Megatron at position 90
-        verbose=verbose,
-        sglang_decode_tensors=sglang_decode_for_hidden,  # Use decode[91]
-    )
+    # First, show exactly what keys we have
+    print("\n  SGLang decode tensor keys (layer-related):")
+    if sglang_decode_for_hidden:
+        sg_keys = sorted([k for k in sglang_decode_for_hidden.keys()
+                          if "layer" in k.lower()])
+        for k in sg_keys[:10]:
+            t = sglang_decode_for_hidden[k]
+            if isinstance(t, torch.Tensor):
+                print(f"    {k}: shape={t.shape}")
+            elif isinstance(t, (list, tuple)):
+                print(f"    {k}: list[{len(t)}]")
+
+    print("\n  Megatron tensor keys (layer-related, layer_0):")
+    meg_keys = sorted([k for k in megatron_tensors.keys()
+                       if "layer_0" in k.lower()])
+    for k in meg_keys:
+        t = megatron_tensors[k]
+        if isinstance(t, torch.Tensor):
+            print(f"    {k}: shape={t.shape}")
+
+    # Compare layer 0 at different positions
+    print("\n  LAYER 0 COMPARISON (SGLang decode vs Megatron at 90/91):")
+
+    # Get SGLang decode layer 0 post_attention_layernorm
+    sg_hidden = None
+    sg_key_used = None
+    if sglang_decode_for_hidden:
+        for k in sglang_decode_for_hidden.keys():
+            if "layers.0" in k and "post_attention_layernorm" in k:
+                sg_hidden = sglang_decode_for_hidden[k]
+                sg_key_used = k
+                break
+
+    if sg_hidden is not None:
+        if isinstance(sg_hidden, (list, tuple)):
+            sg_hidden = sg_hidden[-1]  # Take output, not input
+        sg_flat = sg_hidden.flatten()
+        print(f"    SGLang key: {sg_key_used}")
+        print(f"    SGLang shape: {sg_flat.shape}")
+        sg_vals = sg_flat[:10].float().tolist()
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_vals]}")
+
+        # Try Megatron at position 90 (base tensor)
+        meg_key_90 = "layer_0_post_attention_layernorm_output"
+        if meg_key_90 in megatron_tensors:
+            meg_90 = megatron_tensors[meg_key_90].flatten()
+            meg_vals_90 = meg_90[:10].float().tolist()
+            diff_90 = (sg_flat[:10].float() - meg_90[:10].float()).abs()
+            max_diff_90 = diff_90.max().item()
+            print(f"\n    Megatron pos 90 ({meg_key_90}):")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_vals_90]}")
+            print(f"    Max diff: {max_diff_90:.6e}")
+
+        # Try Megatron at position 91 (_at_response_start)
+        meg_key_91 = "layer_0_post_attention_layernorm_output" \
+                     "_at_response_start"
+        if meg_key_91 in megatron_tensors:
+            meg_91 = megatron_tensors[meg_key_91].flatten()
+            meg_vals_91 = meg_91[:10].float().tolist()
+            diff_91 = (sg_flat[:10].float() - meg_91[:10].float()).abs()
+            max_diff_91 = diff_91.max().item()
+            print(f"\n    Megatron pos 91 ({meg_key_91}):")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_vals_91]}")
+            print(f"    Max diff: {max_diff_91:.6e}")
+    else:
+        print("    Could not find SGLang decode layer 0 tensor")
+
+    # Also compare input_layernorm to double-check layer alignment
+    print("\n  LAYER 0 INPUT_LAYERNORM COMPARISON:")
+    sg_input_ln = None
+    if sglang_decode_for_hidden:
+        for k in sglang_decode_for_hidden.keys():
+            if "layers.0" in k and "input_layernorm" in k:
+                sg_input_ln = sglang_decode_for_hidden[k]
+                print(f"    SGLang key: {k}")
+                break
+
+    if sg_input_ln is not None:
+        if isinstance(sg_input_ln, (list, tuple)):
+            sg_input_ln = sg_input_ln[-1]
+        if isinstance(sg_input_ln, torch.Tensor):
+            sg_ln_flat = sg_input_ln.flatten()
+            sg_ln_vals = sg_ln_flat[:10].float().tolist()
+            print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_ln_vals]}")
+
+            meg_ln_90 = "layer_0_input_layernorm_output"
+            if meg_ln_90 in megatron_tensors:
+                meg_ln = megatron_tensors[meg_ln_90].flatten()
+                meg_ln_vals = meg_ln[:10].float().tolist()
+                diff_ln = (sg_ln_flat[:10].float() - meg_ln[:10].float())
+                diff_ln = diff_ln.abs()
+                max_diff_ln = diff_ln.max().item()
+                print(f"    Megatron90: {[f'{v:.4f}' for v in meg_ln_vals]}")
+                print(f"    Max diff: {max_diff_ln:.6e}")
+
+            meg_ln_91 = "layer_0_input_layernorm_output_at_response_start"
+            if meg_ln_91 in megatron_tensors:
+                meg_ln = megatron_tensors[meg_ln_91].flatten()
+                meg_ln_vals = meg_ln[:10].float().tolist()
+                diff_ln = (sg_ln_flat[:10].float() - meg_ln[:10].float())
+                diff_ln = diff_ln.abs()
+                max_diff_ln = diff_ln.max().item()
+                print(f"    Megatron91: {[f'{v:.4f}' for v in meg_ln_vals]}")
+                print(f"    Max diff: {max_diff_ln:.6e}")
+
+    # Compare LAYER OUTPUT (after full layer, including MLP and residual)
+    print("\n  LAYER 0 FULL OUTPUT COMPARISON (after MLP + residual):")
+    sg_layer_out = None
+    if sglang_decode_for_hidden:
+        for k in ["model.layers.0.mlp.down_proj",
+                  "model.layers.0.mlp",
+                  "model.layers.0"]:
+            if k in sglang_decode_for_hidden:
+                sg_layer_out = sglang_decode_for_hidden[k]
+                print(f"    SGLang key: {k}")
+                if isinstance(sg_layer_out, (list, tuple)):
+                    sg_layer_out = sg_layer_out[-1]
+                break
+
+    if sg_layer_out is not None and isinstance(sg_layer_out, torch.Tensor):
+        sg_out_flat = sg_layer_out.flatten()
+        sg_out_vals = sg_out_flat[:10].float().tolist()
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_out_vals]}")
+
+        # Megatron layer output at pos 91
+        meg_out_91 = "layer_0_output_at_response_start"
+        if meg_out_91 in megatron_tensors:
+            meg_out = megatron_tensors[meg_out_91].flatten()
+            meg_out_vals = meg_out[:10].float().tolist()
+            diff_out = (sg_out_flat[:10].float() - meg_out[:10].float())
+            diff_out = diff_out.abs()
+            max_diff_out = diff_out.max().item()
+            print("    Megatron layer_0_output pos 91:")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_out_vals]}")
+            print(f"    Max diff: {max_diff_out:.6e}")
+
+        # Megatron MLP output at pos 91
+        meg_mlp_91 = "layer_0_mlp_output_at_response_start"
+        if meg_mlp_91 in megatron_tensors:
+            meg_mlp = megatron_tensors[meg_mlp_91].flatten()
+            meg_mlp_vals = meg_mlp[:10].float().tolist()
+            diff_mlp = (sg_out_flat[:10].float() - meg_mlp[:10].float())
+            diff_mlp = diff_mlp.abs()
+            max_diff_mlp = diff_mlp.max().item()
+            print("    Megatron layer_0_mlp_output pos 91:")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_mlp_vals]}")
+            print(f"    Max diff: {max_diff_mlp:.6e}")
+
+    # Also check self-attention output
+    print("\n  LAYER 0 SELF-ATTENTION OUTPUT COMPARISON:")
+    sg_attn = None
+    if sglang_decode_for_hidden:
+        for k in ["model.layers.0.self_attn.o_proj",
+                  "model.layers.0.self_attn.attn",
+                  "model.layers.0.self_attn"]:
+            if k in sglang_decode_for_hidden:
+                sg_attn = sglang_decode_for_hidden[k]
+                print(f"    SGLang key: {k}")
+                if isinstance(sg_attn, (list, tuple)):
+                    sg_attn = sg_attn[-1]
+                break
+
+    if sg_attn is not None and isinstance(sg_attn, torch.Tensor):
+        # Take first 1024 for hidden dim
+        sg_attn_flat = sg_attn.flatten()[:1024]
+        sg_attn_vals = sg_attn_flat[:10].float().tolist()
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_attn_vals]}")
+
+        meg_attn_91 = "layer_0_self_attention_output_at_response_start"
+        if meg_attn_91 in megatron_tensors:
+            meg_attn = megatron_tensors[meg_attn_91].flatten()
+            meg_attn_vals = meg_attn[:10].float().tolist()
+            diff_attn = (sg_attn_flat[:10].float() - meg_attn[:10].float())
+            diff_attn = diff_attn.abs()
+            max_diff_attn = diff_attn.max().item()
+            print("    Megatron self_attention_output pos 91:")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_attn_vals]}")
+            print(f"    Max diff: {max_diff_attn:.6e}")
 
     # =========================================================================
     # 2. Compare logits for first response token
@@ -809,6 +983,25 @@ def compare_first_response_token(
         print(
             f"Megatron logits_at_prompt_end: "
             f"shape={megatron_logits.shape}, dtype={megatron_logits.dtype}"
+        )
+    elif "logits_full" in megatron_tensors:
+        # Extract from full logits tensor
+        full_logits = megatron_tensors["logits_full"]
+        print(f"  Extracting from logits_full: shape={full_logits.shape}")
+        # Detect format: [batch, seq, vocab] or [seq, batch, vocab]
+        if full_logits.dim() == 3:
+            d0, d1, d2 = full_logits.shape
+            if d0 == 1 and d1 > 1:
+                # [batch=1, seq, vocab]
+                megatron_logits = full_logits[0, comparison_pos:comparison_pos+1, :]
+            else:
+                # [seq, batch=1, vocab]
+                megatron_logits = full_logits[comparison_pos:comparison_pos+1, 0, :]
+        elif full_logits.dim() == 2:
+            megatron_logits = full_logits[comparison_pos:comparison_pos+1, :]
+        print(
+            f"Megatron (from logits_full at pos {comparison_pos}): "
+            f"shape={megatron_logits.shape}"
         )
     else:
         print(f"WARNING: Could not find {logits_key} in Megatron dump")

@@ -355,11 +355,28 @@ class MegatronTensorDumper:
         prompt_len = getattr(self, '_response_start_pos', 0)
         
         if logits.dim() == 3:
-            # [seq_len, batch, vocab_size] - Megatron format
-            seq_len = logits.shape[0]
-            batch_size = logits.shape[1]
-            vocab_size = logits.shape[2]
-            
+            # Detect format: could be [seq, batch, vocab] or [batch, seq, vocab]
+            # Heuristic: batch is usually 1, vocab is largest
+            d0, d1, d2 = logits.shape
+            if d0 == 1 and d1 > 1:
+                # [batch=1, seq_len, vocab_size] format
+                batch_size = d0
+                seq_len = d1
+                vocab_size = d2
+                is_batch_first = True
+                logger.info(
+                    "[MegatronTensorDumper] Detected [batch, seq, vocab] format"
+                )
+            else:
+                # [seq_len, batch, vocab_size] - Megatron format
+                seq_len = d0
+                batch_size = d1
+                vocab_size = d2
+                is_batch_first = False
+                logger.info(
+                    "[MegatronTensorDumper] Detected [seq, batch, vocab] format"
+                )
+
             # Save sequence info
             self._current_tensors["seq_len"] = torch.tensor([seq_len])
             self._current_tensors["batch_size"] = torch.tensor([batch_size])
@@ -367,31 +384,40 @@ class MegatronTensorDumper:
             self._current_tensors["prompt_len"] = torch.tensor([prompt_len])
             response_len = seq_len - prompt_len
             self._current_tensors["response_len_from_logits"] = torch.tensor([response_len])
-            
+
             # Save full logits tensor
             self._current_tensors["logits_full"] = logits.cpu().bfloat16()
-            
+
             # Save logits at EACH response position for decode comparison
             response_positions = []
             for i in range(response_len):
                 pos = prompt_len + i
                 if pos < seq_len:
-                    # Megatron format: [seq, batch, vocab] -> squeeze batch dim
-                    self._current_tensors[f"logits_pos_{pos}"] = logits[pos:pos+1, 0, :].cpu().bfloat16()
+                    if is_batch_first:
+                        # [batch, seq, vocab] -> take [0, pos, :]
+                        pos_logits = logits[0, pos:pos+1, :].cpu().bfloat16()
+                    else:
+                        # [seq, batch, vocab] -> take [pos, 0, :]
+                        pos_logits = logits[pos:pos+1, 0, :].cpu().bfloat16()
+                    self._current_tensors[f"logits_pos_{pos}"] = pos_logits
                     response_positions.append(pos)
-            
+
             self._current_tensors["response_logits_positions"] = torch.tensor(response_positions)
-            
+
             # For prefill comparison: logits at prompt_len - 1
             if prompt_len > 0 and prompt_len - 1 < seq_len:
-                self._current_tensors["logits_at_prompt_end"] = logits[prompt_len-1:prompt_len, 0, :].cpu().bfloat16()
+                if is_batch_first:
+                    prompt_end_logits = logits[0, prompt_len-1:prompt_len, :].cpu().bfloat16()
+                else:
+                    prompt_end_logits = logits[prompt_len-1:prompt_len, 0, :].cpu().bfloat16()
+                self._current_tensors["logits_at_prompt_end"] = prompt_end_logits
                 self._current_tensors["logits_prompt_end_pos"] = torch.tensor([prompt_len - 1])
-            
+
             # Default position for backwards compatibility
             target_pos = prompt_len if prompt_len < seq_len else 0
-            self._current_tensors["logits"] = logits[target_pos:target_pos+1, :, :].cpu().bfloat16()
+            self._current_tensors["logits"] = logits.cpu().bfloat16()
             self._current_tensors["logits_pos"] = torch.tensor([target_pos])
-            
+
             logger.info(f"[MegatronTensorDumper] Saved logits: seq_len={seq_len}, "
                        f"prompt_len={prompt_len}, response_len={response_len}, "
                        f"batch_size={batch_size}, vocab_size={vocab_size}")
