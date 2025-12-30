@@ -258,8 +258,23 @@ def forward_only(
         if tensor_dump_enabled:
             from slime.backends.megatron_utils.debug_tensor_dump import get_megatron_tensor_dumper
             dumper = get_megatron_tensor_dumper()
-            if dumper is not None and hasattr(output_tensor, 'logits'):
-                dumper.add_logits(output_tensor.logits)
+            if dumper is not None:
+                # Check if logits exist in output_tensor
+                if hasattr(output_tensor, 'logits'):
+                    logits = output_tensor.logits
+                    dumper.add_logits(logits)
+                elif isinstance(output_tensor, torch.Tensor):
+                    # output_tensor might be the logits directly
+                    dumper.add_logits(output_tensor)
+                else:
+                    # Try to find logits in the output
+                    import logging
+                    _logger = logging.getLogger(__name__)
+                    _logger.warning(
+                        f"[MegatronTensorDump] Could not find logits in "
+                        f"output_tensor. Type: {type(output_tensor)}, "
+                        f"Has logits attr: {hasattr(output_tensor, 'logits')}"
+                    )
 
         return output_tensor, partial(
             f,

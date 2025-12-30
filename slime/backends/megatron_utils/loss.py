@@ -160,6 +160,8 @@ def get_log_probs_and_entropy(
                 # We want the first token of the response
                 first_logprob = log_probs_list[0][0:1] if len(log_probs_list[0]) > 0 else log_probs_list[0]
                 dumper.add_logprobs(first_logprob)
+                # Dump all tensors (including logits and logprobs) after forward pass
+                dumper.dump_current_tensors()
 
     res = {
         "log_probs": log_probs_list,
