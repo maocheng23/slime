@@ -284,11 +284,12 @@ class FSDPTensorDumper:
             # Hook MLP sublayers to match Megatron naming
             if hasattr(layer.mlp, 'gate_proj') and hasattr(layer.mlp, 'up_proj'):
                 # For models with separate gate/up projections
+                # Use separate names so both are captured (not overwriting each other)
                 layer.mlp.gate_proj.register_forward_hook(
-                    self._create_sublayer_hook(layer_idx, "mlp.gate_up_proj")
+                    self._create_sublayer_hook(layer_idx, "mlp.gate_proj")
                 )
                 layer.mlp.up_proj.register_forward_hook(
-                    self._create_sublayer_hook(layer_idx, "mlp.gate_up_proj")
+                    self._create_sublayer_hook(layer_idx, "mlp.up_proj")
                 )
             if hasattr(layer.mlp, 'down_proj'):
                 layer.mlp.down_proj.register_forward_hook(
@@ -303,7 +304,8 @@ class FSDPTensorDumper:
         - layer_{idx}_post_attention_layernorm_output
         - layer_{idx}_self_attention_output
         - layer_{idx}_mlp_output
-        - layer_{idx}_mlp.gate_up_proj_output
+        - layer_{idx}_mlp.gate_proj_output
+        - layer_{idx}_mlp.up_proj_output
         - layer_{idx}_mlp.down_proj_output
         """
 
