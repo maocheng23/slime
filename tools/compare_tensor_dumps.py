@@ -875,6 +875,81 @@ def compare_first_response_token(
                 print(f"    FSDP91: {[f'{v:.4f}' for v in fsdp_ln_vals]}")
                 print(f"    Max diff: {max_diff_ln:.6e}")
 
+    # Compare LAYER OUTPUT (after full layer, including MLP and residual)
+    print("\n  LAYER 0 FULL OUTPUT COMPARISON (after MLP + residual):")
+    sg_layer_out = None
+    # SGLang might store layer output as mlp.down_proj output
+    if sglang_decode_for_hidden:
+        for k in ["model.layers.0.mlp.down_proj",
+                  "model.layers.0.mlp",
+                  "model.layers.0"]:
+            if k in sglang_decode_for_hidden:
+                sg_layer_out = sglang_decode_for_hidden[k]
+                print(f"    SGLang key: {k}")
+                if isinstance(sg_layer_out, (list, tuple)):
+                    sg_layer_out = sg_layer_out[-1]
+                break
+
+    if sg_layer_out is not None and isinstance(sg_layer_out, torch.Tensor):
+        sg_out_flat = sg_layer_out.flatten()
+        sg_out_vals = sg_out_flat[:10].float().tolist()
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_out_vals]}")
+
+        # FSDP layer output at pos 91
+        fsdp_out_91 = "layer_0_output_at_response_start"
+        if fsdp_out_91 in fsdp_tensors:
+            fsdp_out = fsdp_tensors[fsdp_out_91].flatten()
+            fsdp_out_vals = fsdp_out[:10].float().tolist()
+            diff_out = (sg_out_flat[:10].float() - fsdp_out[:10].float())
+            diff_out = diff_out.abs()
+            max_diff_out = diff_out.max().item()
+            print("    FSDP layer_0_output pos 91:")
+            print(f"    FSDP first 10: {[f'{v:.4f}' for v in fsdp_out_vals]}")
+            print(f"    Max diff: {max_diff_out:.6e}")
+
+        # FSDP MLP output at pos 91
+        fsdp_mlp_91 = "layer_0_mlp_output_at_response_start"
+        if fsdp_mlp_91 in fsdp_tensors:
+            fsdp_mlp = fsdp_tensors[fsdp_mlp_91].flatten()
+            fsdp_mlp_vals = fsdp_mlp[:10].float().tolist()
+            diff_mlp = (sg_out_flat[:10].float() - fsdp_mlp[:10].float())
+            diff_mlp = diff_mlp.abs()
+            max_diff_mlp = diff_mlp.max().item()
+            print("    FSDP layer_0_mlp_output pos 91:")
+            print(f"    FSDP first 10: {[f'{v:.4f}' for v in fsdp_mlp_vals]}")
+            print(f"    Max diff: {max_diff_mlp:.6e}")
+
+    # Also check self-attention output
+    print("\n  LAYER 0 SELF-ATTENTION OUTPUT COMPARISON:")
+    sg_attn = None
+    if sglang_decode_for_hidden:
+        for k in ["model.layers.0.self_attn.o_proj",
+                  "model.layers.0.self_attn.attn",
+                  "model.layers.0.self_attn"]:
+            if k in sglang_decode_for_hidden:
+                sg_attn = sglang_decode_for_hidden[k]
+                print(f"    SGLang key: {k}")
+                if isinstance(sg_attn, (list, tuple)):
+                    sg_attn = sg_attn[-1]
+                break
+
+    if sg_attn is not None and isinstance(sg_attn, torch.Tensor):
+        # Take first 1024 for hidden dim
+        sg_attn_flat = sg_attn.flatten()[:1024]
+        sg_attn_vals = sg_attn_flat[:10].float().tolist()
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_attn_vals]}")
+
+        fsdp_attn_91 = "layer_0_self_attention_output_at_response_start"
+        if fsdp_attn_91 in fsdp_tensors:
+            fsdp_attn = fsdp_tensors[fsdp_attn_91].flatten()
+            fsdp_attn_vals = fsdp_attn[:10].float().tolist()
+            diff_attn = (sg_attn_flat[:10].float() - fsdp_attn[:10].float())
+            diff_attn = diff_attn.abs()
+            max_diff_attn = diff_attn.max().item()
+            print("    FSDP self_attention_output pos 91:")
+            print(f"    FSDP first 10: {[f'{v:.4f}' for v in fsdp_attn_vals]}")
+            print(f"    Max diff: {max_diff_attn:.6e}")
+
     # =========================================================================
     # 2. Compare logits for first response token
     # =========================================================================
