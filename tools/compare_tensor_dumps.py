@@ -763,8 +763,8 @@ def compare_first_response_token(
     # =========================================================================
     print("\n" + "=" * 70)
     print("COMPREHENSIVE HIDDEN STATE COMPARISON")
-    print("SGLang decode[91] vs FSDP at positions 90, 91, 92")
-    print("=" * 70)
+    print("SGLang decode[91] vs FSDP at positions 90")
+    print("=" * 70) 
 
     # First, show exactly what keys we have
     print("\n  SGLang decode tensor keys (layer-related):")
