@@ -451,15 +451,11 @@ def compare_hidden_states_at_position(
 
     significant_diff_layers = []
 
-    # IMPORTANT: When using SGLang decode tensors (position prompt_len),
-    # we need FSDP's _at_response_start tensors (also at prompt_len).
-    # When using SGLang prefill tensors (position prompt_len-1),
-    # we use FSDP's base tensors (also at prompt_len-1).
-    use_fsdp_response_start = sglang_decode_tensors is not None
-
-    if use_fsdp_response_start:
-        print("\n  NOTE: Using SGLang decode, comparing with FSDP at")
-        print("        response_start position (prompt_len)")
+    # Comparing SGLang decode[91] vs FSDP base[90]
+    # SGLang decode processes token at position 91
+    # FSDP base tensors are at position 90 (prompt_len - 1)
+    if sglang_decode_tensors is not None:
+        print("\n  NOTE: Using SGLang decode[91] vs FSDP base[90]")
 
     for layer_idx in all_layers:
         if layer_idx not in sglang_layers:
@@ -474,16 +470,7 @@ def compare_hidden_states_at_position(
         # Extract tensor from (name, tensor) tuple
         sg_name, sglang_hidden = sglang_layers[layer_idx]
         fsdp_name, fsdp_hidden = fsdp_layers[layer_idx]
-
-        # When using decode, try to get FSDP's _at_response_start tensor
-        if use_fsdp_response_start:
-            if fsdp_name.endswith("_output"):
-                resp_key = f"{fsdp_name[:-7]}_at_response_start"
-            else:
-                resp_key = f"{fsdp_name}_at_response_start"
-            if resp_key in fsdp_tensors:
-                fsdp_hidden = fsdp_tensors[resp_key]
-                fsdp_name = resp_key
+        # Using FSDP base tensors at position 90 (not _at_response_start)
 
         # Helper to convert list/tuple to tensor
         def to_tensor(x, prefer_last=True):
@@ -761,20 +748,28 @@ def compare_first_response_token(
               f"{sglang_prefill_last_pos}")
         fsdp_hidden_pos = sglang_prefill_last_pos
 
-    # For hidden states, compare PREFILL vs FSDP base (both at same pos)
-    # NOT decode pass - that's a separate forward with only 1 token!
-    print(f"    Comparing: SGLang prefill[{sglang_prefill_last_pos}] vs "
+    # Load decode pass tensors for SGLang position 91
+    sglang_decode_for_hidden = None
+    decode_result = find_sglang_decode_pass(sglang_dir, first_response_pos)
+    if decode_result is not None:
+        decode_id, decode_path = decode_result
+        sglang_decode_for_hidden = torch.load(decode_path, map_location="cpu")
+        print(f"    Loaded SGLang decode pass {decode_id} "
+              f"(first_pos={first_response_pos})")
+
+    # Compare: SGLang decode[91] vs FSDP base[90]
+    # The decode pass processes token 91 as input
+    print(f"    Comparing: SGLang decode[{first_response_pos}] vs "
           f"FSDP base[{fsdp_hidden_pos}]")
 
-    # Compare hidden states using PREFILL tensors for SGLang
-    # Pass sglang_decode_tensors=None to use prefill only
+    # Compare hidden states
     compare_hidden_states_at_position(
-        sglang_prefill_tensors,  # Use prefill for hidden states
+        sglang_prefill_tensors,  # Prefill tensors (fallback)
         fsdp_tensors,
         sglang_position=sglang_prefill_last_pos,
-        fsdp_position=fsdp_hidden_pos,
+        fsdp_position=fsdp_hidden_pos,  # FSDP at position 90
         verbose=verbose,
-        sglang_decode_tensors=None,  # DON'T use decode - use prefill!
+        sglang_decode_tensors=sglang_decode_for_hidden,  # Use decode[91]
     )
 
     # =========================================================================

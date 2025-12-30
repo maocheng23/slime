@@ -446,15 +446,11 @@ def compare_hidden_states_at_position(
 
     significant_diff_layers = []
 
-    # IMPORTANT: When using SGLang decode tensors (position prompt_len),
-    # we need Megatron's _at_response_start tensors (also at prompt_len).
-    # When using SGLang prefill tensors (position prompt_len-1),
-    # we use Megatron's base tensors (also at prompt_len-1).
-    use_megatron_response_start = sglang_decode_tensors is not None
-
-    if use_megatron_response_start:
-        print("\n  NOTE: Using SGLang decode, comparing with Megatron at")
-        print("        response_start position (prompt_len)")
+    # Comparing SGLang decode[91] vs Megatron base[90]
+    # SGLang decode processes token at position 91
+    # Megatron base tensors are at position 90 (prompt_len - 1)
+    if sglang_decode_tensors is not None:
+        print("\n  NOTE: Using SGLang decode[91] vs Megatron base[90]")
 
     for layer_idx in all_layers:
         if layer_idx not in sglang_layers:
@@ -469,16 +465,7 @@ def compare_hidden_states_at_position(
         # Extract tensor from (name, tensor) tuple
         sg_name, sglang_hidden = sglang_layers[layer_idx]
         megatron_name, megatron_hidden = megatron_layers[layer_idx]
-
-        # When using decode, try to get Megatron's _at_response_start tensor
-        if use_megatron_response_start:
-            if megatron_name.endswith("_output"):
-                resp_key = f"{megatron_name[:-7]}_at_response_start"
-            else:
-                resp_key = f"{megatron_name}_at_response_start"
-            if resp_key in megatron_tensors:
-                megatron_hidden = megatron_tensors[resp_key]
-                megatron_name = resp_key
+        # Using Megatron base tensors at position 90 (not _at_response_start)
 
         # Helper to convert list/tuple to tensor
         def to_tensor(x, prefer_last=True):
@@ -756,20 +743,27 @@ def compare_first_response_token(
               f"{sglang_prefill_last_pos}")
         megatron_hidden_pos = sglang_prefill_last_pos
 
-    # For hidden states, compare PREFILL (position 90) vs Megatron base (pos 90)
-    # NOT decode pass - that's a different forward pass with only 1 token!
-    print(f"    Comparing: SGLang prefill[{sglang_prefill_last_pos}] vs "
+    # Load decode pass tensors for SGLang position 91
+    sglang_decode_for_hidden = None
+    decode_result = find_sglang_decode_pass(sglang_dir, first_response_pos)
+    if decode_result is not None:
+        decode_id, decode_path = decode_result
+        sglang_decode_for_hidden = torch.load(decode_path, map_location="cpu")
+        print(f"    Loaded SGLang decode pass {decode_id} "
+              f"(first_pos={first_response_pos})")
+
+    # Compare: SGLang decode[91] vs Megatron base[90]
+    print(f"    Comparing: SGLang decode[{first_response_pos}] vs "
           f"Megatron base[{megatron_hidden_pos}]")
 
-    # Compare hidden states using PREFILL tensors for SGLang
-    # Pass sglang_decode_tensors=None to use prefill only
+    # Compare hidden states
     compare_hidden_states_at_position(
-        sglang_prefill_tensors,  # Use prefill for hidden states
+        sglang_prefill_tensors,  # Prefill tensors (fallback)
         megatron_tensors,
         sglang_position=sglang_prefill_last_pos,
-        megatron_position=megatron_hidden_pos,
+        megatron_position=megatron_hidden_pos,  # Megatron at position 90
         verbose=verbose,
-        sglang_decode_tensors=None,  # DON'T use decode - use prefill!
+        sglang_decode_tensors=sglang_decode_for_hidden,  # Use decode[91]
     )
 
     # =========================================================================
