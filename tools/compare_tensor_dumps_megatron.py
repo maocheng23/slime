@@ -356,19 +356,25 @@ def compare_hidden_states_at_position(
     # Component mapping:
     #   SGLang                      Megatron
     #   ------                      -------
-    #   input_layernorm          -> layer_N_input_layernorm_output
-    #   post_attention_layernorm -> layer_N_post_attention_layernorm_output
-    #   self_attn                -> layer_N_self_attention_output
-    #   mlp                      -> layer_N_mlp_output
+    #   input_layernorm          -> layer_N_qkv_layernorm_output (RMSNorm inside linear_qkv)
+    #   qkv_proj                 -> layer_N_qkv_proj_output (QKV projection output)
+    #   self_attn.o_proj         -> layer_N_o_proj_output (output projection)
+    #   post_attention_layernorm -> layer_N_pre_mlp_layernorm_output (AFTER residual, before MLP)
+    #   mlp.down_proj            -> layer_N_mlp_output
     #   (final layer output)     -> layer_N_output
+    #
+    # NOTE: Megatron's post_self_attn_layernorm is applied to attention output BEFORE residual,
+    #       which is different from SGLang's post_attention_layernorm!
 
     sglang_layers = {}
     megatron_layers = {}
 
     # Define component pairs to try (SGLang pattern, Megatron pattern)
     component_pairs = [
-        ("post_attention_layernorm", "post_attention_layernorm"),
-        ("input_layernorm", "input_layernorm"),
+        ("post_attention_layernorm", "pre_mlp_layernorm"),  # before MLP
+        ("input_layernorm", "qkv_layernorm"),  # RMSNorm before attention
+        ("qkv_proj", "qkv_proj"),  # QKV projection
+        ("self_attn.o_proj", "o_proj"),  # Output projection
         ("self_attn", "self_attention"),
         ("mlp", "mlp"),
     ]
@@ -782,7 +788,9 @@ def compare_first_response_token(
             print(f"    {k}: shape={t.shape}")
 
     # Compare layer 0 at different positions
-    print("\n  LAYER 0 COMPARISON (SGLang decode vs Megatron at 90/91):")
+    # SGLang's post_attention_layernorm == Megatron's pre_mlp_layernorm
+    print("\n  LAYER 0 PRE-MLP LAYERNORM COMPARISON (SGLang decode vs Megatron at 90/91):")
+    print("    (SGLang's post_attention_layernorm == Megatron's pre_mlp_layernorm)")
 
     # Get SGLang decode layer 0 post_attention_layernorm
     sg_hidden = None
@@ -803,8 +811,9 @@ def compare_first_response_token(
         sg_vals = sg_flat[:10].float().tolist()
         print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_vals]}")
 
-        # Try Megatron at position 90 (base tensor)
-        meg_key_90 = "layer_0_post_attention_layernorm_output"
+        # Try Megatron pre_mlp_layernorm at position 90 (base tensor)
+        # Note: SGLang's post_attention_layernorm == Megatron's pre_mlp_layernorm
+        meg_key_90 = "layer_0_pre_mlp_layernorm_output"
         if meg_key_90 in megatron_tensors:
             meg_90 = megatron_tensors[meg_key_90].flatten()
             meg_vals_90 = meg_90[:10].float().tolist()
@@ -814,9 +823,8 @@ def compare_first_response_token(
             print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_vals_90]}")
             print(f"    Max diff: {max_diff_90:.6e}")
 
-        # Try Megatron at position 91 (_at_response_start)
-        meg_key_91 = "layer_0_post_attention_layernorm_output" \
-                     "_at_response_start"
+        # Try Megatron pre_mlp_layernorm at position 91 (_at_response_start)
+        meg_key_91 = "layer_0_pre_mlp_layernorm_output_at_response_start"
         if meg_key_91 in megatron_tensors:
             meg_91 = megatron_tensors[meg_key_91].flatten()
             meg_vals_91 = meg_91[:10].float().tolist()
@@ -890,6 +898,53 @@ def compare_first_response_token(
                 print(f"    Megatron first 10: {vals_str}")
                 print("    (This is embedding output, NOT normalized)")
 
+    # Compare QKV PROJECTION output
+    print("\n  LAYER 0 QKV PROJECTION COMPARISON:")
+    print("    (SGLang: qkv_proj, Megatron: linear_qkv)")
+    sg_qkv = None
+    if sglang_decode_for_hidden:
+        for k in ["model.layers.0.self_attn.qkv_proj"]:
+            if k in sglang_decode_for_hidden:
+                sg_qkv = sglang_decode_for_hidden[k]
+                print(f"    SGLang key: {k}")
+                if isinstance(sg_qkv, (list, tuple)):
+                    sg_qkv = sg_qkv[-1]
+                break
+
+    if sg_qkv is not None and isinstance(sg_qkv, torch.Tensor):
+        sg_qkv_flat = sg_qkv.flatten()
+        sg_qkv_vals = sg_qkv_flat[:10].float().tolist()
+        print(f"    SGLang shape: {sg_qkv.shape}")
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_qkv_vals]}")
+
+        # Megatron QKV projection at pos 91
+        meg_qkv_91 = "layer_0_qkv_proj_output_at_response_start"
+        if meg_qkv_91 in megatron_tensors:
+            meg_qkv = megatron_tensors[meg_qkv_91].flatten()
+            meg_qkv_vals = meg_qkv[:10].float().tolist()
+            diff_qkv = (sg_qkv_flat[:10].float() - meg_qkv[:10].float()).abs()
+            max_diff_qkv = diff_qkv.max().item()
+            print(f"\n    Megatron layer_0_qkv_proj pos 91:")
+            print(f"    Megatron shape: {megatron_tensors[meg_qkv_91].shape}")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_qkv_vals]}")
+            print(f"    Max diff: {max_diff_qkv:.6e}")
+            if max_diff_qkv < 1e-3:
+                print("    ✓ QKV projections MATCH!")
+        else:
+            # Try base tensor without _at_response_start
+            meg_qkv_base = "layer_0_qkv_proj_output"
+            if meg_qkv_base in megatron_tensors:
+                meg_qkv = megatron_tensors[meg_qkv_base].flatten()
+                meg_qkv_vals = meg_qkv[:10].float().tolist()
+                print(f"\n    Megatron layer_0_qkv_proj (base):")
+                print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_qkv_vals]}")
+            else:
+                print("    WARNING: Could not find Megatron QKV projection tensor")
+    else:
+        print("    SGLang qkv_proj not found in decode dump")
+        print(f"    Available SGLang keys with 'qkv': "
+              f"{[k for k in (sglang_decode_for_hidden or {}).keys() if 'qkv' in k.lower()]}")
+
     # Compare LAYER OUTPUT (after full layer, including MLP and residual)
     print("\n  LAYER 0 FULL OUTPUT COMPARISON (after MLP + residual):")
     sg_layer_out = None
@@ -933,8 +988,9 @@ def compare_first_response_token(
             print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_mlp_vals]}")
             print(f"    Max diff: {max_diff_mlp:.6e}")
 
-    # Also check self-attention output
-    print("\n  LAYER 0 SELF-ATTENTION OUTPUT COMPARISON:")
+    # Also check self-attention output (o_proj)
+    print("\n  LAYER 0 OUTPUT PROJECTION (o_proj) COMPARISON:")
+    print("    (SGLang: self_attn.o_proj, Megatron: linear_proj)")
     sg_attn = None
     if sglang_decode_for_hidden:
         for k in ["model.layers.0.self_attn.o_proj",
@@ -951,18 +1007,34 @@ def compare_first_response_token(
         # Take first 1024 for hidden dim
         sg_attn_flat = sg_attn.flatten()[:1024]
         sg_attn_vals = sg_attn_flat[:10].float().tolist()
+        print(f"    SGLang shape: {sg_attn.shape}")
         print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_attn_vals]}")
 
-        meg_attn_91 = "layer_0_self_attention_output_at_response_start"
-        if meg_attn_91 in megatron_tensors:
-            meg_attn = megatron_tensors[meg_attn_91].flatten()
+        # Try new o_proj hook first
+        meg_oproj_91 = "layer_0_o_proj_output_at_response_start"
+        if meg_oproj_91 in megatron_tensors:
+            meg_attn = megatron_tensors[meg_oproj_91].flatten()
             meg_attn_vals = meg_attn[:10].float().tolist()
-            diff_attn = (sg_attn_flat[:10].float() - meg_attn[:10].float())
-            diff_attn = diff_attn.abs()
+            diff_attn = (sg_attn_flat[:10].float() - meg_attn[:10].float()).abs()
             max_diff_attn = diff_attn.max().item()
-            print("    Megatron self_attention_output pos 91:")
+            print(f"\n    Megatron o_proj pos 91:")
+            print(f"    Megatron shape: {megatron_tensors[meg_oproj_91].shape}")
             print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_attn_vals]}")
             print(f"    Max diff: {max_diff_attn:.6e}")
+            if max_diff_attn < 1e-3:
+                print("    ✓ Output projections MATCH!")
+        else:
+            # Fall back to self_attention_output
+            meg_attn_91 = "layer_0_self_attention_output_at_response_start"
+            if meg_attn_91 in megatron_tensors:
+                meg_attn = megatron_tensors[meg_attn_91].flatten()
+                meg_attn_vals = meg_attn[:10].float().tolist()
+                diff_attn = (sg_attn_flat[:10].float() - meg_attn[:10].float())
+                diff_attn = diff_attn.abs()
+                max_diff_attn = diff_attn.max().item()
+                print("    Megatron self_attention_output pos 91:")
+                print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_attn_vals]}")
+                print(f"    Max diff: {max_diff_attn:.6e}")
 
     # =========================================================================
     # 2. Compare logits for first response token
