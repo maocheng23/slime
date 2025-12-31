@@ -787,120 +787,64 @@ def compare_first_response_token(
         if isinstance(t, torch.Tensor):
             print(f"    {k}: shape={t.shape}")
 
-    # Compare layer 0 at different positions
-    # SGLang's post_attention_layernorm == Megatron's pre_mlp_layernorm
-    print("\n  LAYER 0 PRE-MLP LAYERNORM COMPARISON (SGLang decode vs Megatron at 90/91):")
-    print("    (SGLang's post_attention_layernorm == Megatron's pre_mlp_layernorm)")
+    # =========================================================================
+    # LAYER 0 COMPARISON - Ordered by Calculation Graph
+    # Order: input_layernorm → QKV proj → Q/K layernorm → RoPE → 
+    #        Core Attention → o_proj → post_attn_layernorm → MLP → output
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("LAYER 0 COMPARISON - Ordered by Calculation Graph")
+    print("-" * 70)
+    
+    # Track results for summary
+    comparison_results = {}
+    
+    # =========================================================================
+    # STEP 1: INPUT LAYERNORM (RMSNorm)
+    # =========================================================================
+    print("\n  [STEP 1] INPUT LAYERNORM (RMSNorm) - Before QKV projection:")
+    print("    SGLang: input_layernorm | Megatron: qkv_layernorm (inside fused linear_qkv)")
 
-    # Get SGLang decode layer 0 post_attention_layernorm
-    sg_hidden = None
-    sg_key_used = None
-    if sglang_decode_for_hidden:
-        for k in sglang_decode_for_hidden.keys():
-            if "layers.0" in k and "post_attention_layernorm" in k:
-                sg_hidden = sglang_decode_for_hidden[k]
-                sg_key_used = k
-                break
-
-    if sg_hidden is not None:
-        if isinstance(sg_hidden, (list, tuple)):
-            sg_hidden = sg_hidden[-1]  # Take output, not input
-        sg_flat = sg_hidden.flatten()
-        print(f"    SGLang key: {sg_key_used}")
-        print(f"    SGLang shape: {sg_flat.shape}")
-        sg_vals = sg_flat[:10].float().tolist()
-        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_vals]}")
-
-        # Try Megatron pre_mlp_layernorm at position 90 (base tensor)
-        # Note: SGLang's post_attention_layernorm == Megatron's pre_mlp_layernorm
-        meg_key_90 = "layer_0_pre_mlp_layernorm_output"
-        if meg_key_90 in megatron_tensors:
-            meg_90 = megatron_tensors[meg_key_90].flatten()
-            meg_vals_90 = meg_90[:10].float().tolist()
-            diff_90 = (sg_flat[:10].float() - meg_90[:10].float()).abs()
-            max_diff_90 = diff_90.max().item()
-            print(f"\n    Megatron pos 90 ({meg_key_90}):")
-            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_vals_90]}")
-            print(f"    Max diff: {max_diff_90:.6e}")
-
-        # Try Megatron pre_mlp_layernorm at position 91 (_at_response_start)
-        meg_key_91 = "layer_0_pre_mlp_layernorm_output_at_response_start"
-        if meg_key_91 in megatron_tensors:
-            meg_91 = megatron_tensors[meg_key_91].flatten()
-            meg_vals_91 = meg_91[:10].float().tolist()
-            diff_91 = (sg_flat[:10].float() - meg_91[:10].float()).abs()
-            max_diff_91 = diff_91.max().item()
-            print(f"\n    Megatron pos 91 ({meg_key_91}):")
-            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_vals_91]}")
-            print(f"    Max diff: {max_diff_91:.6e}")
-    else:
-        print("    Could not find SGLang decode layer 0 tensor")
-
-    # Compare RMSNorm output (the actual normalized values)
-    # SGLang: input_layernorm output (actual RMSNorm)
-    # Megatron: qkv_layernorm output (RMSNorm inside fused linear_qkv)
-    print("\n  LAYER 0 RMSNORM COMPARISON (actual normalized values):")
-    print("    SGLang: model.layers.0.input_layernorm (RMSNorm output)")
-    print("    Megatron: layer_0_qkv_layernorm_output (RMSNorm inside linear_qkv)")
-
+    # Get SGLang input_layernorm output
     sg_input_ln = None
-    if sglang_decode_for_hidden:
-        for k in sglang_decode_for_hidden.keys():
-            if "layers.0" in k and "input_layernorm" in k:
-                sg_input_ln = sglang_decode_for_hidden[k]
-                print(f"    SGLang key: {k}")
-                break
-
-    if sg_input_ln is not None:
+    sg_input_ln_key = "model.layers.0.input_layernorm"
+    if sglang_decode_for_hidden and sg_input_ln_key in sglang_decode_for_hidden:
+        sg_input_ln = sglang_decode_for_hidden[sg_input_ln_key]
         if isinstance(sg_input_ln, (list, tuple)):
-            sg_input_ln = sg_input_ln[-1]
-        if isinstance(sg_input_ln, torch.Tensor):
-            sg_ln_flat = sg_input_ln.flatten()
-            sg_ln_vals = sg_ln_flat[:10].float().tolist()
-            print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_ln_vals]}")
+            sg_input_ln = sg_input_ln[-1]  # Take output, not input
+    
+    if sg_input_ln is not None and isinstance(sg_input_ln, torch.Tensor):
+        sg_ln_flat = sg_input_ln.flatten()
+        print(f"    SGLang shape: {sg_input_ln.shape}")
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_ln_flat[:10].float().tolist()]}")
+        
+        # Megatron qkv_layernorm at position 91 (first response token)
+        meg_qkv_ln_91 = "layer_0_qkv_layernorm_output_at_response_start"
+        if meg_qkv_ln_91 in megatron_tensors:
+            meg_ln = megatron_tensors[meg_qkv_ln_91].flatten()
+            min_len = min(sg_ln_flat.numel(), meg_ln.numel())
+            diff = (sg_ln_flat[:min_len].float() - meg_ln[:min_len].float()).abs()
+            max_diff = diff.max().item()
+            print(f"    Megatron shape: {megatron_tensors[meg_qkv_ln_91].shape}")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_ln[:10].float().tolist()]}")
+            print(f"    Max diff: {max_diff:.6e}")
+            if max_diff < 1e-5:
+                print("    ✓ Input LayerNorm MATCH!")
+                comparison_results["input_layernorm"] = ("MATCH", max_diff)
+            else:
+                comparison_results["input_layernorm"] = ("DIFF", max_diff)
+        else:
+            print("    Megatron qkv_layernorm not found")
+            comparison_results["input_layernorm"] = ("NOT_FOUND", None)
+    else:
+        print("    SGLang input_layernorm not found")
+        comparison_results["input_layernorm"] = ("NOT_FOUND", None)
 
-            # Check for qkv_layernorm (RMSNorm inside fused linear_qkv)
-            meg_qkv_ln_90 = "layer_0_qkv_layernorm_output"
-            meg_qkv_ln_91 = "layer_0_qkv_layernorm_output_at_response_start"
-
-            if meg_qkv_ln_90 in megatron_tensors:
-                meg_ln = megatron_tensors[meg_qkv_ln_90].flatten()
-                meg_ln_vals = meg_ln[:10].float().tolist()
-                diff_ln = (sg_ln_flat[:10].float() - meg_ln[:10].float()).abs()
-                max_diff_ln = diff_ln.max().item()
-                print("\n    Megatron qkv_layernorm pos 90:")
-                vals_str = [f'{v:.4f}' for v in meg_ln_vals]
-                print(f"    Megatron first 10: {vals_str}")
-                print(f"    Max diff: {max_diff_ln:.6e}")
-                if max_diff_ln < 1e-5:
-                    print("    ✓ RMSNorm outputs MATCH!")
-
-            if meg_qkv_ln_91 in megatron_tensors:
-                meg_ln = megatron_tensors[meg_qkv_ln_91].flatten()
-                meg_ln_vals = meg_ln[:10].float().tolist()
-                diff_ln = (sg_ln_flat[:10].float() - meg_ln[:10].float())
-                diff_ln = diff_ln.abs()
-                max_diff_ln = diff_ln.max().item()
-                print("\n    Megatron qkv_layernorm pos 91:")
-                vals_str = [f'{v:.4f}' for v in meg_ln_vals]
-                print(f"    Megatron first 10: {vals_str}")
-                print(f"    Max diff: {max_diff_ln:.6e}")
-                if max_diff_ln < 1e-5:
-                    print("    ✓ RMSNorm outputs MATCH!")
-
-            # Also show old input_layernorm for reference (IdentityOp)
-            meg_ln_90 = "layer_0_input_layernorm_output"
-            if meg_ln_90 in megatron_tensors:
-                meg_ln = megatron_tensors[meg_ln_90].flatten()
-                meg_ln_vals = meg_ln[:10].float().tolist()
-                print("\n    [Ref] Megatron input_layernorm (IdentityOp):")
-                vals_str = [f'{v:.4f}' for v in meg_ln_vals]
-                print(f"    Megatron first 10: {vals_str}")
-                print("    (This is embedding output, NOT normalized)")
-
-    # Compare QKV PROJECTION output
-    print("\n  LAYER 0 QKV PROJECTION COMPARISON:")
-    print("    (SGLang: qkv_proj, Megatron: linear_qkv)")
+    # =========================================================================
+    # STEP 2: QKV PROJECTION
+    # =========================================================================
+    print("\n  [STEP 2] QKV PROJECTION:")
+    print("    SGLang: qkv_proj | Megatron: linear_qkv")
     sg_qkv = None
     if sglang_decode_for_hidden:
         for k in ["model.layers.0.self_attn.qkv_proj"]:
@@ -928,8 +872,11 @@ def compare_first_response_token(
             print(f"    Megatron shape: {megatron_tensors[meg_qkv_91].shape}")
             print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_qkv_vals]}")
             print(f"    Max diff: {max_diff_qkv:.6e}")
-            if max_diff_qkv < 1e-3:
+            if max_diff_qkv < 1e-5:
                 print("    ✓ QKV projections MATCH!")
+                comparison_results["qkv_proj"] = ("MATCH", max_diff_qkv)
+            else:
+                comparison_results["qkv_proj"] = ("DIFF", max_diff_qkv)
         else:
             # Try base tensor without _at_response_start
             meg_qkv_base = "layer_0_qkv_proj_output"
@@ -945,9 +892,11 @@ def compare_first_response_token(
         print(f"    Available SGLang keys with 'qkv': "
               f"{[k for k in (sglang_decode_for_hidden or {}).keys() if 'qkv' in k.lower()]}")
 
-    # Compare Q/K LAYERNORM outputs (after QKV split, before rotary)
-    print("\n  LAYER 0 Q/K LAYERNORM COMPARISON:")
-    print("    (SGLang: q_norm/k_norm, Megatron: q_layernorm/k_layernorm)")
+    # =========================================================================
+    # STEP 3: Q/K LAYERNORM (after QKV split, before RoPE)
+    # =========================================================================
+    print("\n  [STEP 3] Q/K LAYERNORM:")
+    print("    SGLang: q_norm/k_norm | Megatron: q_layernorm/k_layernorm")
     
     # Check SGLang q_norm
     sg_q_norm = None
@@ -977,8 +926,12 @@ def compare_first_response_token(
             print(f"    Max diff: {max_diff_q:.6e}")
             if max_diff_q < 1e-5:
                 print("    ✓ Q layernorms MATCH!")
+                comparison_results["q_layernorm"] = ("MATCH", max_diff_q)
+            else:
+                comparison_results["q_layernorm"] = ("DIFF", max_diff_q)
         else:
             print("    Megatron q_layernorm not found")
+            comparison_results["q_layernorm"] = ("NOT_FOUND", None)
             print(f"    Available Megatron keys with 'layernorm': "
                   f"{[k for k in megatron_tensors.keys() if 'layernorm' in k.lower()][:10]}")
     else:
@@ -1012,16 +965,22 @@ def compare_first_response_token(
             print(f"    Max diff: {max_diff_k:.6e}")
             if max_diff_k < 1e-5:
                 print("    ✓ K layernorms MATCH!")
+                comparison_results["k_layernorm"] = ("MATCH", max_diff_k)
+            else:
+                comparison_results["k_layernorm"] = ("DIFF", max_diff_k)
         else:
             print("    Megatron k_layernorm not found")
+            comparison_results["k_layernorm"] = ("NOT_FOUND", None)
     else:
         print("    SGLang k_norm not found")
+        comparison_results["k_layernorm"] = ("NOT_FOUND", None)
 
-    # Compare Q/K AFTER ROPE (if available)
-    # Note: Megatron layer_number is 1-based, so layer 1 = first layer (layer 0 in SGLang)
-    # SGLang's rotary_emb hook captures (query, key) tuple - the Q/K AFTER RoPE
-    print("\n  LAYER 0 Q/K AFTER ROPE COMPARISON:")
-    print("    (Megatron layer_1 = SGLang layer 0)")
+    # =========================================================================
+    # STEP 4: RoPE (Rotary Position Embedding)
+    # =========================================================================
+    print("\n  [STEP 4] Q/K AFTER ROPE:")
+    print("    SGLang: rotary_emb | Megatron: layer_1 Q/K after RoPE")
+    print("    Note: Megatron layer_1 = SGLang layer 0 (1-based vs 0-based indexing)")
     
     # Show all available q_after_rope keys for debugging
     rope_keys = [k for k in megatron_tensors.keys() if 'after_rope' in k.lower()]
@@ -1116,10 +1075,13 @@ def compare_first_response_token(
                 
                 if max_diff_q < 1e-5:
                     print("    ✓ Q after RoPE MATCH!")
+                    comparison_results["rope"] = ("MATCH", max_diff_q)
                 elif max_diff_q < 1e-3:
                     print("    ⚠ Q after RoPE close but not identical")
+                    comparison_results["rope"] = ("CLOSE", max_diff_q)
                 else:
                     print("    ✗ Q after RoPE DIFFERENT - RoPE implementations differ")
+                    comparison_results["rope"] = ("DIFF", max_diff_q)
                     
                 # Also compare K if available
                 if sg_k_rope is not None and meg_k_rope is not None:
@@ -1143,11 +1105,13 @@ def compare_first_response_token(
     else:
         print("    Megatron Q after RoPE not found (layer_1_q_after_rope)")
         print("    (Enable with: enable_qk_after_rope_dump(model))")
+        comparison_results["rope"] = ("NOT_FOUND", None)
 
-    # Compare CORE ATTENTION output
-    # This is the output of flash attention (after RoPE is applied to Q/K)
-    print("\n  LAYER 0 CORE ATTENTION OUTPUT COMPARISON:")
-    print("    (This is after RoPE + FlashAttention)")
+    # =========================================================================
+    # STEP 5: CORE ATTENTION (Flash Attention output)
+    # =========================================================================
+    print("\n  [STEP 5] CORE ATTENTION (Flash Attention output):")
+    print("    SGLang: self_attn.attn | Megatron: core_attention")
     meg_core_attn_91 = "layer_0_core_attention_output_at_response_start"
     if meg_core_attn_91 in megatron_tensors:
         meg_core = megatron_tensors[meg_core_attn_91].flatten()
@@ -1180,22 +1144,64 @@ def compare_first_response_token(
             
             if max_diff_attn < 1e-5:
                 print("    ✓ Core attention outputs MATCH! (true on-policy)")
+                comparison_results["core_attention"] = ("MATCH", max_diff_attn)
             elif max_diff_attn < 1e-3:
                 print("    ⚠ Core attention outputs close but not identical")
-                print("      This may be due to RoPE implementation differences")
-                print("      (Expected: <1e-5 for true on-policy)")
+                comparison_results["core_attention"] = ("CLOSE", max_diff_attn)
             else:
                 print("    ✗ Core attention outputs DIFFERENT")
-                print("      Check RoPE implementation")
+                comparison_results["core_attention"] = ("DIFF", max_diff_attn)
     else:
         print("    Megatron core_attention not found")
+        comparison_results["core_attention"] = ("NOT_FOUND", None)
 
-    # =====================================================================
-    # POST-ATTENTION LAYERNORM COMPARISON (input to MLP)
-    # This is key to finding the source of MLP differences
-    # =====================================================================
-    print("\n  LAYER 0 POST-ATTENTION LAYERNORM COMPARISON:")
-    print("    (This is the input to MLP, after attention + residual + layernorm)")
+    # =========================================================================
+    # STEP 6: OUTPUT PROJECTION (o_proj)
+    # =========================================================================
+    print("\n  [STEP 6] OUTPUT PROJECTION (o_proj):")
+    print("    SGLang: self_attn.o_proj | Megatron: linear_proj")
+    
+    sg_oproj = None
+    sg_oproj_key = "model.layers.0.self_attn.o_proj"
+    if sglang_decode_for_hidden and sg_oproj_key in sglang_decode_for_hidden:
+        sg_oproj = sglang_decode_for_hidden[sg_oproj_key]
+        if isinstance(sg_oproj, (list, tuple)):
+            sg_oproj = sg_oproj[-1]
+    
+    if sg_oproj is not None and isinstance(sg_oproj, torch.Tensor):
+        sg_oproj_flat = sg_oproj.flatten()
+        print(f"    SGLang shape: {sg_oproj.shape}")
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_oproj_flat[:10].float().tolist()]}")
+        
+        # Megatron o_proj at pos 91
+        meg_oproj_91 = "layer_0_o_proj_output_at_response_start"
+        if meg_oproj_91 in megatron_tensors:
+            meg_oproj = megatron_tensors[meg_oproj_91].flatten()
+            min_len = min(sg_oproj_flat.numel(), meg_oproj.numel())
+            diff = (sg_oproj_flat[:min_len].float() - meg_oproj[:min_len].float()).abs()
+            max_diff = diff.max().item()
+            print(f"    Megatron shape: {megatron_tensors[meg_oproj_91].shape}")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_oproj[:10].float().tolist()]}")
+            print(f"    Max diff: {max_diff:.6e}")
+            if max_diff < 1e-5:
+                print("    ✓ Output projections MATCH!")
+                comparison_results["o_proj"] = ("MATCH", max_diff)
+            else:
+                comparison_results["o_proj"] = ("DIFF", max_diff)
+        else:
+            print("    Megatron o_proj not found")
+            comparison_results["o_proj"] = ("NOT_FOUND", None)
+    else:
+        print("    SGLang o_proj not found")
+        comparison_results["o_proj"] = ("NOT_FOUND", None)
+
+    # =========================================================================
+    # STEP 7: POST-ATTENTION LAYERNORM (pre_mlp_layernorm)
+    # This is AFTER attention+residual, BEFORE MLP
+    # =========================================================================
+    print("\n  [STEP 7] POST-ATTENTION LAYERNORM (pre_mlp_layernorm):")
+    print("    SGLang: post_attention_layernorm | Megatron: pre_mlp_layernorm")
+    print("    This is the normalized input to MLP")
     
     sg_post_attn_ln = None
     sg_post_attn_ln_key = "model.layers.0.post_attention_layernorm"
@@ -1226,23 +1232,70 @@ def compare_first_response_token(
             
             if max_diff_post < 1e-5:
                 print("    ✓ Post-attention layernorm MATCH!")
+                comparison_results["post_attn_ln"] = ("MATCH", max_diff_post)
             elif max_diff_post < 1e-3:
                 print("    ⚠ Post-attention layernorm close (small diff)")
+                comparison_results["post_attn_ln"] = ("CLOSE", max_diff_post)
             else:
                 print("    ✗ Post-attention layernorm DIFFERENT")
+                comparison_results["post_attn_ln"] = ("DIFF", max_diff_post)
         else:
             print("    Megatron pre_mlp_layernorm not found")
-            # List available keys
-            post_keys = [k for k in megatron_tensors.keys() if 'mlp' in k.lower() or 'post' in k.lower()]
-            print(f"    Available related keys: {post_keys[:5]}")
+            comparison_results["post_attn_ln"] = ("NOT_FOUND", None)
     else:
         print("    SGLang post_attention_layernorm not found")
+        comparison_results["post_attn_ln"] = ("NOT_FOUND", None)
 
-    # =====================================================================
-    # MLP OUTPUT COMPARISON (down_proj / linear_fc2)
-    # =====================================================================
-    print("\n  LAYER 0 MLP OUTPUT COMPARISON:")
-    print("    (SGLang: mlp.down_proj, Megatron: mlp_output)")
+    # =========================================================================
+    # STEP 8a: MLP GATE_UP_PROJ (linear_fc1)
+    # =========================================================================
+    print("\n  [STEP 8a] MLP GATE_UP_PROJ (linear_fc1):")
+    print("    SGLang: mlp.gate_up_proj | Megatron: mlp.gate_up_proj")
+    
+    sg_gate_up = None
+    sg_gate_up_key = "model.layers.0.mlp.gate_up_proj"
+    if sglang_decode_for_hidden and sg_gate_up_key in sglang_decode_for_hidden:
+        sg_gate_up = sglang_decode_for_hidden[sg_gate_up_key]
+        if isinstance(sg_gate_up, (list, tuple)):
+            sg_gate_up = sg_gate_up[-1]
+    
+    if sg_gate_up is not None and isinstance(sg_gate_up, torch.Tensor):
+        sg_gate_up_flat = sg_gate_up.flatten()
+        print(f"    SGLang shape: {sg_gate_up.shape}")
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_gate_up_flat[:10].float().tolist()]}")
+        
+        meg_gate_up_91 = "layer_0_mlp.gate_up_proj_output_at_response_start"
+        if meg_gate_up_91 in megatron_tensors:
+            meg_gate_up = megatron_tensors[meg_gate_up_91].flatten()
+            print(f"    Megatron shape: {megatron_tensors[meg_gate_up_91].shape}")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_gate_up[:10].float().tolist()]}")
+            
+            min_len = min(sg_gate_up_flat.numel(), meg_gate_up.numel())
+            diff = (sg_gate_up_flat[:min_len].float() - meg_gate_up[:min_len].float()).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+            print(f"    Max diff: {max_diff:.6e}, Mean diff: {mean_diff:.6e}")
+            
+            if max_diff < 1e-5:
+                print("    ✓ Gate/Up projections MATCH!")
+                comparison_results["gate_up_proj"] = ("MATCH", max_diff)
+            else:
+                print("    ✗ Gate/Up projections DIFFERENT")
+                comparison_results["gate_up_proj"] = ("DIFF", max_diff)
+        else:
+            print("    Megatron mlp.gate_up_proj not found")
+            print(f"    Available MLP keys: {[k for k in megatron_tensors.keys() if 'mlp' in k.lower()][:10]}")
+            comparison_results["gate_up_proj"] = ("NOT_FOUND", None)
+    else:
+        print("    SGLang mlp.gate_up_proj not found")
+        print(f"    Available SGLang MLP keys: {[k for k in (sglang_decode_for_hidden or {}).keys() if 'mlp' in k.lower()]}")
+        comparison_results["gate_up_proj"] = ("NOT_FOUND", None)
+    
+    # =========================================================================
+    # STEP 8b: MLP DOWN_PROJ OUTPUT (linear_fc2)
+    # =========================================================================
+    print("\n  [STEP 8b] MLP DOWN_PROJ OUTPUT:")
+    print("    SGLang: mlp.down_proj | Megatron: mlp_output")
     
     sg_mlp_out = None
     sg_mlp_key = "model.layers.0.mlp.down_proj"
@@ -1273,70 +1326,59 @@ def compare_first_response_token(
             
             if max_diff_mlp < 1e-5:
                 print("    ✓ MLP outputs MATCH!")
+                comparison_results["mlp_output"] = ("MATCH", max_diff_mlp)
             elif max_diff_mlp < 1e-2:
                 print("    ⚠ MLP outputs close (acceptable for true on-policy)")
+                comparison_results["mlp_output"] = ("CLOSE", max_diff_mlp)
             else:
                 print("    ✗ MLP outputs DIFFERENT")
+                comparison_results["mlp_output"] = ("DIFF", max_diff_mlp)
         else:
             print("    Megatron mlp_output not found")
+            comparison_results["mlp_output"] = ("NOT_FOUND", None)
 
-    # =====================================================================
-    # FULL LAYER OUTPUT (for reference - includes residual)
-    # =====================================================================
-    print("\n  LAYER 0 FULL LAYER OUTPUT (MLP + residual, for reference):")
+    # =========================================================================
+    # STEP 9: FULL LAYER OUTPUT (MLP + residual)  
+    # =========================================================================
+    print("\n  [STEP 9] FULL LAYER OUTPUT (MLP + residual):")
+    print("    Megatron: layer_0_output | SGLang: N/A (residual not dumped)")
     meg_out_91 = "layer_0_output_at_response_start"
     if meg_out_91 in megatron_tensors:
         meg_out = megatron_tensors[meg_out_91].flatten()
-        print(f"    Megatron layer_0_output (full) first 10: {[f'{v:.4f}' for v in meg_out[:10].float().tolist()]}")
+        print(f"    Megatron shape: {megatron_tensors[meg_out_91].shape}")
+        print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_out[:10].float().tolist()]}")
         print("    Note: SGLang doesn't dump full layer output with residual directly")
-
-    # Also check self-attention output (o_proj)
-    print("\n  LAYER 0 OUTPUT PROJECTION (o_proj) COMPARISON:")
-    print("    (SGLang: self_attn.o_proj, Megatron: linear_proj)")
-    sg_attn = None
-    if sglang_decode_for_hidden:
-        for k in ["model.layers.0.self_attn.o_proj",
-                  "model.layers.0.self_attn.attn",
-                  "model.layers.0.self_attn"]:
-            if k in sglang_decode_for_hidden:
-                sg_attn = sglang_decode_for_hidden[k]
-                print(f"    SGLang key: {k}")
-                if isinstance(sg_attn, (list, tuple)):
-                    sg_attn = sg_attn[-1]
-                break
-
-    if sg_attn is not None and isinstance(sg_attn, torch.Tensor):
-        # Take first 1024 for hidden dim
-        sg_attn_flat = sg_attn.flatten()[:1024]
-        sg_attn_vals = sg_attn_flat[:10].float().tolist()
-        print(f"    SGLang shape: {sg_attn.shape}")
-        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_attn_vals]}")
-
-        # Try new o_proj hook first
-        meg_oproj_91 = "layer_0_o_proj_output_at_response_start"
-        if meg_oproj_91 in megatron_tensors:
-            meg_attn = megatron_tensors[meg_oproj_91].flatten()
-            meg_attn_vals = meg_attn[:10].float().tolist()
-            diff_attn = (sg_attn_flat[:10].float() - meg_attn[:10].float()).abs()
-            max_diff_attn = diff_attn.max().item()
-            print(f"\n    Megatron o_proj pos 91:")
-            print(f"    Megatron shape: {megatron_tensors[meg_oproj_91].shape}")
-            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_attn_vals]}")
-            print(f"    Max diff: {max_diff_attn:.6e}")
-            if max_diff_attn < 1e-3:
-                print("    ✓ Output projections MATCH!")
+        print("    The full output = o_proj + input (residual #1) + mlp_output (residual #2)")
+    else:
+        print("    Megatron layer_0_output not found")
+    
+    # =========================================================================
+    # SUMMARY: Layer 0 Comparison Results
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("LAYER 0 COMPARISON SUMMARY")
+    print("-" * 70)
+    
+    all_match = True
+    for step, (status, diff) in comparison_results.items():
+        if status == "MATCH":
+            mark = "✓"
+        elif status == "CLOSE":
+            mark = "⚠"
+            all_match = False
+        elif status == "NOT_FOUND":
+            mark = "?"
         else:
-            # Fall back to self_attention_output
-            meg_attn_91 = "layer_0_self_attention_output_at_response_start"
-            if meg_attn_91 in megatron_tensors:
-                meg_attn = megatron_tensors[meg_attn_91].flatten()
-                meg_attn_vals = meg_attn[:10].float().tolist()
-                diff_attn = (sg_attn_flat[:10].float() - meg_attn[:10].float())
-                diff_attn = diff_attn.abs()
-                max_diff_attn = diff_attn.max().item()
-                print("    Megatron self_attention_output pos 91:")
-                print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_attn_vals]}")
-                print(f"    Max diff: {max_diff_attn:.6e}")
+            mark = "✗"
+            all_match = False
+        
+        diff_str = f"{diff:.2e}" if diff is not None else "N/A"
+        print(f"  {mark} {step}: {status} (max_diff={diff_str})")
+    
+    if all_match:
+        print("\n  ✓✓✓ ALL COMPONENTS MATCH - TRUE ON-POLICY VERIFIED! ✓✓✓")
+    else:
+        print("\n  ⚠ Some components have differences. Check the details above.")
 
     # =========================================================================
     # 2. Compare logits for first response token
