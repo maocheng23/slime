@@ -1071,6 +1071,42 @@ def compare_first_response_token(
                 sg_q_flat = sg_q_rope.flatten()
                 print(f"    SGLang Q after RoPE first 10: {[f'{v:.4f}' for v in sg_q_flat[:10].float().tolist()]}")
                 
+                # Detailed comparison - check element ordering
+                print("\n    === DETAILED Q AFTER ROPE ANALYSIS ===")
+                print(f"    Megatron shape: {meg_q_rope.shape} -> flatten to {meg_q_flat.numel()}")
+                print(f"    SGLang shape: {sg_q_rope.shape} -> flatten to {sg_q_flat.numel()}")
+                
+                # Check if values appear in different order
+                # Megatron: [num_heads, head_dim] = [16, 128]
+                # SGLang: [1, num_heads * head_dim] = [1, 2048]
+                
+                # Maybe SGLang has different head ordering?
+                # Try comparing with Megatron reshaped to [1, 2048]
+                meg_q_reshape = meg_q_rope.reshape(1, -1)  # [1, 2048]
+                print(f"    Megatron reshaped to [1, 2048] first 10: {[f'{v:.4f}' for v in meg_q_reshape.flatten()[:10].float().tolist()]}")
+                
+                # Check if transpose helps (maybe head vs dim ordering)
+                if meg_q_rope.dim() == 2:
+                    meg_q_transpose = meg_q_rope.T.reshape(1, -1)  # [128, 16] -> [1, 2048]
+                    print(f"    Megatron transposed to [128,16]->[1,2048] first 10: {[f'{v:.4f}' for v in meg_q_transpose.flatten()[:10].float().tolist()]}")
+                
+                # Also check Q BEFORE RoPE (q_layernorm) for reference
+                sg_q_norm_key = "model.layers.0.self_attn.q_norm"
+                if sg_q_norm_key in sglang_decode_for_hidden:
+                    sg_q_norm = sglang_decode_for_hidden[sg_q_norm_key]
+                    if isinstance(sg_q_norm, (list, tuple)):
+                        sg_q_norm = sg_q_norm[-1] if len(sg_q_norm) > 0 else sg_q_norm[0]
+                    sg_q_norm_flat = sg_q_norm.flatten() if isinstance(sg_q_norm, torch.Tensor) else None
+                    if sg_q_norm_flat is not None:
+                        print(f"    [Reference] SGLang Q before RoPE (q_norm) first 10: {[f'{v:.4f}' for v in sg_q_norm_flat[:10].float().tolist()]}")
+                
+                meg_q_layernorm_key = "layer_0_q_layernorm_output_at_response_start"
+                if meg_q_layernorm_key in megatron_tensors:
+                    meg_q_norm = megatron_tensors[meg_q_layernorm_key].flatten()
+                    print(f"    [Reference] Megatron Q before RoPE (q_layernorm) first 10: {[f'{v:.4f}' for v in meg_q_norm[:10].float().tolist()]}")
+                
+                print("    === END DETAILED ANALYSIS ===\n")
+                
                 # Compare Q after RoPE
                 min_len = min(sg_q_flat.numel(), meg_q_flat.numel())
                 diff_q = (sg_q_flat[:min_len].float() - meg_q_flat[:min_len].float()).abs()
