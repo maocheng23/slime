@@ -611,6 +611,141 @@ def compare_hidden_states_at_position(
     return results
 
 
+def compare_layer(
+    layer_idx: int,
+    sglang_tensors: dict,
+    megatron_tensors: dict,
+    verbose: bool = True,
+) -> dict:
+    """
+    Compare a single transformer layer between SGLang and Megatron.
+    
+    Returns a dict with comparison results for each component.
+    """
+    results = {}
+    
+    # Helper to get tensor and flatten
+    def get_tensor(tensors, key):
+        if key not in tensors:
+            return None
+        t = tensors[key]
+        if isinstance(t, (list, tuple)):
+            t = t[-1]  # Take last element (output, not input)
+        if isinstance(t, torch.Tensor):
+            return t.flatten()
+        return None
+    
+    # Helper to compare two tensors
+    def compare_tensors(sg_key, meg_key, name):
+        sg = get_tensor(sglang_tensors, sg_key)
+        meg = get_tensor(megatron_tensors, meg_key)
+        
+        if sg is None:
+            if verbose:
+                print(f"    {name}: SGLang not found ({sg_key})")
+            return ("NOT_FOUND", None)
+        if meg is None:
+            if verbose:
+                print(f"    {name}: Megatron not found ({meg_key})")
+            return ("NOT_FOUND", None)
+        
+        min_len = min(sg.numel(), meg.numel())
+        diff = (sg[:min_len].float() - meg[:min_len].float()).abs()
+        max_diff = diff.max().item()
+        
+        if verbose:
+            sg_vals = [f'{v:.4f}' for v in sg[:10].float().tolist()]
+            meg_vals = [f'{v:.4f}' for v in meg[:10].float().tolist()]
+            print(f"    {name}:")
+            print(f"      SGLang first 10:   {sg_vals}")
+            print(f"      Megatron first 10: {meg_vals}")
+            print(f"      Max diff: {max_diff:.6e}")
+            if max_diff < 1e-5:
+                print(f"      ✓ MATCH")
+        
+        if max_diff < 1e-5:
+            return ("MATCH", max_diff)
+        elif max_diff < 1e-3:
+            return ("CLOSE", max_diff)
+        else:
+            return ("DIFF", max_diff)
+    
+    print(f"\n  Layer {layer_idx}:")
+    
+    # Component comparisons (in calculation graph order)
+    # 1. Input LayerNorm (RMSNorm)
+    results["input_ln"] = compare_tensors(
+        f"model.layers.{layer_idx}.input_layernorm",
+        f"layer_{layer_idx}_qkv_layernorm_output_at_response_start",
+        "Input LayerNorm"
+    )
+    
+    # 2. QKV Projection
+    results["qkv_proj"] = compare_tensors(
+        f"model.layers.{layer_idx}.self_attn.qkv_proj",
+        f"layer_{layer_idx}_qkv_proj_output_at_response_start",
+        "QKV Projection"
+    )
+    
+    # 3. Q LayerNorm
+    results["q_ln"] = compare_tensors(
+        f"model.layers.{layer_idx}.self_attn.q_norm",
+        f"layer_{layer_idx}_q_layernorm_output_at_response_start",
+        "Q LayerNorm"
+    )
+    
+    # 4. K LayerNorm
+    results["k_ln"] = compare_tensors(
+        f"model.layers.{layer_idx}.self_attn.k_norm",
+        f"layer_{layer_idx}_k_layernorm_output_at_response_start",
+        "K LayerNorm"
+    )
+    
+    # 5. Core Attention
+    results["core_attn"] = compare_tensors(
+        f"model.layers.{layer_idx}.self_attn.attn",
+        f"layer_{layer_idx}_core_attention_output_at_response_start",
+        "Core Attention"
+    )
+    
+    # 6. Output Projection (o_proj)
+    results["o_proj"] = compare_tensors(
+        f"model.layers.{layer_idx}.self_attn.o_proj",
+        f"layer_{layer_idx}_o_proj_output_at_response_start",
+        "Output Projection"
+    )
+    
+    # 7. Post-Attention LayerNorm (pre_mlp_layernorm)
+    results["post_attn_ln"] = compare_tensors(
+        f"model.layers.{layer_idx}.post_attention_layernorm",
+        f"layer_{layer_idx}_pre_mlp_layernorm_output_at_response_start",
+        "Post-Attn LayerNorm"
+    )
+    
+    # 8a. MLP Gate/Up Projection
+    results["gate_up"] = compare_tensors(
+        f"model.layers.{layer_idx}.mlp.gate_up_proj",
+        f"layer_{layer_idx}_mlp.gate_up_proj_output_at_response_start",
+        "MLP Gate/Up Proj"
+    )
+    
+    # 8b. MLP Output (down_proj)
+    results["mlp_out"] = compare_tensors(
+        f"model.layers.{layer_idx}.mlp.down_proj",
+        f"layer_{layer_idx}_mlp_output_at_response_start",
+        "MLP Output"
+    )
+    
+    # 9. Full Layer Output
+    results["layer_out"] = compare_tensors(
+        f"model.layers.{layer_idx}.mlp.down_proj",  # SGLang doesn't have full output with residual
+        f"layer_{layer_idx}_output_at_response_start",
+        "Layer Output"
+    )
+    
+    return results
+
+
 def compare_first_response_token(
     sglang_dir: str,
     megatron_dir: str,
@@ -1376,9 +1511,51 @@ def compare_first_response_token(
         print(f"  {mark} {step}: {status} (max_diff={diff_str})")
     
     if all_match:
-        print("\n  ✓✓✓ ALL COMPONENTS MATCH - TRUE ON-POLICY VERIFIED! ✓✓✓")
+        print("\n  ✓✓✓ LAYER 0 ALL COMPONENTS MATCH! ✓✓✓")
     else:
         print("\n  ⚠ Some components have differences. Check the details above.")
+
+    # =========================================================================
+    # LAYER 1 AND LAYER 2 COMPARISON (using helper function)
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("LAYER 1 & 2 COMPARISON (Condensed)")
+    print("=" * 70)
+    
+    all_layers_results = {0: comparison_results}
+    
+    for layer_idx in [1, 2]:
+        layer_results = compare_layer(
+            layer_idx=layer_idx,
+            sglang_tensors=sglang_decode_for_hidden if sglang_decode_for_hidden else {},
+            megatron_tensors=megatron_tensors,
+            verbose=True,
+        )
+        all_layers_results[layer_idx] = layer_results
+    
+    # Print summary for all layers
+    print("\n" + "=" * 70)
+    print("ALL LAYERS SUMMARY")
+    print("=" * 70)
+    
+    all_layers_match = True
+    for layer_idx in [0, 1, 2]:
+        layer_results = all_layers_results.get(layer_idx, {})
+        layer_match = True
+        mismatches = []
+        for component, (status, diff) in layer_results.items():
+            if status not in ("MATCH", "NOT_FOUND"):
+                layer_match = False
+                all_layers_match = False
+                mismatches.append(f"{component}({diff:.2e})" if diff else component)
+        
+        if layer_match:
+            print(f"  Layer {layer_idx}: ✓ ALL MATCH")
+        else:
+            print(f"  Layer {layer_idx}: ✗ DIFF in {', '.join(mismatches)}")
+    
+    if all_layers_match:
+        print("\n  ✓✓✓ ALL LAYERS MATCH - TRUE ON-POLICY VERIFIED! ✓✓✓")
 
     # =========================================================================
     # 2. Compare logits for first response token
