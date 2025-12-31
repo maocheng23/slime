@@ -1610,15 +1610,35 @@ def compare_first_response_token(
     print("    (Both should be normalized hidden states before lm_head)")
 
     # SGLang final norm - try model.norm key
-    # Note: SGLang's norm hook may return (input, output) tuple/list
+    # Note: SGLang's norm hook may return (output, residual) tuple from model.norm()
     sglang_final_norm = None
+    sglang_raw_val = None
     for key in ["model.norm", "norm"]:
         if key in sglang_decode_for_hidden:
             val = sglang_decode_for_hidden[key]
-            # Handle list/tuple (input, output) - take OUTPUT (last element)
-            sglang_final_norm = to_tensor(val, prefer_last=True)
+            sglang_raw_val = val
+            print(f"    SGLang raw value type: {type(val)}")
+            if isinstance(val, (list, tuple)):
+                print(f"    SGLang raw value length: {len(val)}")
+                for i, item in enumerate(val):
+                    if isinstance(item, torch.Tensor):
+                        print(f"      Element {i}: shape={item.shape}, "
+                              f"dtype={item.dtype}, "
+                              f"RMS={((item.float()**2).mean().sqrt().item()):.4f}")
+            
+            # SGLang's model.norm() returns (hidden_states, residual) tuple
+            # The first element is the OUTPUT (normalized hidden states)
+            # The second element is the residual (usually None for final norm)
+            if isinstance(val, (list, tuple)) and len(val) > 0:
+                # Take FIRST element (output), not last
+                sglang_final_norm = to_tensor(val[0], prefer_last=False)
+            else:
+                # Single tensor - might be output or input
+                sglang_final_norm = to_tensor(val, prefer_last=True)
+            
             if sglang_final_norm is not None:
                 # Extract the last token if it's a sequence
+                original_shape = sglang_final_norm.shape
                 if sglang_final_norm.dim() == 2:
                     # [seq_len, hidden_size] -> take last token
                     sglang_final_norm = sglang_final_norm[-1]
@@ -1634,7 +1654,15 @@ def compare_first_response_token(
                 elif sglang_final_norm.dim() == 1:
                     # Already a single token [hidden_size]
                     pass
-                print(f"    SGLang key: {key}, shape: {sglang_final_norm.shape}")
+                
+                # Check if this looks normalized (RMS should be ~1.0)
+                rms_check = (sglang_final_norm.float() ** 2).mean().sqrt().item()
+                print(f"    SGLang key: {key}, original shape: {original_shape}, "
+                      f"extracted shape: {sglang_final_norm.shape}, RMS: {rms_check:.4f}")
+                if rms_check > 5.0:
+                    print(f"      ⚠️  RMS too high - this might be INPUT (before norm), "
+                          f"not OUTPUT (after norm)")
+                    print(f"      Expected RMS ~1.0 for normalized values")
                 break
 
     if sglang_final_norm is None:
@@ -1642,6 +1670,37 @@ def compare_first_response_token(
         norm_keys = [k for k in sglang_decode_for_hidden.keys()
                      if 'norm' in k.lower()]
         print(f"    Available keys containing 'norm': {norm_keys[:10]}")
+    
+    # Also check for keys that might be the output before lm_head
+    # (e.g., after final norm, before lm_head projection)
+    if sglang_final_norm is not None:
+        # Check if there are other keys that might be the actual normalized output
+        potential_keys = [k for k in sglang_decode_for_hidden.keys()
+                         if any(x in k.lower() for x in ['final', 'norm', 'lm_head'])
+                         and k != "model.norm" and k != "norm"]
+        if potential_keys:
+            print(f"    Other potential keys: {potential_keys[:5]}")
+            # Check if any of these have normalized-looking values
+            for pk in potential_keys[:3]:
+                try:
+                    pk_val = to_tensor(sglang_decode_for_hidden[pk], prefer_last=False)
+                    if pk_val is not None and pk_val.numel() > 0:
+                        if pk_val.dim() > 1:
+                            # Extract last token if sequence
+                            if pk_val.dim() == 2:
+                                pk_val = pk_val[-1]
+                            elif pk_val.dim() == 3:
+                                d0, d1, d2 = pk_val.shape
+                                if d0 == 1:
+                                    pk_val = pk_val[0, -1]
+                                else:
+                                    pk_val = pk_val[-1, 0]
+                        pk_rms = (pk_val.float() ** 2).mean().sqrt().item()
+                        if 0.5 < pk_rms < 2.0:  # Looks normalized
+                            print(f"      {pk}: shape={pk_val.shape}, RMS={pk_rms:.4f} "
+                                  f"✓ Looks normalized!")
+                except Exception as e:
+                    pass
 
     # Megatron final_layernorm
     megatron_final_norm = None
@@ -1695,14 +1754,37 @@ def compare_first_response_token(
         print(f"    SGLang RMS: {sglang_rms:.4f}, Megatron RMS: {megatron_rms:.4f}")
         print(f"    Max diff: {max_diff_fn:.6e}, Mean diff: {mean_diff_fn:.6e}")
         
+        # If SGLang RMS is very high, try to manually normalize it
+        if sglang_rms > 5.0 and megatron_rms < 5.0:
+            print(f"\n    🔍 SGLang RMS ({sglang_rms:.2f}) is too high - "
+                  f"trying manual normalization...")
+            # Manually normalize SGLang values
+            sglang_normalized = sglang_fn / sglang_rms
+            sglang_normalized_rms = (sglang_normalized ** 2).mean().sqrt().item()
+            print(f"    After manual normalization: RMS={sglang_normalized_rms:.4f}")
+            
+            # Compare normalized SGLang vs Megatron
+            diff_normalized = (sglang_normalized - megatron_fn).abs()
+            max_diff_norm = diff_normalized.max().item()
+            mean_diff_norm = diff_normalized.mean().item()
+            print(f"    Normalized comparison - Max diff: {max_diff_norm:.6e}, "
+                  f"Mean diff: {mean_diff_norm:.6e}")
+            
+            if max_diff_norm < 1e-3:
+                print("    ✓ After normalization, values are close!")
+                print("    → SGLang hook captured INPUT (before norm), "
+                      "not OUTPUT (after norm)")
+            else:
+                print("    ✗ Even after normalization, values differ")
+                print("    → May be comparing different positions or implementations")
+        
         if max_diff_fn < 1e-4:
             print("    ✓ Final LayerNorm MATCH!")
         else:
             print(f"    ✗ Final LayerNorm DIFFERENT (max_diff={max_diff_fn:.6e})")
-            print("    NOTE: If this difference is large, we may be comparing:")
-            print("      - Input vs Output (SGLang hook may dump both)")
-            print("      - Different positions")
-            print("      - Different normalization implementations")
+            if sglang_rms > 5.0:
+                print("    → SGLang value appears to be INPUT (before normalization)")
+                print("    → Need to check SGLang hook structure or find correct key")
 
     # --- LM Head (output projection to vocab) ---
     print("\n  LM HEAD OUTPUT (projection to vocab):")
