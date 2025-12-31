@@ -2030,11 +2030,6 @@ def compare_first_response_token(
         f"layer_{last_layer_idx_for_final}_output_at_response_start",
         f"layer_{last_layer_idx_for_final}_output",
     ]:
-    
-    for key_pattern in [
-        f"layer_{last_layer_idx}_output_at_response_start",
-        f"layer_{last_layer_idx}_output",
-    ]:
         if key_pattern in megatron_tensors:
             megatron_final_norm_input = megatron_tensors[key_pattern]
             if megatron_final_norm_input.dim() == 2:
