@@ -1017,6 +1017,48 @@ def compare_first_response_token(
     else:
         print("    SGLang k_norm not found")
 
+    # Compare Q/K AFTER ROPE (if available)
+    # These tensors are dumped when enable_qk_after_rope_dump() is called
+    print("\n  LAYER 0 Q/K AFTER ROPE COMPARISON:")
+    print("    (These tensors help identify RoPE divergence)")
+    
+    meg_q_rope_91 = "layer_1_q_after_rope_at_response_start"  # layer_number is 1-based
+    meg_k_rope_91 = "layer_1_k_after_rope_at_response_start"
+    
+    if meg_q_rope_91 in megatron_tensors:
+        meg_q_rope = megatron_tensors[meg_q_rope_91].flatten()
+        print(f"    Megatron Q after RoPE shape: {megatron_tensors[meg_q_rope_91].shape}")
+        print(f"    Megatron Q after RoPE first 10: {[f'{v:.4f}' for v in meg_q_rope[:10].float().tolist()]}")
+        
+        # Try to find SGLang Q after RoPE (from rotary_emb hook if available)
+        sg_q_rope = None
+        if sglang_decode_for_hidden:
+            for k in ["model.layers.0.self_attn.rotary_emb"]:
+                if k in sglang_decode_for_hidden:
+                    sg_q_rope = sglang_decode_for_hidden[k]
+                    print(f"    SGLang rotary_emb key: {k}")
+                    if isinstance(sg_q_rope, (list, tuple)):
+                        # Rotary emb returns (q, k) tuple
+                        sg_q_rope = sg_q_rope[0] if len(sg_q_rope) > 0 else None
+                    break
+        
+        if sg_q_rope is not None and isinstance(sg_q_rope, torch.Tensor):
+            sg_q_flat = sg_q_rope.flatten()
+            print(f"    SGLang Q after RoPE shape: {sg_q_rope.shape}")
+            print(f"    SGLang Q after RoPE first 10: {[f'{v:.4f}' for v in sg_q_flat[:10].float().tolist()]}")
+            diff_q_rope = (sg_q_flat[:10].float() - meg_q_rope[:10].float()).abs()
+            max_diff_q_rope = diff_q_rope.max().item()
+            print(f"    Max diff: {max_diff_q_rope:.6e}")
+            if max_diff_q_rope < 1e-5:
+                print("    ✓ Q after RoPE MATCH!")
+    else:
+        print("    Megatron Q after RoPE not found")
+        print("    (Enable with: enable_qk_after_rope_dump(model))")
+        # List available keys that might be related
+        rope_keys = [k for k in megatron_tensors.keys() if 'rope' in k.lower()]
+        if rope_keys:
+            print(f"    Available RoPE-related keys: {rope_keys[:5]}")
+
     # Compare CORE ATTENTION output
     print("\n  LAYER 0 CORE ATTENTION OUTPUT COMPARISON:")
     meg_core_attn_91 = "layer_0_core_attention_output_at_response_start"

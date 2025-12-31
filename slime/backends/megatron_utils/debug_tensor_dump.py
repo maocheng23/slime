@@ -26,6 +26,40 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
+# Global dumper reference for access from attention module
+_global_dumper: Optional["MegatronTensorDumper"] = None
+
+
+def get_global_dumper() -> Optional["MegatronTensorDumper"]:
+    """Get the global tensor dumper instance."""
+    return _global_dumper
+
+
+def set_global_dumper(dumper: Optional["MegatronTensorDumper"]) -> None:
+    """Set the global tensor dumper instance."""
+    global _global_dumper
+    _global_dumper = dumper
+
+
+def enable_qk_after_rope_dump(model: torch.nn.Module) -> None:
+    """Enable Q/K after RoPE dumping on all attention layers.
+    
+    This sets a flag on attention modules to dump Q/K tensors after 
+    rotary position embedding is applied, which helps debug RoPE 
+    divergence between SGLang and Megatron.
+    """
+    for name, module in model.named_modules():
+        if hasattr(module, 'layer_number') and 'attention' in name.lower():
+            module._debug_dump_qk_after_rope = True
+            logger.info(f"Enabled Q/K after RoPE dump for {name}")
+
+
+def disable_qk_after_rope_dump(model: torch.nn.Module) -> None:
+    """Disable Q/K after RoPE dumping on all attention layers."""
+    for name, module in model.named_modules():
+        if hasattr(module, '_debug_dump_qk_after_rope'):
+            module._debug_dump_qk_after_rope = False
+
 
 class MegatronTensorDumper:
     """Dumps intermediate tensors from Megatron forward passes for debugging."""
@@ -49,6 +83,9 @@ class MegatronTensorDumper:
         self._process_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"[MegatronTensorDumper] Initialized. dump_dir={self._process_dir}, dump_layers={dump_layers}")
+        
+        # Set as global dumper for access from attention module
+        set_global_dumper(self)
 
     def add_tensor(self, name: str, tensor: torch.Tensor | tuple | list) -> None:
         """Add a tensor to the current forward pass collection.
