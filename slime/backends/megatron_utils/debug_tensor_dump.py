@@ -345,6 +345,23 @@ class MegatronTensorDumper:
                     f"[MegatronTensorDumper] Hooked layer {layer_idx} "
                     f"linear_proj for output projection"
                 )
+            
+            # Hook Q/K layernorms (if they exist)
+            # These are applied after QKV projection split
+            if hasattr(layer.self_attention, "q_layernorm"):
+                layer.self_attention.q_layernorm.register_forward_hook(
+                    self._create_sublayer_hook(layer_idx, "q_layernorm")
+                )
+                logger.info(
+                    f"[MegatronTensorDumper] Hooked layer {layer_idx} q_layernorm"
+                )
+            if hasattr(layer.self_attention, "k_layernorm"):
+                layer.self_attention.k_layernorm.register_forward_hook(
+                    self._create_sublayer_hook(layer_idx, "k_layernorm")
+                )
+                logger.info(
+                    f"[MegatronTensorDumper] Hooked layer {layer_idx} k_layernorm"
+                )
 
         # Hook MLP output
         if hasattr(layer, "mlp"):

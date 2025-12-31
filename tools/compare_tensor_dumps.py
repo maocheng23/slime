@@ -466,7 +466,7 @@ def compare_hidden_states_at_position(
             if verbose:
                 print(f"  Layer {layer_idx:2d}: NOT IN FSDP dump")
             continue
-
+        
         # Extract tensor from (name, tensor) tuple
         sg_name, sglang_hidden = sglang_layers[layer_idx]
         fsdp_name, fsdp_hidden = fsdp_layers[layer_idx]
@@ -498,7 +498,7 @@ def compare_hidden_states_at_position(
             if verbose:
                 print(f"  Layer {layer_idx:2d}: FSDP tensor is None/empty")
             continue
-
+        
         # FSDP hidden state (already extracted at prompt_len position)
         fsdp_at_pos = fsdp_hidden
         if fsdp_at_pos.dim() == 3:
@@ -550,7 +550,7 @@ def compare_hidden_states_at_position(
             if verbose:
                 print(f"  Layer {layer_idx:2d}: SGLang tensor not found")
             continue
-
+        
         # Align shapes if needed
         if sg_flat.shape != fsdp_flat.shape:
             min_len = min(len(sg_flat), len(fsdp_flat))
@@ -563,9 +563,9 @@ def compare_hidden_states_at_position(
         if stats["max_diff"] >= 1e-5:
             significant_diff_layers.append((layer_idx, stats["max_diff"]))
 
-        match_str = "✓" if stats["max_diff"] < 1e-5 else "✗"
+            match_str = "✓" if stats["max_diff"] < 1e-5 else "✗"
         color = "" if stats["max_diff"] < 1e-5 else "\033[91m"
-        end_color = "\033[0m" if color else ""
+            end_color = "\033[0m" if color else ""
 
         if verbose:
             list_info = ""
@@ -602,7 +602,7 @@ def compare_hidden_states_at_position(
         first_diff = significant_diff_layers[0][1]
         print(f"\n⚠️  FIRST SIGNIFICANT DIFFERENCE at layer {first_layer}")
         print(f"   Max diff: {first_diff:.6e}")
-    else:
+        else:
         print("\n✓ All layers match (diff < 1e-5)")
 
     print("=" * 70)
@@ -834,7 +834,7 @@ def compare_first_response_token(
         # Check if we have logits_full to extract pos 92
         if "logits_full" in fsdp_tensors:
             print("\n    Note: For pos 92, would need to check next position")
-    else:
+        else:
         print("    Could not find SGLang decode layer 0 tensor")
 
     # Also compare input_layernorm to double-check layer alignment
@@ -1041,7 +1041,7 @@ def compare_first_response_token(
             fsdp_tok = fsdp_logits.flatten()
             if first_response_token < len(sg_tok):
                 sg_token_logit = sg_tok[first_response_token]
-            else:
+        else:
                 sg_token_logit = None
             if first_response_token < len(fsdp_tok):
                 fsdp_token_logit = fsdp_tok[first_response_token]
@@ -1099,7 +1099,7 @@ def compare_first_response_token(
 
             if diff < 1e-5:
                 print("    ✓ Logprobs MATCH!")
-            else:
+        else:
                 print("    ✗ Logprobs DIFFER!")
     
         # =====================================================================
@@ -1267,7 +1267,7 @@ def compare_first_response_token(
             print(f"    Mean diff: {stats['mean_diff']:.8e}")
             if stats["max_diff"] < 1e-5:
                 print("    ✓ Second response token logits MATCH!")
-            else:
+                    else:
                 print("    ✗ Second response token logits DIFFER!")
         else:
             print(f"    Shape mismatch: {sg_flat.shape} vs {fsdp_flat.shape}")

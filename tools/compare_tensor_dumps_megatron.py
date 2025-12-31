@@ -945,6 +945,109 @@ def compare_first_response_token(
         print(f"    Available SGLang keys with 'qkv': "
               f"{[k for k in (sglang_decode_for_hidden or {}).keys() if 'qkv' in k.lower()]}")
 
+    # Compare Q/K LAYERNORM outputs (after QKV split, before rotary)
+    print("\n  LAYER 0 Q/K LAYERNORM COMPARISON:")
+    print("    (SGLang: q_norm/k_norm, Megatron: q_layernorm/k_layernorm)")
+    
+    # Check SGLang q_norm
+    sg_q_norm = None
+    if sglang_decode_for_hidden:
+        for k in ["model.layers.0.self_attn.q_norm"]:
+            if k in sglang_decode_for_hidden:
+                sg_q_norm = sglang_decode_for_hidden[k]
+                print(f"    SGLang q_norm key: {k}")
+                if isinstance(sg_q_norm, (list, tuple)):
+                    sg_q_norm = sg_q_norm[-1]
+                break
+    
+    if sg_q_norm is not None and isinstance(sg_q_norm, torch.Tensor):
+        sg_q_flat = sg_q_norm.flatten()
+        print(f"    SGLang q_norm shape: {sg_q_norm.shape}")
+        print(f"    SGLang q_norm first 10: {[f'{v:.4f}' for v in sg_q_flat[:10].float().tolist()]}")
+        
+        # Megatron q_layernorm
+        meg_q_91 = "layer_0_q_layernorm_output_at_response_start"
+        if meg_q_91 in megatron_tensors:
+            meg_q = megatron_tensors[meg_q_91].flatten()
+            diff_q = (sg_q_flat[:10].float() - meg_q[:10].float()).abs()
+            max_diff_q = diff_q.max().item()
+            print(f"\n    Megatron q_layernorm pos 91:")
+            print(f"    Megatron shape: {megatron_tensors[meg_q_91].shape}")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_q[:10].float().tolist()]}")
+            print(f"    Max diff: {max_diff_q:.6e}")
+            if max_diff_q < 1e-5:
+                print("    ✓ Q layernorms MATCH!")
+        else:
+            print("    Megatron q_layernorm not found")
+            print(f"    Available Megatron keys with 'layernorm': "
+                  f"{[k for k in megatron_tensors.keys() if 'layernorm' in k.lower()][:10]}")
+    else:
+        print("    SGLang q_norm not found")
+    
+    # Check SGLang k_norm
+    sg_k_norm = None
+    if sglang_decode_for_hidden:
+        for k in ["model.layers.0.self_attn.k_norm"]:
+            if k in sglang_decode_for_hidden:
+                sg_k_norm = sglang_decode_for_hidden[k]
+                print(f"\n    SGLang k_norm key: {k}")
+                if isinstance(sg_k_norm, (list, tuple)):
+                    sg_k_norm = sg_k_norm[-1]
+                break
+    
+    if sg_k_norm is not None and isinstance(sg_k_norm, torch.Tensor):
+        sg_k_flat = sg_k_norm.flatten()
+        print(f"    SGLang k_norm shape: {sg_k_norm.shape}")
+        print(f"    SGLang k_norm first 10: {[f'{v:.4f}' for v in sg_k_flat[:10].float().tolist()]}")
+        
+        # Megatron k_layernorm
+        meg_k_91 = "layer_0_k_layernorm_output_at_response_start"
+        if meg_k_91 in megatron_tensors:
+            meg_k = megatron_tensors[meg_k_91].flatten()
+            diff_k = (sg_k_flat[:10].float() - meg_k[:10].float()).abs()
+            max_diff_k = diff_k.max().item()
+            print(f"\n    Megatron k_layernorm pos 91:")
+            print(f"    Megatron shape: {megatron_tensors[meg_k_91].shape}")
+            print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_k[:10].float().tolist()]}")
+            print(f"    Max diff: {max_diff_k:.6e}")
+            if max_diff_k < 1e-5:
+                print("    ✓ K layernorms MATCH!")
+        else:
+            print("    Megatron k_layernorm not found")
+    else:
+        print("    SGLang k_norm not found")
+
+    # Compare CORE ATTENTION output
+    print("\n  LAYER 0 CORE ATTENTION OUTPUT COMPARISON:")
+    meg_core_attn_91 = "layer_0_core_attention_output_at_response_start"
+    if meg_core_attn_91 in megatron_tensors:
+        meg_core = megatron_tensors[meg_core_attn_91].flatten()
+        print(f"    Megatron core_attention shape: {megatron_tensors[meg_core_attn_91].shape}")
+        print(f"    Megatron core_attention first 10: {[f'{v:.4f}' for v in meg_core[:10].float().tolist()]}")
+        
+        # Check if SGLang has attn output
+        sg_attn = None
+        if sglang_decode_for_hidden:
+            for k in ["model.layers.0.self_attn.attn"]:
+                if k in sglang_decode_for_hidden:
+                    sg_attn = sglang_decode_for_hidden[k]
+                    print(f"    SGLang attn key: {k}")
+                    if isinstance(sg_attn, (list, tuple)):
+                        sg_attn = sg_attn[-1]
+                    break
+        
+        if sg_attn is not None and isinstance(sg_attn, torch.Tensor):
+            sg_attn_flat = sg_attn.flatten()
+            print(f"    SGLang attn shape: {sg_attn.shape}")
+            print(f"    SGLang attn first 10: {[f'{v:.4f}' for v in sg_attn_flat[:10].float().tolist()]}")
+            diff_attn = (sg_attn_flat[:10].float() - meg_core[:10].float()).abs()
+            max_diff_attn = diff_attn.max().item()
+            print(f"    Max diff: {max_diff_attn:.6e}")
+            if max_diff_attn < 1e-3:
+                print("    ✓ Core attention outputs close!")
+    else:
+        print("    Megatron core_attention not found")
+
     # Compare LAYER OUTPUT (after full layer, including MLP and residual)
     print("\n  LAYER 0 FULL OUTPUT COMPARISON (after MLP + residual):")
     sg_layer_out = None
