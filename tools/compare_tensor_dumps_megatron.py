@@ -828,8 +828,13 @@ def compare_first_response_token(
     else:
         print("    Could not find SGLang decode layer 0 tensor")
 
-    # Also compare input_layernorm to double-check layer alignment
-    print("\n  LAYER 0 INPUT_LAYERNORM COMPARISON:")
+    # Compare RMSNorm output (the actual normalized values)
+    # SGLang: input_layernorm output (actual RMSNorm)
+    # Megatron: qkv_layernorm output (RMSNorm inside fused linear_qkv)
+    print("\n  LAYER 0 RMSNORM COMPARISON (actual normalized values):")
+    print("    SGLang: model.layers.0.input_layernorm (RMSNorm output)")
+    print("    Megatron: layer_0_qkv_layernorm_output (RMSNorm inside linear_qkv)")
+
     sg_input_ln = None
     if sglang_decode_for_hidden:
         for k in sglang_decode_for_hidden.keys():
@@ -846,25 +851,44 @@ def compare_first_response_token(
             sg_ln_vals = sg_ln_flat[:10].float().tolist()
             print(f"    SGLang first 10: {[f'{v:.4f}' for v in sg_ln_vals]}")
 
+            # Check for qkv_layernorm (RMSNorm inside fused linear_qkv)
+            meg_qkv_ln_90 = "layer_0_qkv_layernorm_output"
+            meg_qkv_ln_91 = "layer_0_qkv_layernorm_output_at_response_start"
+
+            if meg_qkv_ln_90 in megatron_tensors:
+                meg_ln = megatron_tensors[meg_qkv_ln_90].flatten()
+                meg_ln_vals = meg_ln[:10].float().tolist()
+                diff_ln = (sg_ln_flat[:10].float() - meg_ln[:10].float()).abs()
+                max_diff_ln = diff_ln.max().item()
+                print("\n    Megatron qkv_layernorm pos 90:")
+                vals_str = [f'{v:.4f}' for v in meg_ln_vals]
+                print(f"    Megatron first 10: {vals_str}")
+                print(f"    Max diff: {max_diff_ln:.6e}")
+                if max_diff_ln < 1e-5:
+                    print("    ✓ RMSNorm outputs MATCH!")
+
+            if meg_qkv_ln_91 in megatron_tensors:
+                meg_ln = megatron_tensors[meg_qkv_ln_91].flatten()
+                meg_ln_vals = meg_ln[:10].float().tolist()
+                diff_ln = (sg_ln_flat[:10].float() - meg_ln[:10].float())
+                diff_ln = diff_ln.abs()
+                max_diff_ln = diff_ln.max().item()
+                print("\n    Megatron qkv_layernorm pos 91:")
+                vals_str = [f'{v:.4f}' for v in meg_ln_vals]
+                print(f"    Megatron first 10: {vals_str}")
+                print(f"    Max diff: {max_diff_ln:.6e}")
+                if max_diff_ln < 1e-5:
+                    print("    ✓ RMSNorm outputs MATCH!")
+
+            # Also show old input_layernorm for reference (IdentityOp)
             meg_ln_90 = "layer_0_input_layernorm_output"
             if meg_ln_90 in megatron_tensors:
                 meg_ln = megatron_tensors[meg_ln_90].flatten()
                 meg_ln_vals = meg_ln[:10].float().tolist()
-                diff_ln = (sg_ln_flat[:10].float() - meg_ln[:10].float())
-                diff_ln = diff_ln.abs()
-                max_diff_ln = diff_ln.max().item()
-                print(f"    Megatron90: {[f'{v:.4f}' for v in meg_ln_vals]}")
-                print(f"    Max diff: {max_diff_ln:.6e}")
-
-            meg_ln_91 = "layer_0_input_layernorm_output_at_response_start"
-            if meg_ln_91 in megatron_tensors:
-                meg_ln = megatron_tensors[meg_ln_91].flatten()
-                meg_ln_vals = meg_ln[:10].float().tolist()
-                diff_ln = (sg_ln_flat[:10].float() - meg_ln[:10].float())
-                diff_ln = diff_ln.abs()
-                max_diff_ln = diff_ln.max().item()
-                print(f"    Megatron91: {[f'{v:.4f}' for v in meg_ln_vals]}")
-                print(f"    Max diff: {max_diff_ln:.6e}")
+                print("\n    [Ref] Megatron input_layernorm (IdentityOp):")
+                vals_str = [f'{v:.4f}' for v in meg_ln_vals]
+                print(f"    Megatron first 10: {vals_str}")
+                print("    (This is embedding output, NOT normalized)")
 
     # Compare LAYER OUTPUT (after full layer, including MLP and residual)
     print("\n  LAYER 0 FULL OUTPUT COMPARISON (after MLP + residual):")

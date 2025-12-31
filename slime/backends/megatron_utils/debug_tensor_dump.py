@@ -304,6 +304,19 @@ class MegatronTensorDumper:
                 layer.self_attention.core_attention.register_forward_hook(
                     self._create_sublayer_hook(layer_idx, "core_attention")
                 )
+            # Hook linear_qkv.norm output (RMSNorm inside fused LayerNorm+Linear)
+            # This captures the actual normalized hidden states before QKV projection
+            if hasattr(layer.self_attention, "linear_qkv"):
+                linear_qkv = layer.self_attention.linear_qkv
+                if hasattr(linear_qkv, "norm"):
+                    # SGLangLayerNormColumnParallelLinear has .norm
+                    linear_qkv.norm.register_forward_hook(
+                        self._create_sublayer_hook(layer_idx, "qkv_layernorm")
+                    )
+                    logger.info(
+                        f"[MegatronTensorDumper] Hooked layer {layer_idx} "
+                        f"linear_qkv.norm for RMSNorm output"
+                    )
 
         # Hook MLP output
         if hasattr(layer, "mlp"):
