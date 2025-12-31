@@ -2005,7 +2005,32 @@ def compare_first_response_token(
     # This should match SGLang's element 1 (input before normalization)
     megatron_final_norm_input = None
     # Try to find the last layer output
-    last_layer_idx = 2  # Assuming we have layers 0, 1, 2
+    # Re-detect last_layer_idx from available keys to ensure we get the correct value
+    # (The earlier last_layer_idx might be None for small models)
+    megatron_layer_indices_for_final = set()
+    for key in megatron_tensors.keys():
+        match = re.match(r"layer_(\d+)_", key)
+        if match:
+            layer_idx = int(match.group(1))
+            megatron_layer_indices_for_final.add(layer_idx)
+    
+    if megatron_layer_indices_for_final:
+        last_layer_idx_for_final = max(megatron_layer_indices_for_final)
+    else:
+        # Fallback: try to use the earlier detected value if available
+        try:
+            last_layer_idx_for_final = last_layer_idx if last_layer_idx is not None else 2
+        except NameError:
+            last_layer_idx_for_final = 2
+    
+    print(f"    Detected last layer index: {last_layer_idx_for_final} "
+          f"(from available keys: {sorted(megatron_layer_indices_for_final)})")
+    
+    for key_pattern in [
+        f"layer_{last_layer_idx_for_final}_output_at_response_start",
+        f"layer_{last_layer_idx_for_final}_output",
+    ]:
+    
     for key_pattern in [
         f"layer_{last_layer_idx}_output_at_response_start",
         f"layer_{last_layer_idx}_output",
@@ -2024,42 +2049,42 @@ def compare_first_response_token(
                   f"key={key_pattern}, shape={megatron_final_norm_input.shape}")
             break
     
-    # Quick comparison: SGLang Element 1 vs Megatron layer 27 output
-    # Note: Element 1 is (mlp_output + residual), while layer_27_output is just mlp_output
+    # Quick comparison: SGLang Element 1 vs Megatron last layer output
+    # Note: Element 1 is (mlp_output + residual), while layer_N_output is just mlp_output
     # So they should be different - this comparison shows the difference
     if sglang_final_norm_input is not None and megatron_final_norm_input is not None:
         sg_elem1_f = sglang_final_norm_input.float()
-        meg_layer27_f = megatron_final_norm_input.float()
+        meg_last_layer_f = megatron_final_norm_input.float()
         
-        if sg_elem1_f.shape != meg_layer27_f.shape:
-            min_len = min(sg_elem1_f.numel(), meg_layer27_f.numel())
+        if sg_elem1_f.shape != meg_last_layer_f.shape:
+            min_len = min(sg_elem1_f.numel(), meg_last_layer_f.numel())
             sg_elem1_f = sg_elem1_f.flatten()[:min_len]
-            meg_layer27_f = meg_layer27_f.flatten()[:min_len]
+            meg_last_layer_f = meg_last_layer_f.flatten()[:min_len]
         
-        diff_elem1_vs_layer27 = (sg_elem1_f - meg_layer27_f).abs()
-        max_diff_elem1_vs_layer27 = diff_elem1_vs_layer27.max().item()
-        mean_diff_elem1_vs_layer27 = diff_elem1_vs_layer27.mean().item()
+        diff_elem1_vs_layer = (sg_elem1_f - meg_last_layer_f).abs()
+        max_diff_elem1_vs_layer = diff_elem1_vs_layer.max().item()
+        mean_diff_elem1_vs_layer = diff_elem1_vs_layer.mean().item()
         
-        print(f"\n    🔍 QUICK COMPARISON: SGLang Element 1 vs Megatron layer_{last_layer_idx}_output")
+        print(f"\n    🔍 QUICK COMPARISON: SGLang Element 1 vs Megatron layer_{last_layer_idx_for_final}_output")
         print(f"    {'='*70}")
         print(f"    SGLang Element 1 (INPUT - mlp_output + residual, before norm):")
         print(f"      shape: {sg_elem1_f.shape}, RMS: {(sg_elem1_f**2).mean().sqrt().item():.4f}")
         print(f"      first 10: {[f'{v:.4f}' for v in sg_elem1_f[:10].tolist()]}")
-        print(f"    Megatron layer_{last_layer_idx}_output (MLP output, WITHOUT residual):")
-        print(f"      shape: {meg_layer27_f.shape}, RMS: {(meg_layer27_f**2).mean().sqrt().item():.4f}")
-        print(f"      first 10: {[f'{v:.4f}' for v in meg_layer27_f[:10].tolist()]}")
-        print(f"    Difference (Element 1 - layer_{last_layer_idx}_output):")
-        print(f"      Max diff: {max_diff_elem1_vs_layer27:.6e}, Mean diff: {mean_diff_elem1_vs_layer27:.6e}")
+        print(f"    Megatron layer_{last_layer_idx_for_final}_output (MLP output, WITHOUT residual):")
+        print(f"      shape: {meg_last_layer_f.shape}, RMS: {(meg_last_layer_f**2).mean().sqrt().item():.4f}")
+        print(f"      first 10: {[f'{v:.4f}' for v in meg_last_layer_f[:10].tolist()]}")
+        print(f"    Difference (Element 1 - layer_{last_layer_idx_for_final}_output):")
+        print(f"      Max diff: {max_diff_elem1_vs_layer:.6e}, Mean diff: {mean_diff_elem1_vs_layer:.6e}")
         print(f"    Note: Element 1 = (mlp_output + residual), so difference should be ~residual value")
         
         # Find top differences
-        top_diff_elem1 = diff_elem1_vs_layer27.topk(min(5, len(diff_elem1_vs_layer27))).indices
+        top_diff_elem1 = diff_elem1_vs_layer.topk(min(5, len(diff_elem1_vs_layer))).indices
         print(f"    Top 5 differences:")
         for idx in top_diff_elem1:
             idx_val = idx.item()
             print(f"      idx={idx_val}: SGLang={sg_elem1_f[idx_val]:.6f}, "
-                  f"Megatron={meg_layer27_f[idx_val]:.6f}, "
-                  f"diff={diff_elem1_vs_layer27[idx_val]:.6e}")
+                  f"Megatron={meg_last_layer_f[idx_val]:.6f}, "
+                  f"diff={diff_elem1_vs_layer[idx_val]:.6e}")
 
     if megatron_final_norm is None:
         print("    Megatron final_layernorm: NOT FOUND")
@@ -2086,7 +2111,7 @@ def compare_first_response_token(
     # Try to find Megatron residual value passed to final_layernorm
     megatron_residual = None
     for key_pattern in [
-        f"layer_{last_layer_idx}_residual_at_response_start",
+        f"layer_{last_layer_idx_for_final}_residual_at_response_start",
         f"final_layernorm_residual_at_response_start",
         f"residual_at_response_start",
     ]:
