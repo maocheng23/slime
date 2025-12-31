@@ -80,7 +80,7 @@ def execute():
         # Default layers to dump: 0, 1, 2
         dump_layers = [0, 1, 2]
         # Automatically add last layer (layer 28 for Qwen3-0.6B and Qwen3-4B)
-        last_layer = 28
+        last_layer = 27
         if last_layer not in dump_layers:
             dump_layers.append(last_layer)
         dump_layers_str = f"--sglang-debug-tensor-dump-layers {' '.join(map(str, dump_layers))} "

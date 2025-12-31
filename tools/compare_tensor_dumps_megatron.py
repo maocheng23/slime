@@ -1573,7 +1573,11 @@ def compare_first_response_token(
         all_layers_results[layer_idx] = layer_results
     
     # Find the last layer index for summary
+    # Strategy: Check for layer 28 first (known last layer for Qwen3 models),
+    # then fall back to detected max layer from dump files
     last_layer_for_summary = None
+    
+    # Collect all layer indices from both dumps
     megatron_layer_indices = set()
     for key in megatron_tensors.keys():
         match = re.match(r"layer_(\d+)_", key)
@@ -1590,7 +1594,22 @@ def compare_first_response_token(
                 sglang_layer_indices.add(layer_idx)
     
     all_available_layers = sorted(megatron_layer_indices & sglang_layer_indices)
+    
+    # Check if layer 28 exists in either dump (even if not in intersection)
+    # This handles the case where layer 28 was added automatically but not in initial dump_layers
+    candidate_last_layers = [28]  # Known last layer for Qwen3 models
     if all_available_layers:
+        candidate_last_layers.append(max(all_available_layers))
+    
+    # Find the highest layer that exists in both dumps
+    for candidate in sorted(candidate_last_layers, reverse=True):
+        if (candidate in megatron_layer_indices and
+            candidate in sglang_layer_indices):
+            last_layer_for_summary = candidate
+            break
+    
+    # If still not found, use the max from intersection
+    if last_layer_for_summary is None and all_available_layers:
         last_layer_for_summary = max(all_available_layers)
     
     # Print summary for all layers
@@ -1631,7 +1650,34 @@ def compare_first_response_token(
     # =========================================================================
     # Find the last layer index from available layers (reuse detection logic)
     last_layer_idx = last_layer_for_summary
-    print(f"Last layer index: {last_layer_idx}")
+    
+    # Debug: Print detection info
+    print(f"\n  Layer detection info:")
+    print(f"    Megatron layers found: {sorted(megatron_layer_indices)}")
+    print(f"    SGLang layers found: {sorted(sglang_layer_indices)}")
+    print(f"    Intersection: {sorted(all_available_layers)}")
+    print(f"    Last layer index: {last_layer_idx}")
+    
+    # If layer 28 is not detected but should exist, check if it's in the dumps
+    if last_layer_idx != 28:
+        # Check if layer 28 exists in either dump (may have been auto-added)
+        has_layer_28_megatron = any(
+            re.match(r"layer_28_", key) for key in megatron_tensors.keys()
+        )
+        has_layer_28_sglang = False
+        if sglang_decode_for_hidden:
+            has_layer_28_sglang = any(
+                re.search(r"layers\.28\.", key)
+                for key in sglang_decode_for_hidden.keys()
+            )
+        
+        print(f"    Checking for layer 28:")
+        print(f"      In Megatron dump: {has_layer_28_megatron}")
+        print(f"      In SGLang dump: {has_layer_28_sglang}")
+        
+        if has_layer_28_megatron and has_layer_28_sglang:
+            print(f"    → Layer 28 found in both dumps, using it as last layer")
+            last_layer_idx = 28
     
     if last_layer_idx is not None and last_layer_idx not in [0, 1, 2]:
         print("\n" + "=" * 70)
