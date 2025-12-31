@@ -31,6 +31,22 @@ from typing import Any
 import torch
 
 
+def to_tensor(x, prefer_last=True):
+    """Convert list/tuple to tensor, taking last element by default."""
+    if isinstance(x, (list, tuple)):
+        if len(x) == 0:
+            return None
+        # For layernorm hooks, list is often (input, output)
+        # Take LAST element to get the OUTPUT, not input
+        if prefer_last:
+            x = x[-1]  # Last element is typically the output
+        else:
+            x = x[0]
+    if not isinstance(x, torch.Tensor):
+        return None
+    return x
+
+
 def compute_logprobs_from_logits(
     logits: torch.Tensor,
     temperature: float = 1.0,
@@ -1423,9 +1439,32 @@ def compare_first_response_token(
             comparison_results["gate_up_proj"] = ("NOT_FOUND", None)
     else:
         print("    SGLang mlp.gate_up_proj not found")
-        print(f"    Available SGLang MLP keys: {[k for k in (sglang_decode_for_hidden or {}).keys() if 'mlp' in k.lower()]}")
+        mlp_keys = [k for k in (sglang_decode_for_hidden or {}).keys()
+                    if 'mlp' in k.lower()]
+        print(f"    Available SGLang MLP keys: {mlp_keys}")
         comparison_results["gate_up_proj"] = ("NOT_FOUND", None)
-    
+
+    # =========================================================================
+    # STEP 8a-ii: AFTER ACTIVATION (SiLU output)
+    # =========================================================================
+    print("\n  [STEP 8a-ii] AFTER ACTIVATION (SiLU output):")
+    print("    Megatron: mlp.after_activation (after SGLangSwiGLU)")
+
+    meg_after_act_key = "layer_0_mlp.after_activation_output_at_response_start"
+    if meg_after_act_key in megatron_tensors:
+        meg_after_act = megatron_tensors[meg_after_act_key]
+        print(f"    Megatron shape: {meg_after_act.shape}")
+        meg_after_act_flat = meg_after_act.flatten()
+        act_first10 = meg_after_act_flat[:10].float().tolist()
+        print(f"    Megatron first 10: {[f'{v:.4f}' for v in act_first10]}")
+        comparison_results["after_activation"] = ("FOUND", None)
+    else:
+        print("    Megatron mlp.after_activation not found")
+        act_keys = [k for k in megatron_tensors.keys()
+                    if 'activation' in k.lower() or 'act' in k.lower()]
+        print(f"    Available activation keys: {act_keys[:5]}")
+        comparison_results["after_activation"] = ("NOT_FOUND", None)
+
     # =========================================================================
     # STEP 8b: MLP DOWN_PROJ OUTPUT (linear_fc2)
     # =========================================================================
@@ -1558,6 +1597,104 @@ def compare_first_response_token(
         print("\n  ✓✓✓ ALL LAYERS MATCH - TRUE ON-POLICY VERIFIED! ✓✓✓")
 
     # =========================================================================
+    # FINAL LAYERNORM AND LM HEAD COMPARISON
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("FINAL LAYERNORM & LM HEAD COMPARISON")
+    print("(Components between last transformer layer and logits)")
+    print("=" * 70)
+
+    # --- Final LayerNorm ---
+    print("\n  FINAL LAYERNORM (after all transformer layers):")
+    print("    SGLang: model.norm, Megatron: final_layernorm")
+
+    # SGLang final norm - try model.norm key
+    sglang_final_norm = None
+    for key in ["model.norm", "norm"]:
+        if key in sglang_decode_for_hidden:
+            val = sglang_decode_for_hidden[key]
+            sglang_final_norm = to_tensor(val)
+            if sglang_final_norm is not None:
+                # Extract the last token if it's a sequence
+                if sglang_final_norm.dim() == 2:
+                    sglang_final_norm = sglang_final_norm[-1]  # last token
+                elif sglang_final_norm.dim() == 3:
+                    sglang_final_norm = sglang_final_norm[0, -1]  # [batch, seq, dim] -> last token
+                print(f"    SGLang key: {key}, shape: {sglang_final_norm.shape}")
+                break
+
+    if sglang_final_norm is None:
+        print("    SGLang final_norm: NOT FOUND")
+        print(f"    Available keys containing 'norm': "
+              f"{[k for k in sglang_decode_for_hidden.keys() if 'norm' in k.lower()]}")
+
+    # Megatron final_layernorm
+    megatron_final_norm = None
+    for key_pattern in [
+        "final_layernorm_at_response_start",
+        f"final_layernorm_pos_{first_response_pos}",
+        "final_layernorm",
+    ]:
+        if key_pattern in megatron_tensors:
+            megatron_final_norm = megatron_tensors[key_pattern]
+            if megatron_final_norm.dim() == 2:
+                megatron_final_norm = megatron_final_norm[0]  # [1, dim] -> [dim]
+            elif megatron_final_norm.dim() == 3:
+                # [batch, seq, dim] or [seq, batch, dim]
+                d0, d1, d2 = megatron_final_norm.shape
+                if d0 == 1:
+                    megatron_final_norm = megatron_final_norm[0, first_response_pos]
+                else:
+                    megatron_final_norm = megatron_final_norm[first_response_pos, 0]
+            print(f"    Megatron key: {key_pattern}, shape: {megatron_final_norm.shape}")
+            break
+
+    if megatron_final_norm is None:
+        print("    Megatron final_layernorm: NOT FOUND")
+        print(f"    Available keys containing 'final': "
+              f"{[k for k in megatron_tensors.keys() if 'final' in k.lower()]}")
+
+    if sglang_final_norm is not None and megatron_final_norm is not None:
+        # Convert both to float32 for comparison
+        sglang_fn = sglang_final_norm.float()
+        megatron_fn = megatron_final_norm.float()
+        diff_fn = (sglang_fn - megatron_fn).abs()
+        max_diff_fn = diff_fn.max().item()
+        mean_diff_fn = diff_fn.mean().item()
+        
+        print(f"    SGLang first 10: {[f'{v:.4f}' for v in sglang_fn[:10].tolist()]}")
+        print(f"    Megatron first 10: {[f'{v:.4f}' for v in megatron_fn[:10].tolist()]}")
+        print(f"    Max diff: {max_diff_fn:.6e}, Mean diff: {mean_diff_fn:.6e}")
+        
+        if max_diff_fn < 1e-4:
+            print("    ✓ Final LayerNorm MATCH!")
+        else:
+            print(f"    ✗ Final LayerNorm DIFFERENT (max_diff={max_diff_fn:.6e})")
+
+    # --- LM Head (output projection to vocab) ---
+    print("\n  LM HEAD OUTPUT (projection to vocab):")
+    print("    SGLang: lm_head, Megatron: lm_head")
+
+    sglang_lm_head = None
+    if "lm_head" in sglang_decode_for_hidden:
+        val = sglang_decode_for_hidden["lm_head"]
+        sglang_lm_head = to_tensor(val)
+        if sglang_lm_head is not None:
+            print(f"    SGLang lm_head shape: {sglang_lm_head.shape}")
+    else:
+        print("    SGLang lm_head: NOT FOUND (this is normal - logits are compared directly)")
+
+    megatron_lm_head = None
+    for key_pattern in ["lm_head_at_response_start", "lm_head"]:
+        if key_pattern in megatron_tensors:
+            megatron_lm_head = megatron_tensors[key_pattern]
+            print(f"    Megatron {key_pattern} shape: {megatron_lm_head.shape}")
+            break
+    
+    if megatron_lm_head is None:
+        print("    Megatron lm_head: NOT FOUND (this is normal - logits are compared directly)")
+
+    # =========================================================================
     # 2. Compare logits for first response token
     # =========================================================================
     print("\n" + "=" * 70)
@@ -1659,6 +1796,33 @@ def compare_first_response_token(
         print(f"    SGLang:   {[f'{v:.4f}' for v in sg_first10]}")
         print(f"    Megatron: {[f'{v:.4f}' for v in meg_first10]}")
         print(f"    Diff:     {[f'{v:.4f}' for v in diff_first10]}")
+
+        # Detailed difference analysis
+        diff_all = (sg_flat.float() - megatron_flat.float()).abs()
+        nonzero_diff_mask = diff_all > 1e-6
+        num_diff = nonzero_diff_mask.sum().item()
+        total_vocab = len(diff_all)
+        pct_diff = 100.0 * num_diff / total_vocab
+        print(f"\n  Detailed difference analysis:")
+        print(f"    Total vocab size: {total_vocab}")
+        print(f"    Exact matches (diff < 1e-6): {total_vocab - num_diff}")
+        print(f"    With differences: {num_diff} ({pct_diff:.2f}%)")
+        
+        if num_diff > 0:
+            # Distribution of differences
+            nonzero_diffs = diff_all[nonzero_diff_mask]
+            print(f"    Min non-zero diff: {nonzero_diffs.min().item():.6e}")
+            print(f"    Max diff: {nonzero_diffs.max().item():.6e}")
+            print(f"    Mean of non-zero diffs: {nonzero_diffs.mean().item():.6e}")
+            
+            # Find indices with largest differences
+            top_diff_indices = diff_all.topk(5).indices.tolist()
+            print(f"    Top 5 differing indices: {top_diff_indices}")
+            for idx in top_diff_indices:
+                sg_v = sg_flat[idx].float().item()
+                meg_v = megatron_flat[idx].float().item()
+                d = abs(sg_v - meg_v)
+                print(f"      idx {idx}: SGLang={sg_v:.4f}, Meg={meg_v:.4f}, diff={d:.6f}")
 
         # Compare specific token logit
         if first_response_token is not None:

@@ -249,6 +249,17 @@ class MegatronTensorDumper:
             hooks_registered += 1
             logger.info("[MegatronTensorDumper] Hooked output_layer (lm_head)")
 
+        # Hook final_layernorm (after all transformer layers, before lm_head)
+        decoder = getattr(model, 'decoder', None)
+        if decoder is not None:
+            final_layernorm = getattr(decoder, 'final_layernorm', None)
+            if final_layernorm is not None:
+                final_layernorm.register_forward_hook(
+                    self._create_named_hook("final_layernorm")
+                )
+                hooks_registered += 1
+                logger.info("[MegatronTensorDumper] Hooked decoder.final_layernorm")
+
         # Find the decoder/transformer layers
         layers = self._find_transformer_layers(model)
 
@@ -429,6 +440,15 @@ class MegatronTensorDumper:
             if hasattr(layer.mlp, "linear_fc1"):
                 layer.mlp.linear_fc1.register_forward_hook(
                     self._create_sublayer_hook(layer_idx, "mlp.gate_up_proj")
+                )
+            # Hook activation function output (after SiLU)
+            if hasattr(layer.mlp, "activation_func"):
+                layer.mlp.activation_func.register_forward_hook(
+                    self._create_sublayer_hook(layer_idx, "mlp.after_activation")
+                )
+                logger.info(
+                    f"[MegatronTensorDumper] Hooked layer {layer_idx} "
+                    f"mlp.activation_func ({type(layer.mlp.activation_func).__name__})"
                 )
             if hasattr(layer.mlp, "linear_fc2"):
                 layer.mlp.linear_fc2.register_forward_hook(
