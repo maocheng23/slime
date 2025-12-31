@@ -1018,68 +1018,54 @@ def compare_first_response_token(
         print("    SGLang k_norm not found")
 
     # Compare Q/K AFTER ROPE (if available)
-    # These tensors are automatically dumped when global dumper is active
+    # Note: Megatron layer_number is 1-based, so layer 1 = first layer (layer 0 in SGLang)
+    # SGLang's rotary_emb hook captures cos/sin, NOT Q after RoPE
     print("\n  LAYER 0 Q/K AFTER ROPE COMPARISON:")
-    print("    (These tensors help identify RoPE divergence)")
-    
-    # Try both 0-based and 1-based layer numbering
-    meg_q_rope_91 = None
-    meg_k_rope_91 = None
-    for layer_num in [1, 0]:  # layer_number is 1-based in Megatron
-        q_key = f"layer_{layer_num}_q_after_rope_at_response_start"
-        k_key = f"layer_{layer_num}_k_after_rope_at_response_start"
-        if q_key in megatron_tensors:
-            meg_q_rope_91 = q_key
-            meg_k_rope_91 = k_key
-            break
-        # Also try without _at_response_start suffix
-        q_key_base = f"layer_{layer_num}_q_after_rope"
-        if q_key_base in megatron_tensors:
-            meg_q_rope_91 = q_key_base
-            meg_k_rope_91 = f"layer_{layer_num}_k_after_rope"
-            break
+    print("    (Megatron layer_1 = SGLang layer 0)")
     
     # Show all available q_after_rope keys for debugging
     rope_keys = [k for k in megatron_tensors.keys() if 'after_rope' in k.lower()]
     if rope_keys:
-        print(f"    Available RoPE keys: {rope_keys[:5]}")
+        print(f"    Available RoPE keys: {rope_keys[:6]}")
     
-    if meg_q_rope_91 and meg_q_rope_91 in megatron_tensors:
-        meg_q_rope = megatron_tensors[meg_q_rope_91].flatten()
-        print(f"    Megatron Q after RoPE shape: {megatron_tensors[meg_q_rope_91].shape}")
-        print(f"    Megatron Q after RoPE first 10: {[f'{v:.4f}' for v in meg_q_rope[:10].float().tolist()]}")
+    # Megatron uses 1-based layer numbering, so layer_1 is the first layer
+    meg_q_key = "layer_1_q_after_rope_at_response_start"
+    meg_k_key = "layer_1_k_after_rope_at_response_start"
+    
+    # Fallback to base key without _at_response_start
+    if meg_q_key not in megatron_tensors:
+        meg_q_key = "layer_1_q_after_rope"
+        meg_k_key = "layer_1_k_after_rope"
+    
+    if meg_q_key in megatron_tensors:
+        meg_q_rope = megatron_tensors[meg_q_key]
+        meg_k_rope = megatron_tensors.get(meg_k_key)
         
-        # Try to find SGLang Q after RoPE (from rotary_emb hook if available)
-        sg_q_rope = None
-        if sglang_decode_for_hidden:
-            for k in ["model.layers.0.self_attn.rotary_emb"]:
-                if k in sglang_decode_for_hidden:
-                    sg_q_rope = sglang_decode_for_hidden[k]
-                    print(f"    SGLang rotary_emb key: {k}")
-                    if isinstance(sg_q_rope, (list, tuple)):
-                        # Rotary emb returns (q, k) tuple
-                        sg_q_rope = sg_q_rope[0] if len(sg_q_rope) > 0 else None
-                    break
+        print(f"    Megatron Q after RoPE key: {meg_q_key}")
+        print(f"    Megatron Q after RoPE shape: {meg_q_rope.shape}")
+        meg_q_flat = meg_q_rope.flatten()
+        print(f"    Megatron Q after RoPE first 10: {[f'{v:.4f}' for v in meg_q_flat[:10].float().tolist()]}")
         
-        if sg_q_rope is not None and isinstance(sg_q_rope, torch.Tensor):
-            sg_q_flat = sg_q_rope.flatten()
-            print(f"    SGLang Q after RoPE shape: {sg_q_rope.shape}")
-            print(f"    SGLang Q after RoPE first 10: {[f'{v:.4f}' for v in sg_q_flat[:10].float().tolist()]}")
-            diff_q_rope = (sg_q_flat[:10].float() - meg_q_rope[:10].float()).abs()
-            max_diff_q_rope = diff_q_rope.max().item()
-            print(f"    Max diff: {max_diff_q_rope:.6e}")
-            if max_diff_q_rope < 1e-5:
-                print("    ✓ Q after RoPE MATCH!")
+        if meg_k_rope is not None:
+            print(f"    Megatron K after RoPE shape: {meg_k_rope.shape}")
+            meg_k_flat = meg_k_rope.flatten()
+            print(f"    Megatron K after RoPE first 10: {[f'{v:.4f}' for v in meg_k_flat[:10].float().tolist()]}")
+        
+        # Note: SGLang's rotary_emb hook captures cos/sin frequencies, not Q/K after RoPE
+        # So we cannot directly compare Q/K after RoPE with SGLang
+        print("    Note: SGLang 'rotary_emb' hook captures cos/sin, not Q after RoPE")
+        print("    (Direct Q/K after RoPE comparison not available)")
+        
+        # However, we can compare via attention output which is available
+        print("    → Compare via core_attention output below instead")
     else:
-        print("    Megatron Q after RoPE not found")
+        print("    Megatron Q after RoPE not found (layer_1_q_after_rope)")
         print("    (Enable with: enable_qk_after_rope_dump(model))")
-        # List available keys that might be related
-        rope_keys = [k for k in megatron_tensors.keys() if 'rope' in k.lower()]
-        if rope_keys:
-            print(f"    Available RoPE-related keys: {rope_keys[:5]}")
 
     # Compare CORE ATTENTION output
+    # This is the output of flash attention (after RoPE is applied to Q/K)
     print("\n  LAYER 0 CORE ATTENTION OUTPUT COMPARISON:")
+    print("    (This is after RoPE + FlashAttention)")
     meg_core_attn_91 = "layer_0_core_attention_output_at_response_start"
     if meg_core_attn_91 in megatron_tensors:
         meg_core = megatron_tensors[meg_core_attn_91].flatten()
@@ -1101,11 +1087,24 @@ def compare_first_response_token(
             sg_attn_flat = sg_attn.flatten()
             print(f"    SGLang attn shape: {sg_attn.shape}")
             print(f"    SGLang attn first 10: {[f'{v:.4f}' for v in sg_attn_flat[:10].float().tolist()]}")
-            diff_attn = (sg_attn_flat[:10].float() - meg_core[:10].float()).abs()
-            max_diff_attn = diff_attn.max().item()
-            print(f"    Max diff: {max_diff_attn:.6e}")
-            if max_diff_attn < 1e-3:
-                print("    ✓ Core attention outputs close!")
+            
+            # Compare all values, not just first 10
+            min_len = min(sg_attn_flat.numel(), meg_core.numel())
+            diff_attn_all = (sg_attn_flat[:min_len].float() - meg_core[:min_len].float()).abs()
+            max_diff_attn = diff_attn_all.max().item()
+            mean_diff_attn = diff_attn_all.mean().item()
+            
+            print(f"    Max diff: {max_diff_attn:.6e}, Mean diff: {mean_diff_attn:.6e}")
+            
+            if max_diff_attn < 1e-5:
+                print("    ✓ Core attention outputs MATCH! (true on-policy)")
+            elif max_diff_attn < 1e-3:
+                print("    ⚠ Core attention outputs close but not identical")
+                print("      This may be due to RoPE implementation differences")
+                print("      (Expected: <1e-5 for true on-policy)")
+            else:
+                print("    ✗ Core attention outputs DIFFERENT")
+                print("      Check RoPE implementation")
     else:
         print("    Megatron core_attention not found")
 
