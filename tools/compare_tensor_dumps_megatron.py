@@ -1717,6 +1717,122 @@ def compare_first_response_token(
         else:
             print(f"\n  ⚠ Layer {last_layer_idx} has differences: "
                   f"{', '.join(last_layer_mismatches)}")
+        
+        # =====================================================================
+        # LAST LAYER INPUT COMPARISON
+        # =====================================================================
+        print("\n" + "=" * 70)
+        print(f"LAST LAYER (LAYER {last_layer_idx}) INPUT COMPARISON")
+        print("=" * 70)
+        print("Comparing the input to the last transformer layer")
+        print("  SGLang: output from layer (last_layer_idx - 1)")
+        print("  Megatron: layer_{last_layer_idx}_input")
+        
+        # SGLang: Get output from previous layer (last_layer_idx - 1)
+        # The input to last layer is the output from previous layer (after residual add)
+        prev_layer_idx = last_layer_idx - 1
+        sglang_last_layer_input = None
+        # Try to find the previous layer's output (which is the input to last layer)
+        # In SGLang, layer output is after MLP + residual, so we look for the full layer output
+        for key_pattern in [
+            f"model.layers.{prev_layer_idx}.mlp.down_proj",  # MLP output (before residual)
+            f"model.layers.{prev_layer_idx}.mlp",  # MLP output
+            f"layer_{prev_layer_idx}_output",  # Full layer output (if captured)
+        ]:
+            tensors_dict = sglang_decode_for_hidden if sglang_decode_for_hidden else {}
+            if key_pattern in tensors_dict:
+                val = tensors_dict[key_pattern]
+                if val is not None:
+                    sglang_last_layer_input = to_tensor(val, prefer_last=True)
+                    if sglang_last_layer_input is not None:
+                        # Extract at response start position
+                        if sglang_last_layer_input.dim() == 2:
+                            sglang_last_layer_input = sglang_last_layer_input[-1]  # Last token
+                        elif sglang_last_layer_input.dim() == 3:
+                            d0, d1, d2 = sglang_last_layer_input.shape
+                            if d0 == 1:
+                                sglang_last_layer_input = sglang_last_layer_input[0, -1]
+                            else:
+                                sglang_last_layer_input = sglang_last_layer_input[-1, 0]
+                        print(f"    SGLang key: {key_pattern}, shape: {sglang_last_layer_input.shape}")
+                        break
+        
+        # If not found, try to compute from previous layer's components
+        # The input to last layer should be: prev_layer_mlp_output + prev_layer_residual
+        # But we don't have direct access to this, so we use MLP output as approximation
+        # (Note: This might not be exact if residual was added after MLP)
+        
+        # Megatron: Get layer input
+        megatron_last_layer_input = None
+        megatron_input_key = f"layer_{last_layer_idx}_input_at_response_start"
+        if megatron_input_key not in megatron_tensors:
+            # Try without _at_response_start suffix
+            megatron_input_key = f"layer_{last_layer_idx}_input"
+        
+        if megatron_input_key in megatron_tensors:
+            megatron_last_layer_input = megatron_tensors[megatron_input_key]
+            if megatron_last_layer_input.dim() == 2:
+                megatron_last_layer_input = megatron_last_layer_input[0]  # [1, dim] -> [dim]
+            elif megatron_last_layer_input.dim() == 3:
+                d0, d1, d2 = megatron_last_layer_input.shape
+                if d0 == 1:
+                    megatron_last_layer_input = megatron_last_layer_input[0, first_response_pos]
+                else:
+                    megatron_last_layer_input = megatron_last_layer_input[first_response_pos, 0]
+            print(f"    Megatron key: {megatron_input_key}, shape: {megatron_last_layer_input.shape}")
+        
+        if sglang_last_layer_input is None:
+            print("    ⚠ SGLang last layer input: NOT FOUND")
+        if megatron_last_layer_input is None:
+            print("    ⚠ Megatron last layer input: NOT FOUND")
+        
+        if sglang_last_layer_input is not None and megatron_last_layer_input is not None:
+            # Convert both to float32 for comparison
+            sg_input = sglang_last_layer_input.float()
+            meg_input = megatron_last_layer_input.float()
+            
+            # Verify shapes match
+            if sg_input.shape != meg_input.shape:
+                print(f"    ⚠️  Shape mismatch: SGLang {sg_input.shape} vs "
+                      f"Megatron {meg_input.shape}")
+                min_len = min(sg_input.numel(), meg_input.numel())
+                sg_input = sg_input.flatten()[:min_len]
+                meg_input = meg_input.flatten()[:min_len]
+            
+            diff_input = (sg_input - meg_input).abs()
+            max_diff_input = diff_input.max().item()
+            mean_diff_input = diff_input.mean().item()
+            
+            # Check RMS values
+            sg_rms = (sg_input ** 2).mean().sqrt().item()
+            meg_rms = (meg_input ** 2).mean().sqrt().item()
+            
+            print(f"\n    🔍 LAST LAYER INPUT COMPARISON:")
+            print(f"    {'='*70}")
+            print(f"    SGLang (layer {prev_layer_idx} output):")
+            print(f"      shape: {sg_input.shape}, RMS: {sg_rms:.4f}")
+            print(f"      first 10: {[f'{v:.4f}' for v in sg_input[:10].tolist()]}")
+            print(f"    Megatron (layer_{last_layer_idx}_input):")
+            print(f"      shape: {meg_input.shape}, RMS: {meg_rms:.4f}")
+            print(f"      first 10: {[f'{v:.4f}' for v in meg_input[:10].tolist()]}")
+            print(f"    Difference:")
+            print(f"      Max diff: {max_diff_input:.6e}, Mean diff: {mean_diff_input:.6e}")
+            
+            # Find indices with largest differences
+            top_diff_indices = diff_input.topk(min(5, len(diff_input))).indices
+            print(f"    Top 5 differences:")
+            for idx in top_diff_indices:
+                idx_val = idx.item()
+                print(f"      idx={idx_val}: SGLang={sg_input[idx_val]:.6f}, "
+                      f"Megatron={meg_input[idx_val]:.6f}, "
+                      f"diff={diff_input[idx_val]:.6e}")
+            
+            if max_diff_input < 1e-5:
+                print(f"\n    ✓✓✓ LAST LAYER INPUT MATCHES! ✓✓✓")
+            elif max_diff_input < 1e-3:
+                print(f"\n    ⚠ LAST LAYER INPUT CLOSE (max_diff={max_diff_input:.6e})")
+            else:
+                print(f"\n    ✗ LAST LAYER INPUT DIFFERS (max_diff={max_diff_input:.6e})")
     elif last_layer_idx is None:
         print("\n" + "=" * 70)
         print("LAST LAYER COMPARISON")
