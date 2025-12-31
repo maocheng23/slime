@@ -1019,14 +1019,14 @@ def compare_first_response_token(
 
     # Compare Q/K AFTER ROPE (if available)
     # Note: Megatron layer_number is 1-based, so layer 1 = first layer (layer 0 in SGLang)
-    # SGLang's rotary_emb hook captures cos/sin, NOT Q after RoPE
+    # SGLang's rotary_emb hook captures (query, key) tuple - the Q/K AFTER RoPE
     print("\n  LAYER 0 Q/K AFTER ROPE COMPARISON:")
     print("    (Megatron layer_1 = SGLang layer 0)")
     
     # Show all available q_after_rope keys for debugging
     rope_keys = [k for k in megatron_tensors.keys() if 'after_rope' in k.lower()]
     if rope_keys:
-        print(f"    Available RoPE keys: {rope_keys[:6]}")
+        print(f"    Available Megatron RoPE keys: {rope_keys[:6]}")
     
     # Megatron uses 1-based layer numbering, so layer_1 is the first layer
     meg_q_key = "layer_1_q_after_rope_at_response_start"
@@ -1051,13 +1051,59 @@ def compare_first_response_token(
             meg_k_flat = meg_k_rope.flatten()
             print(f"    Megatron K after RoPE first 10: {[f'{v:.4f}' for v in meg_k_flat[:10].float().tolist()]}")
         
-        # Note: SGLang's rotary_emb hook captures cos/sin frequencies, not Q/K after RoPE
-        # So we cannot directly compare Q/K after RoPE with SGLang
-        print("    Note: SGLang 'rotary_emb' hook captures cos/sin, not Q after RoPE")
-        print("    (Direct Q/K after RoPE comparison not available)")
+        # SGLang's rotary_emb hook captures (query, key) tuple - Q/K AFTER RoPE
+        sg_rotary_key = "model.layers.0.self_attn.rotary_emb"
+        sg_q_rope = None
+        sg_k_rope = None
         
-        # However, we can compare via attention output which is available
-        print("    → Compare via core_attention output below instead")
+        if sglang_decode_for_hidden and sg_rotary_key in sglang_decode_for_hidden:
+            sg_rotary = sglang_decode_for_hidden[sg_rotary_key]
+            print(f"    SGLang rotary_emb key: {sg_rotary_key}")
+            print(f"    SGLang rotary_emb type: {type(sg_rotary)}")
+            
+            if isinstance(sg_rotary, (list, tuple)) and len(sg_rotary) >= 2:
+                # rotary_emb returns (query, key) tuple
+                sg_q_rope = sg_rotary[0]  # Q after RoPE
+                sg_k_rope = sg_rotary[1]  # K after RoPE
+                print(f"    SGLang Q after RoPE shape: {sg_q_rope.shape}")
+                print(f"    SGLang K after RoPE shape: {sg_k_rope.shape}")
+                
+                sg_q_flat = sg_q_rope.flatten()
+                print(f"    SGLang Q after RoPE first 10: {[f'{v:.4f}' for v in sg_q_flat[:10].float().tolist()]}")
+                
+                # Compare Q after RoPE
+                min_len = min(sg_q_flat.numel(), meg_q_flat.numel())
+                diff_q = (sg_q_flat[:min_len].float() - meg_q_flat[:min_len].float()).abs()
+                max_diff_q = diff_q.max().item()
+                mean_diff_q = diff_q.mean().item()
+                print(f"    Q after RoPE - Max diff: {max_diff_q:.6e}, Mean diff: {mean_diff_q:.6e}")
+                
+                if max_diff_q < 1e-5:
+                    print("    ✓ Q after RoPE MATCH!")
+                elif max_diff_q < 1e-3:
+                    print("    ⚠ Q after RoPE close but not identical")
+                else:
+                    print("    ✗ Q after RoPE DIFFERENT - RoPE implementations differ")
+                    
+                # Also compare K if available
+                if sg_k_rope is not None and meg_k_rope is not None:
+                    sg_k_flat = sg_k_rope.flatten()
+                    meg_k_flat_cmp = meg_k_rope.flatten()
+                    min_len_k = min(sg_k_flat.numel(), meg_k_flat_cmp.numel())
+                    diff_k = (sg_k_flat[:min_len_k].float() - meg_k_flat_cmp[:min_len_k].float()).abs()
+                    max_diff_k = diff_k.max().item()
+                    print(f"    K after RoPE - Max diff: {max_diff_k:.6e}")
+                    if max_diff_k < 1e-5:
+                        print("    ✓ K after RoPE MATCH!")
+            else:
+                print(f"    SGLang rotary_emb is not a (q, k) tuple: {type(sg_rotary)}")
+                if isinstance(sg_rotary, torch.Tensor):
+                    print(f"    SGLang rotary_emb tensor shape: {sg_rotary.shape}")
+        else:
+            print("    SGLang rotary_emb not found in decode dump")
+            if sglang_decode_for_hidden:
+                rotary_keys = [k for k in sglang_decode_for_hidden.keys() if 'rotary' in k.lower()]
+                print(f"    Available SGLang rotary keys: {rotary_keys}")
     else:
         print("    Megatron Q after RoPE not found (layer_1_q_after_rope)")
         print("    (Enable with: enable_qk_after_rope_dump(model))")
