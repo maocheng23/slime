@@ -1018,14 +1018,33 @@ def compare_first_response_token(
         print("    SGLang k_norm not found")
 
     # Compare Q/K AFTER ROPE (if available)
-    # These tensors are dumped when enable_qk_after_rope_dump() is called
+    # These tensors are automatically dumped when global dumper is active
     print("\n  LAYER 0 Q/K AFTER ROPE COMPARISON:")
     print("    (These tensors help identify RoPE divergence)")
     
-    meg_q_rope_91 = "layer_1_q_after_rope_at_response_start"  # layer_number is 1-based
-    meg_k_rope_91 = "layer_1_k_after_rope_at_response_start"
+    # Try both 0-based and 1-based layer numbering
+    meg_q_rope_91 = None
+    meg_k_rope_91 = None
+    for layer_num in [1, 0]:  # layer_number is 1-based in Megatron
+        q_key = f"layer_{layer_num}_q_after_rope_at_response_start"
+        k_key = f"layer_{layer_num}_k_after_rope_at_response_start"
+        if q_key in megatron_tensors:
+            meg_q_rope_91 = q_key
+            meg_k_rope_91 = k_key
+            break
+        # Also try without _at_response_start suffix
+        q_key_base = f"layer_{layer_num}_q_after_rope"
+        if q_key_base in megatron_tensors:
+            meg_q_rope_91 = q_key_base
+            meg_k_rope_91 = f"layer_{layer_num}_k_after_rope"
+            break
     
-    if meg_q_rope_91 in megatron_tensors:
+    # Show all available q_after_rope keys for debugging
+    rope_keys = [k for k in megatron_tensors.keys() if 'after_rope' in k.lower()]
+    if rope_keys:
+        print(f"    Available RoPE keys: {rope_keys[:5]}")
+    
+    if meg_q_rope_91 and meg_q_rope_91 in megatron_tensors:
         meg_q_rope = megatron_tensors[meg_q_rope_91].flatten()
         print(f"    Megatron Q after RoPE shape: {megatron_tensors[meg_q_rope_91].shape}")
         print(f"    Megatron Q after RoPE first 10: {[f'{v:.4f}' for v in meg_q_rope[:10].float().tolist()]}")
