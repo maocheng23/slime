@@ -146,12 +146,12 @@ class MegatronTensorDumper:
                 else:
                     # [seq_len, batch, hidden] format
                     seq_len = d0
-                if pos >= seq_len:
-                    pos = seq_len - 1
+                    if pos >= seq_len:
+                        pos = seq_len - 1
                     token = t[pos:pos+1, :, :]
-                if token.shape[1] == 1:
-                    return token[:, 0, :]  # [1, hidden]
-                return token[0, :, :]  # [batch, hidden]
+                    if token.shape[1] == 1:
+                        return token[:, 0, :]  # [1, hidden]
+                    return token[0, :, :]  # [batch, hidden]
             elif t.dim() == 2:
                 # [seq_len, hidden]
                 seq_len = t.shape[0]
