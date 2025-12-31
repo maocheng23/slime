@@ -262,6 +262,18 @@ class MegatronTensorDumper:
 
         # Find the decoder/transformer layers
         layers = self._find_transformer_layers(model)
+        
+        # Always include the last layer (e.g., layer 28 if there are 29 layers)
+        if layers:
+            last_layer_idx = len(layers) - 1
+            if self._dump_layers is not None:
+                # Add last layer to dump_layers if not already present
+                if last_layer_idx not in self._dump_layers:
+                    self._dump_layers.append(last_layer_idx)
+                    logger.info(
+                        f"[MegatronTensorDumper] Automatically added last layer "
+                        f"{last_layer_idx} to dump_layers (total layers: {len(layers)})"
+                    )
 
         for layer_idx, layer in enumerate(layers):
             if not self.should_dump_layer(layer_idx):
@@ -517,7 +529,7 @@ class MegatronTensorDumper:
                     "[MegatronTensorDumper] Detected [batch, seq, vocab] format"
                 )
             else:
-            # [seq_len, batch, vocab_size] - Megatron format
+                # [seq_len, batch, vocab_size] - Megatron format
                 seq_len = d0
                 batch_size = d1
                 vocab_size = d2

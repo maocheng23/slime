@@ -74,6 +74,17 @@ def execute():
     sglang_tensor_dump_dir = "/tmp/sglang_tensor_dump" if MODE == "debug_one_sample" else ""
     fsdp_tensor_dump_dir = "/tmp/fsdp_tensor_dump" if MODE == "debug_one_sample" else ""
 
+    # Build dump layers list - always include last layer (layer 28 for Qwen3 models)
+    dump_layers_str = ""
+    if MODE == "debug_one_sample":
+        # Default layers to dump: 0, 1, 2
+        dump_layers = [0, 1, 2]
+        # Automatically add last layer (layer 28 for Qwen3-0.6B and Qwen3-4B)
+        last_layer = 28
+        if last_layer not in dump_layers:
+            dump_layers.append(last_layer)
+        dump_layers_str = f"--sglang-debug-tensor-dump-layers {' '.join(map(str, dump_layers))} "
+
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "
         "--sglang-decode-log-interval 1000 "
@@ -82,7 +93,7 @@ def execute():
         f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
         # Enable tensor dump for layer-by-layer comparison
         f"{'--sglang-debug-tensor-dump-output-folder ' + sglang_tensor_dump_dir + ' ' if MODE == 'debug_one_sample' else ''}"
-        f"{'--sglang-debug-tensor-dump-layers 0 1 2 ' if MODE == 'debug_one_sample' else ''}"  # Dump first 3 layers
+        f"{dump_layers_str}"  # Includes last layer (28) automatically
     )
 
     fsdp_args = (

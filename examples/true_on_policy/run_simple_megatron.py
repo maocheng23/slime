@@ -81,6 +81,17 @@ def execute():
     # Tensor dump directory for debug_one_sample mode
     tensor_dump_dir = "/tmp/sglang_tensor_dump" if MODE == "debug_one_sample" else ""
     
+    # Build dump layers list - always include last layer (layer 28 for Qwen3 models)
+    dump_layers_str = ""
+    if MODE == "debug_one_sample":
+        # Default layers to dump: 0, 1, 2
+        dump_layers = [0, 1, 2]
+        # Automatically add last layer (layer 28 for Qwen3-0.6B and Qwen3-4B)
+        last_layer = 28
+        if last_layer not in dump_layers:
+            dump_layers.append(last_layer)
+        dump_layers_str = f"--sglang-debug-tensor-dump-layers {' '.join(map(str, dump_layers))} "
+    
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "
         "--sglang-decode-log-interval 1000 "
@@ -89,7 +100,7 @@ def execute():
         f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
         # Enable tensor dump for layer-by-layer comparison
         f"{'--sglang-debug-tensor-dump-output-folder ' + tensor_dump_dir + ' ' if MODE == 'debug_one_sample' else ''}"
-        f"{'--sglang-debug-tensor-dump-layers 0 1 2 ' if MODE == 'debug_one_sample' else ''}"  # Dump first 3 layers
+        f"{dump_layers_str}"  # Includes last layer (28) automatically
     )
 
     fsdp_args = (
@@ -155,8 +166,9 @@ def execute():
             "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
             "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
             # Megatron tensor dump for layer-by-layer comparison
+            # Automatically includes last layer (28) - see debug_tensor_dump.py
             "MEGATRON_TENSOR_DUMP_DIR": "/tmp/megatron_tensor_dump" if MODE == "debug_one_sample" else "",
-            "MEGATRON_TENSOR_DUMP_LAYERS": "0,1,2" if MODE == "debug_one_sample" else "",  # Dump first 3 layers
+            "MEGATRON_TENSOR_DUMP_LAYERS": "0,1,2" if MODE == "debug_one_sample" else "",  # Last layer (28) added automatically
         },
     )
 
