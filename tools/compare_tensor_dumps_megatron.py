@@ -1713,7 +1713,7 @@ def compare_first_response_token(
                 except Exception as e:
                     pass
 
-    # Megatron final_layernorm
+    # Megatron final_layernorm OUTPUT
     megatron_final_norm = None
     for key_pattern in [
         "final_layernorm_at_response_start",
@@ -1732,6 +1732,29 @@ def compare_first_response_token(
                 else:
                     megatron_final_norm = megatron_final_norm[first_response_pos, 0]
             print(f"    Megatron key: {key_pattern}, shape: {megatron_final_norm.shape}")
+            break
+    
+    # Megatron INPUT to final_layernorm (output of last transformer layer)
+    # This should match SGLang's element 1 (input before normalization)
+    megatron_final_norm_input = None
+    # Try to find the last layer output
+    last_layer_idx = 2  # Assuming we have layers 0, 1, 2
+    for key_pattern in [
+        f"layer_{last_layer_idx}_output_at_response_start",
+        f"layer_{last_layer_idx}_output",
+    ]:
+        if key_pattern in megatron_tensors:
+            megatron_final_norm_input = megatron_tensors[key_pattern]
+            if megatron_final_norm_input.dim() == 2:
+                megatron_final_norm_input = megatron_final_norm_input[0]  # [1, dim] -> [dim]
+            elif megatron_final_norm_input.dim() == 3:
+                d0, d1, d2 = megatron_final_norm_input.shape
+                if d0 == 1:
+                    megatron_final_norm_input = megatron_final_norm_input[0, first_response_pos]
+                else:
+                    megatron_final_norm_input = megatron_final_norm_input[first_response_pos, 0]
+            print(f"    Megatron INPUT to final_layernorm (last layer output): "
+                  f"key={key_pattern}, shape={megatron_final_norm_input.shape}")
             break
 
     if megatron_final_norm is None:
@@ -1794,28 +1817,69 @@ def compare_first_response_token(
         else:
             print(f"    ✗ Final LayerNorm DIFFERENT (max_diff={max_diff_fn:.6e})")
             
-            # If we have the input (before residual), compare that with Megatron
-            if 'sglang_final_norm_input' in locals() and sglang_final_norm_input is not None:
-                print(f"\n    🔍 Comparing SGLang INPUT (before residual) vs Megatron:")
-                sg_input_flat = sglang_final_norm_input.flatten()
-                if sg_input_flat.dim() > 1:
-                    if sg_input_flat.shape[0] == 1:
-                        sg_input_flat = sg_input_flat[0]
+            # Compare inputs to understand the difference
+            if ('sglang_final_norm_input' in locals() and sglang_final_norm_input is not None
+                    and megatron_final_norm_input is not None):
+                print(f"\n    🔍 DIAGNOSTICS: Comparing inputs to normalization:")
+                sg_input = sglang_final_norm_input
+                if sg_input.dim() > 1:
+                    if sg_input.shape[0] == 1:
+                        sg_input = sg_input[0]
                     else:
-                        sg_input_flat = sg_input_flat[-1]
+                        sg_input = sg_input[-1]
                 
-                if sg_input_flat.shape == megatron_fn.shape:
-                    diff_input = (sg_input_flat.float() - megatron_fn).abs()
+                if sg_input.shape == megatron_final_norm_input.shape:
+                    sg_input_f = sg_input.float()
+                    meg_input_f = megatron_final_norm_input.float()
+                    diff_input = (sg_input_f - meg_input_f).abs()
                     max_diff_input = diff_input.max().item()
                     mean_diff_input = diff_input.mean().item()
-                    print(f"      Max diff: {max_diff_input:.6e}, Mean diff: {mean_diff_input:.6e}")
-                    if max_diff_input < 1e-4:
-                        print("      ✓ SGLang INPUT matches Megatron!")
-                        print("      → Difference is from residual addition in SGLang")
-                        print(f"      → Residual magnitude: "
-                              f"{((sglang_final_norm.float() - sg_input_flat.float()).abs().max().item()):.6e}")
+                    
+                    sg_input_rms = (sg_input_f ** 2).mean().sqrt().item()
+                    meg_input_rms = (meg_input_f ** 2).mean().sqrt().item()
+                    
+                    print(f"      SGLang input (x + residual): RMS={sg_input_rms:.4f}")
+                    print(f"      Megatron input (last layer output): RMS={meg_input_rms:.4f}")
+                    print(f"      Input diff: max={max_diff_input:.6e}, mean={mean_diff_input:.6e}")
+                    
+                    if max_diff_input < 1e-3:
+                        print("      ✓ Inputs are close - difference is from normalization")
+                        # Check if difference is from residual
+                        residual_est = sg_input_f - meg_input_f
+                        residual_mag = residual_est.abs().max().item()
+                        residual_mean = residual_est.abs().mean().item()
+                        print(f"      Estimated residual: max={residual_mag:.6e}, "
+                              f"mean={residual_mean:.6e}")
+                        
+                        # Try manually normalizing Megatron's input using SGLang's formula
+                        # to see if we get the same output
+                        print(f"\n      🔬 Testing normalization computation:")
+                        # SGLang's RMSNorm formula: x * rsqrt(mean(x^2) + eps) * weight
+                        # Use typical eps=1e-6 (should match config)
+                        eps = 1e-6
+                        meg_input_var = (meg_input_f ** 2).mean()
+                        meg_input_normed = meg_input_f * torch.rsqrt(meg_input_var + eps)
+                        # Compare with SGLang output (assuming weight=1.0 for now)
+                        diff_norm_comp = (meg_input_normed - sglang_fn).abs()
+                        max_diff_norm_comp = diff_norm_comp.max().item()
+                        mean_diff_norm_comp = diff_norm_comp.mean().item()
+                        print(f"        Manual norm of Megatron input vs SGLang output:")
+                        print(f"        Max diff: {max_diff_norm_comp:.6e}, "
+                              f"Mean diff: {mean_diff_norm_comp:.6e}")
+                        if max_diff_norm_comp < 0.2:
+                            print(f"        ✓ Normalization computation is similar")
+                            print(f"        → Difference likely from residual or weight values")
+                        else:
+                            print(f"        ✗ Normalization computation differs")
                     else:
-                        print(f"      ✗ SGLang INPUT also differs (max_diff={max_diff_input:.6e})")
+                        print(f"      ✗ Inputs differ significantly")
+                        print(f"      → This suggests different last layer outputs")
+            
+            # Check if difference is acceptable (within bfloat16 precision)
+            if max_diff_fn < 0.5:  # bfloat16 has ~0.01 precision for values around 1-10
+                print(f"\n    ⚠️  Difference is small (max={max_diff_fn:.6e})")
+                print(f"    → May be within bfloat16 numerical precision limits")
+                print(f"    → Check if logits match (more important)")
             
             if sglang_rms > 5.0:
                 print("    → SGLang value appears to be INPUT (before normalization)")
