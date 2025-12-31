@@ -1572,13 +1572,39 @@ def compare_first_response_token(
         )
         all_layers_results[layer_idx] = layer_results
     
+    # Find the last layer index for summary
+    last_layer_for_summary = None
+    megatron_layer_indices = set()
+    for key in megatron_tensors.keys():
+        match = re.match(r"layer_(\d+)_", key)
+        if match:
+            layer_idx = int(match.group(1))
+            megatron_layer_indices.add(layer_idx)
+    
+    sglang_layer_indices = set()
+    if sglang_decode_for_hidden:
+        for key in sglang_decode_for_hidden.keys():
+            match = re.search(r"layers\.(\d+)\.", key)
+            if match:
+                layer_idx = int(match.group(1))
+                sglang_layer_indices.add(layer_idx)
+    
+    all_available_layers = sorted(megatron_layer_indices & sglang_layer_indices)
+    if all_available_layers:
+        last_layer_for_summary = max(all_available_layers)
+    
     # Print summary for all layers
     print("\n" + "=" * 70)
     print("ALL LAYERS SUMMARY")
     print("=" * 70)
     
+    # Layers to include in summary: first 3 layers + last layer
+    layers_to_summarize = [0, 1, 2]
+    if last_layer_for_summary is not None and last_layer_for_summary not in layers_to_summarize:
+        layers_to_summarize.append(last_layer_for_summary)
+    
     all_layers_match = True
-    for layer_idx in [0, 1, 2]:
+    for layer_idx in layers_to_summarize:
         layer_results = all_layers_results.get(layer_idx, {})
         layer_match = True
         mismatches = []
@@ -1588,13 +1614,67 @@ def compare_first_response_token(
                 all_layers_match = False
                 mismatches.append(f"{component}({diff:.2e})" if diff else component)
         
+        layer_label = f"Layer {layer_idx}"
+        if layer_idx == last_layer_for_summary and layer_idx not in [0, 1, 2]:
+            layer_label = f"Layer {layer_idx} (LAST)"
+        
         if layer_match:
-            print(f"  Layer {layer_idx}: ✓ ALL MATCH")
+            print(f"  {layer_label}: ✓ ALL MATCH")
         else:
-            print(f"  Layer {layer_idx}: ✗ DIFF in {', '.join(mismatches)}")
+            print(f"  {layer_label}: ✗ DIFF in {', '.join(mismatches)}")
     
     if all_layers_match:
         print("\n  ✓✓✓ ALL LAYERS MATCH - TRUE ON-POLICY VERIFIED! ✓✓✓")
+
+    # =========================================================================
+    # LAST LAYER (LAYER 28) COMPARISON
+    # =========================================================================
+    # Find the last layer index from available layers (reuse detection logic)
+    last_layer_idx = last_layer_for_summary
+    
+    if last_layer_idx is not None and last_layer_idx not in [0, 1, 2]:
+        print("\n" + "=" * 70)
+        print(f"LAST LAYER (LAYER {last_layer_idx}) COMPARISON")
+        print("=" * 70)
+        print("Comparing the last transformer layer before final layernorm")
+        print(f"  Detected last layer: {last_layer_idx}")
+        print(f"  Available layers in both dumps: {sorted(all_available_layers)}")
+        
+        print(f"\n  Comparing Layer {last_layer_idx} components:")
+        last_layer_results = compare_layer(
+            layer_idx=last_layer_idx,
+            sglang_tensors=sglang_decode_for_hidden if sglang_decode_for_hidden else {},
+            megatron_tensors=megatron_tensors,
+            verbose=True,
+        )
+        all_layers_results[last_layer_idx] = last_layer_results
+        
+        # Print summary for last layer
+        print(f"\n  Layer {last_layer_idx} Summary:")
+        last_layer_match = True
+        last_layer_mismatches = []
+        for component, (status, diff) in last_layer_results.items():
+            if status not in ("MATCH", "NOT_FOUND"):
+                last_layer_match = False
+                last_layer_mismatches.append(
+                    f"{component}({diff:.2e})" if diff else component
+                )
+            status_mark = ("✓" if status == "MATCH"
+                          else "⚠" if status == "CLOSE" else "✗")
+            diff_str = f"{diff:.2e}" if diff is not None else "N/A"
+            print(f"    {status_mark} {component}: {status} "
+                  f"(max_diff={diff_str})")
+        
+        if last_layer_match:
+            print(f"\n  ✓✓✓ LAYER {last_layer_idx} ALL COMPONENTS MATCH! ✓✓✓")
+        else:
+            print(f"\n  ⚠ Layer {last_layer_idx} has differences: "
+                  f"{', '.join(last_layer_mismatches)}")
+    elif last_layer_idx is None:
+        print("\n" + "=" * 70)
+        print("LAST LAYER COMPARISON")
+        print("=" * 70)
+        print("  ⚠ Could not determine last layer index")
 
     # =========================================================================
     # FINAL LAYERNORM AND LM HEAD COMPARISON
