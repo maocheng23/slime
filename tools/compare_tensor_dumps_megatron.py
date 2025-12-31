@@ -2029,6 +2029,91 @@ def compare_first_response_token(
         print(f"    Available keys containing 'final': "
               f"{[k for k in megatron_tensors.keys() if 'final' in k.lower()]}")
 
+    # Compare the INPUT to final_layernorm (MLP output + residual) if available
+    # SGLang Element 1 is the input AFTER residual addition (before normalization)
+    # This should match (Megatron MLP output + Megatron residual)
+    sglang_final_norm_input = None
+    if isinstance(sglang_raw_val, (list, tuple)) and len(sglang_raw_val) > 1:
+        sglang_final_norm_input = sglang_raw_val[1]  # Element 1 is INPUT before normalization
+        if isinstance(sglang_final_norm_input, torch.Tensor):
+            if sglang_final_norm_input.dim() > 1:
+                if sglang_final_norm_input.dim() == 2:
+                    sglang_final_norm_input = sglang_final_norm_input[0]  # [1, dim] -> [dim]
+                elif sglang_final_norm_input.dim() == 3:
+                    d0, d1, d2 = sglang_final_norm_input.shape
+                    if d0 == 1:
+                        sglang_final_norm_input = sglang_final_norm_input[0, -1]
+                    else:
+                        sglang_final_norm_input = sglang_final_norm_input[-1, 0]
+    
+    # Try to find Megatron residual value passed to final_layernorm
+    megatron_residual = None
+    for key_pattern in [
+        f"layer_{last_layer_idx}_residual_at_response_start",
+        f"final_layernorm_residual_at_response_start",
+        f"residual_at_response_start",
+    ]:
+        if key_pattern in megatron_tensors:
+            megatron_residual = megatron_tensors[key_pattern]
+            if megatron_residual.dim() == 2:
+                megatron_residual = megatron_residual[0]
+            elif megatron_residual.dim() == 3:
+                d0, d1, d2 = megatron_residual.shape
+                if d0 == 1:
+                    megatron_residual = megatron_residual[0, first_response_pos]
+                else:
+                    megatron_residual = megatron_residual[first_response_pos, 0]
+            print(f"    Megatron RESIDUAL passed to final_layernorm: "
+                  f"key={key_pattern}, shape={megatron_residual.shape}")
+            break
+    
+    # Compare INPUT to final_layernorm (MLP output + residual)
+    if sglang_final_norm_input is not None and megatron_final_norm_input is not None:
+        sg_input_f = sglang_final_norm_input.float()
+        meg_input_f = megatron_final_norm_input.float()
+        
+        # If we have residual, compute the sum (MLP output + residual)
+        if megatron_residual is not None:
+            meg_residual_f = megatron_residual.float()
+            meg_sum_f = meg_input_f + meg_residual_f
+            print(f"\n    🔍 COMPARING INPUT TO FINAL LAYERNORM:")
+            print(f"    {'='*70}")
+            print(f"    SGLang Element 1 (MLP_output + residual, before norm):")
+            print(f"      shape: {sg_input_f.shape}, RMS: {(sg_input_f**2).mean().sqrt().item():.4f}")
+            print(f"      first 10: {[f'{v:.4f}' for v in sg_input_f[:10].tolist()]}")
+            print(f"    Megatron (MLP_output + residual, computed):")
+            print(f"      MLP output shape: {meg_input_f.shape}, RMS: {(meg_input_f**2).mean().sqrt().item():.4f}")
+            print(f"      Residual shape: {meg_residual_f.shape}, RMS: {(meg_residual_f**2).mean().sqrt().item():.4f}")
+            print(f"      Sum shape: {meg_sum_f.shape}, RMS: {(meg_sum_f**2).mean().sqrt().item():.4f}")
+            print(f"      Sum first 10: {[f'{v:.4f}' for v in meg_sum_f[:10].tolist()]}")
+            
+            # Compare the sums
+            if sg_input_f.shape != meg_sum_f.shape:
+                min_len = min(sg_input_f.numel(), meg_sum_f.numel())
+                sg_input_f = sg_input_f.flatten()[:min_len]
+                meg_sum_f = meg_sum_f.flatten()[:min_len]
+            
+            diff_input = (sg_input_f - meg_sum_f).abs()
+            max_diff_input = diff_input.max().item()
+            mean_diff_input = diff_input.mean().item()
+            print(f"    Difference (SGLang Element 1 vs Megatron sum):")
+            print(f"      Max diff: {max_diff_input:.6e}, Mean diff: {mean_diff_input:.6e}")
+            
+            if max_diff_input < 1e-3:
+                print(f"    ✓ INPUT to final_layernorm MATCHES!")
+            else:
+                print(f"    ✗ INPUT to final_layernorm DIFFERS")
+                top_diff_input = diff_input.topk(min(5, len(diff_input))).indices
+                print(f"    Top 5 differences in INPUT:")
+                for idx in top_diff_input:
+                    idx_val = idx.item()
+                    print(f"      idx={idx_val}: SGLang={sg_input_f[idx_val]:.6f}, "
+                          f"Megatron={meg_sum_f[idx_val]:.6f}, "
+                          f"diff={diff_input[idx_val]:.6e}")
+        else:
+            print(f"\n    ⚠️  Could not find Megatron residual - cannot compare INPUT to final_layernorm")
+            print(f"    Available keys: {[k for k in megatron_tensors.keys() if 'residual' in k.lower()]}")
+    
     if sglang_final_norm is not None and megatron_final_norm is not None:
         # Convert both to float32 for comparison
         sglang_fn = sglang_final_norm.float()
