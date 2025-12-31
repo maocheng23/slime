@@ -1631,6 +1631,7 @@ def compare_first_response_token(
     # =========================================================================
     # Find the last layer index from available layers (reuse detection logic)
     last_layer_idx = last_layer_for_summary
+    print(f"Last layer index: {last_layer_idx}")
     
     if last_layer_idx is not None and last_layer_idx not in [0, 1, 2]:
         print("\n" + "=" * 70)
