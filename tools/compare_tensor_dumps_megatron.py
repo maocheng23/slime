@@ -1606,27 +1606,42 @@ def compare_first_response_token(
 
     # --- Final LayerNorm ---
     print("\n  FINAL LAYERNORM (after all transformer layers):")
-    print("    SGLang: model.norm, Megatron: final_layernorm")
+    print("    SGLang: model.norm OUTPUT, Megatron: final_layernorm OUTPUT")
+    print("    (Both should be normalized hidden states before lm_head)")
 
     # SGLang final norm - try model.norm key
+    # Note: SGLang's norm hook may return (input, output) tuple/list
     sglang_final_norm = None
     for key in ["model.norm", "norm"]:
         if key in sglang_decode_for_hidden:
             val = sglang_decode_for_hidden[key]
-            sglang_final_norm = to_tensor(val)
+            # Handle list/tuple (input, output) - take OUTPUT (last element)
+            sglang_final_norm = to_tensor(val, prefer_last=True)
             if sglang_final_norm is not None:
                 # Extract the last token if it's a sequence
                 if sglang_final_norm.dim() == 2:
-                    sglang_final_norm = sglang_final_norm[-1]  # last token
+                    # [seq_len, hidden_size] -> take last token
+                    sglang_final_norm = sglang_final_norm[-1]
                 elif sglang_final_norm.dim() == 3:
-                    sglang_final_norm = sglang_final_norm[0, -1]  # [batch, seq, dim] -> last token
+                    # [batch, seq, dim] or [seq, batch, dim]
+                    d0, d1, d2 = sglang_final_norm.shape
+                    if d0 == 1:
+                        # [batch=1, seq, dim] -> take last token
+                        sglang_final_norm = sglang_final_norm[0, -1]
+                    else:
+                        # [seq, batch=1, dim] -> take last token
+                        sglang_final_norm = sglang_final_norm[-1, 0]
+                elif sglang_final_norm.dim() == 1:
+                    # Already a single token [hidden_size]
+                    pass
                 print(f"    SGLang key: {key}, shape: {sglang_final_norm.shape}")
                 break
 
     if sglang_final_norm is None:
         print("    SGLang final_norm: NOT FOUND")
-        print(f"    Available keys containing 'norm': "
-              f"{[k for k in sglang_decode_for_hidden.keys() if 'norm' in k.lower()]}")
+        norm_keys = [k for k in sglang_decode_for_hidden.keys()
+                     if 'norm' in k.lower()]
+        print(f"    Available keys containing 'norm': {norm_keys[:10]}")
 
     # Megatron final_layernorm
     megatron_final_norm = None
@@ -1658,41 +1673,69 @@ def compare_first_response_token(
         # Convert both to float32 for comparison
         sglang_fn = sglang_final_norm.float()
         megatron_fn = megatron_final_norm.float()
+        
+        # Verify shapes match
+        if sglang_fn.shape != megatron_fn.shape:
+            print(f"    ⚠️  Shape mismatch: SGLang {sglang_fn.shape} vs "
+                  f"Megatron {megatron_fn.shape}")
+            min_len = min(sglang_fn.numel(), megatron_fn.numel())
+            sglang_fn = sglang_fn.flatten()[:min_len]
+            megatron_fn = megatron_fn.flatten()[:min_len]
+        
         diff_fn = (sglang_fn - megatron_fn).abs()
         max_diff_fn = diff_fn.max().item()
         mean_diff_fn = diff_fn.mean().item()
         
+        # Check if values are normalized (RMS should be ~1.0)
+        sglang_rms = (sglang_fn ** 2).mean().sqrt().item()
+        megatron_rms = (megatron_fn ** 2).mean().sqrt().item()
+        
         print(f"    SGLang first 10: {[f'{v:.4f}' for v in sglang_fn[:10].tolist()]}")
         print(f"    Megatron first 10: {[f'{v:.4f}' for v in megatron_fn[:10].tolist()]}")
+        print(f"    SGLang RMS: {sglang_rms:.4f}, Megatron RMS: {megatron_rms:.4f}")
         print(f"    Max diff: {max_diff_fn:.6e}, Mean diff: {mean_diff_fn:.6e}")
         
         if max_diff_fn < 1e-4:
             print("    ✓ Final LayerNorm MATCH!")
         else:
             print(f"    ✗ Final LayerNorm DIFFERENT (max_diff={max_diff_fn:.6e})")
+            print("    NOTE: If this difference is large, we may be comparing:")
+            print("      - Input vs Output (SGLang hook may dump both)")
+            print("      - Different positions")
+            print("      - Different normalization implementations")
 
     # --- LM Head (output projection to vocab) ---
     print("\n  LM HEAD OUTPUT (projection to vocab):")
-    print("    SGLang: lm_head, Megatron: lm_head")
-
-    sglang_lm_head = None
+    print("    NOTE: We compare logits directly (logits_processor), not lm_head outputs.")
+    print("    SGLang's lm_head hook may capture input (hidden states) not output (logits).")
+    print("    Megatron's lm_head hook captures the actual logits output.")
+    
+    # Check what SGLang actually dumped
+    sglang_lm_head_shape = None
     if "lm_head" in sglang_decode_for_hidden:
         val = sglang_decode_for_hidden["lm_head"]
-        sglang_lm_head = to_tensor(val)
-        if sglang_lm_head is not None:
-            print(f"    SGLang lm_head shape: {sglang_lm_head.shape}")
+        sglang_lm_head_tmp = to_tensor(val, prefer_last=True)
+        if sglang_lm_head_tmp is not None:
+            sglang_lm_head_shape = sglang_lm_head_tmp.shape
+            print(f"    SGLang lm_head hook shape: {sglang_lm_head_shape}")
+            if len(sglang_lm_head_shape) == 2 and sglang_lm_head_shape[1] < 10000:
+                print(f"      ⚠️  This looks like INPUT (hidden states), not OUTPUT (logits)")
+                print(f"      Expected logits shape: [1, vocab_size={151936}]")
     else:
-        print("    SGLang lm_head: NOT FOUND (this is normal - logits are compared directly)")
+        print("    SGLang lm_head: NOT FOUND in dump")
 
-    megatron_lm_head = None
+    # Check what Megatron dumped
+    megatron_lm_head_shape = None
     for key_pattern in ["lm_head_at_response_start", "lm_head"]:
         if key_pattern in megatron_tensors:
-            megatron_lm_head = megatron_tensors[key_pattern]
-            print(f"    Megatron {key_pattern} shape: {megatron_lm_head.shape}")
+            megatron_lm_head_shape = megatron_tensors[key_pattern].shape
+            print(f"    Megatron {key_pattern} shape: {megatron_lm_head_shape}")
             break
     
-    if megatron_lm_head is None:
-        print("    Megatron lm_head: NOT FOUND (this is normal - logits are compared directly)")
+    if megatron_lm_head_shape is None:
+        print("    Megatron lm_head: NOT FOUND in dump")
+    
+    print("    → Logits comparison (below) is the authoritative check.")
 
     # =========================================================================
     # 2. Compare logits for first response token
