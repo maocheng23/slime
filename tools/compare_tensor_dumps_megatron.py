@@ -1679,58 +1679,60 @@ def compare_first_response_token(
             print(f"    → Layer 28 found in both dumps, using it as last layer")
             last_layer_idx = 28
     
-    if last_layer_idx is not None and last_layer_idx not in [0, 1, 2]:
-        print("\n" + "=" * 70)
-        print(f"LAST LAYER (LAYER {last_layer_idx}) COMPARISON")
-        print("=" * 70)
-        print("Comparing the last transformer layer before final layernorm")
-        print(f"  Detected last layer: {last_layer_idx}")
-        print(f"  Available layers in both dumps: {sorted(all_available_layers)}")
-        
-        print(f"\n  Comparing Layer {last_layer_idx} components:")
-        last_layer_results = compare_layer(
-            layer_idx=last_layer_idx,
-            sglang_tensors=sglang_decode_for_hidden if sglang_decode_for_hidden else {},
-            megatron_tensors=megatron_tensors,
-            verbose=True,
-        )
-        all_layers_results[last_layer_idx] = last_layer_results
-        
-        # Print summary for last layer
-        print(f"\n  Layer {last_layer_idx} Summary:")
-        last_layer_match = True
-        last_layer_mismatches = []
-        for component, (status, diff) in last_layer_results.items():
-            if status not in ("MATCH", "NOT_FOUND"):
-                last_layer_match = False
-                last_layer_mismatches.append(
-                    f"{component}({diff:.2e})" if diff else component
-                )
-            status_mark = ("✓" if status == "MATCH"
-                          else "⚠" if status == "CLOSE" else "✗")
-            diff_str = f"{diff:.2e}" if diff is not None else "N/A"
-            print(f"    {status_mark} {component}: {status} "
-                  f"(max_diff={diff_str})")
-        
-        if last_layer_match:
-            print(f"\n  ✓✓✓ LAYER {last_layer_idx} ALL COMPONENTS MATCH! ✓✓✓")
-        else:
-            print(f"\n  ⚠ Layer {last_layer_idx} has differences: "
-                  f"{', '.join(last_layer_mismatches)}")
-        
-        # =====================================================================
-        # LAST LAYER INPUT COMPARISON
-        # =====================================================================
-        print("\n" + "=" * 70)
-        print(f"LAST LAYER (LAYER {last_layer_idx}) INPUT COMPARISON")
-        print("=" * 70)
-        print("Comparing the input to the last transformer layer")
-        print("  SGLang: output from layer (last_layer_idx - 1)")
-        print("  Megatron: layer_{last_layer_idx}_input")
-        
-        # SGLang: Get output from previous layer (last_layer_idx - 1)
-        # The input to last layer is the output from previous layer (after residual add)
-        prev_layer_idx = last_layer_idx - 1
+    # Hardcode layer 27 as the last layer (for Qwen3-0.6B with 28 layers: 0-27)
+    last_layer_idx_hardcoded = 27
+    
+    print("\n" + "=" * 70)
+    print(f"LAST LAYER (LAYER {last_layer_idx_hardcoded}) COMPARISON")
+    print("=" * 70)
+    print("Comparing the last transformer layer before final layernorm")
+    print(f"  Using hardcoded last layer: {last_layer_idx_hardcoded}")
+    print(f"  Available layers in both dumps: {sorted(all_available_layers)}")
+    
+    print(f"\n  Comparing Layer {last_layer_idx_hardcoded} components:")
+    last_layer_results = compare_layer(
+        layer_idx=last_layer_idx_hardcoded,
+        sglang_tensors=sglang_decode_for_hidden if sglang_decode_for_hidden else {},
+        megatron_tensors=megatron_tensors,
+        verbose=True,
+    )
+    all_layers_results[last_layer_idx_hardcoded] = last_layer_results
+    
+    # Print summary for last layer
+    print(f"\n  Layer {last_layer_idx_hardcoded} Summary:")
+    last_layer_match = True
+    last_layer_mismatches = []
+    for component, (status, diff) in last_layer_results.items():
+        if status not in ("MATCH", "NOT_FOUND"):
+            last_layer_match = False
+            last_layer_mismatches.append(
+                f"{component}({diff:.2e})" if diff else component
+            )
+        status_mark = ("✓" if status == "MATCH"
+                      else "⚠" if status == "CLOSE" else "✗")
+        diff_str = f"{diff:.2e}" if diff is not None else "N/A"
+        print(f"    {status_mark} {component}: {status} "
+              f"(max_diff={diff_str})")
+    
+    if last_layer_match:
+        print(f"\n  ✓✓✓ LAYER {last_layer_idx_hardcoded} ALL COMPONENTS MATCH! ✓✓✓")
+    else:
+        print(f"\n  ⚠ Layer {last_layer_idx_hardcoded} has differences: "
+              f"{', '.join(last_layer_mismatches)}")
+    
+    # =====================================================================
+    # LAST LAYER INPUT COMPARISON
+    # =====================================================================
+    print("\n" + "=" * 70)
+    print(f"LAST LAYER (LAYER {last_layer_idx_hardcoded}) INPUT COMPARISON")
+    print("=" * 70)
+    print("Comparing the input to the last transformer layer")
+    print(f"  SGLang: output from layer {last_layer_idx_hardcoded - 1}")
+    print(f"  Megatron: layer_{last_layer_idx_hardcoded}_input")
+    
+    # SGLang: Get output from previous layer (last_layer_idx - 1)
+    # The input to last layer is the output from previous layer (after residual add)
+    prev_layer_idx = last_layer_idx_hardcoded - 1
         sglang_last_layer_input = None
         # Try to find the previous layer's output (which is the input to last layer)
         # In SGLang, layer output is after MLP + residual, so we look for the full layer output
@@ -1764,10 +1766,10 @@ def compare_first_response_token(
         
         # Megatron: Get layer input
         megatron_last_layer_input = None
-        megatron_input_key = f"layer_{last_layer_idx}_input_at_response_start"
+        megatron_input_key = f"layer_{last_layer_idx_hardcoded}_input_at_response_start"
         if megatron_input_key not in megatron_tensors:
             # Try without _at_response_start suffix
-            megatron_input_key = f"layer_{last_layer_idx}_input"
+            megatron_input_key = f"layer_{last_layer_idx_hardcoded}_input"
         
         if megatron_input_key in megatron_tensors:
             megatron_last_layer_input = megatron_tensors[megatron_input_key]
@@ -1812,7 +1814,7 @@ def compare_first_response_token(
             print(f"    SGLang (layer {prev_layer_idx} output):")
             print(f"      shape: {sg_input.shape}, RMS: {sg_rms:.4f}")
             print(f"      first 10: {[f'{v:.4f}' for v in sg_input[:10].tolist()]}")
-            print(f"    Megatron (layer_{last_layer_idx}_input):")
+            print(f"    Megatron (layer_{last_layer_idx_hardcoded}_input):")
             print(f"      shape: {meg_input.shape}, RMS: {meg_rms:.4f}")
             print(f"      first 10: {[f'{v:.4f}' for v in meg_input[:10].tolist()]}")
             print(f"    Difference:")
@@ -1833,11 +1835,6 @@ def compare_first_response_token(
                 print(f"\n    ⚠ LAST LAYER INPUT CLOSE (max_diff={max_diff_input:.6e})")
             else:
                 print(f"\n    ✗ LAST LAYER INPUT DIFFERS (max_diff={max_diff_input:.6e})")
-    elif last_layer_idx is None:
-        print("\n" + "=" * 70)
-        print("LAST LAYER COMPARISON")
-        print("=" * 70)
-        print("  ⚠ Could not determine last layer index")
 
     # =========================================================================
     # FINAL LAYERNORM AND LM HEAD COMPARISON
@@ -2004,27 +2001,9 @@ def compare_first_response_token(
     # Megatron INPUT to final_layernorm (output of last transformer layer)
     # This should match SGLang's element 1 (input before normalization)
     megatron_final_norm_input = None
-    # Try to find the last layer output
-    # Re-detect last_layer_idx from available keys to ensure we get the correct value
-    # (The earlier last_layer_idx might be None for small models)
-    megatron_layer_indices_for_final = set()
-    for key in megatron_tensors.keys():
-        match = re.match(r"layer_(\d+)_", key)
-        if match:
-            layer_idx = int(match.group(1))
-            megatron_layer_indices_for_final.add(layer_idx)
-    
-    if megatron_layer_indices_for_final:
-        last_layer_idx_for_final = max(megatron_layer_indices_for_final)
-    else:
-        # Fallback: try to use the earlier detected value if available
-        try:
-            last_layer_idx_for_final = last_layer_idx if last_layer_idx is not None else 2
-        except NameError:
-            last_layer_idx_for_final = 2
-    
-    print(f"    Detected last layer index: {last_layer_idx_for_final} "
-          f"(from available keys: {sorted(megatron_layer_indices_for_final)})")
+    # Use hardcoded layer 27 as the last layer (for Qwen3-0.6B with 28 layers: 0-27)
+    last_layer_idx_for_final = 27
+    print(f"    Using last layer index: {last_layer_idx_for_final} (hardcoded)")
     
     for key_pattern in [
         f"layer_{last_layer_idx_for_final}_output_at_response_start",
