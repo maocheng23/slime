@@ -73,11 +73,31 @@ class MegatronTensorDumper:
         def extract_token_at_position(t: torch.Tensor, pos: int) -> torch.Tensor:
             """Extract token at specified position.
 
-            Handles both formats:
-            - [seq_len, batch, hidden] - Megatron default
-            - [batch, seq_len, hidden] - Alternative format
+            Handles multiple formats:
+            - [seq_len, batch, hidden] - Megatron default (3D)
+            - [batch, seq_len, hidden] - Alternative format (3D)
+            - [seq_len, batch, num_heads, head_dim] - Q/K layernorm output (4D)
+            - [batch, seq_len, num_heads, head_dim] - Alternative Q/K format (4D)
             """
-            if t.dim() == 3:
+            if t.dim() == 4:
+                d0, d1, d2, d3 = t.shape
+                # Detect format: [batch=1, seq, heads, dim] vs [seq, batch=1, heads, dim]
+                if d0 == 1 and d1 > 1:
+                    # [batch=1, seq_len, num_heads, head_dim] format
+                    seq_len = d1
+                    if pos >= seq_len:
+                        pos = seq_len - 1
+                    return t[0, pos, :, :]  # [num_heads, head_dim]
+                else:
+                    # [seq_len, batch, num_heads, head_dim] format
+                    seq_len = d0
+                    if pos >= seq_len:
+                        pos = seq_len - 1
+                    token = t[pos, :, :, :]  # [batch, num_heads, head_dim]
+                    if token.shape[0] == 1:
+                        return token[0, :, :]  # [num_heads, head_dim]
+                    return token
+            elif t.dim() == 3:
                 d0, d1, d2 = t.shape
                 # Detect format: [batch=1, seq, hidden] vs [seq, batch=1, hidden]
                 if d0 == 1 and d1 > 1:
