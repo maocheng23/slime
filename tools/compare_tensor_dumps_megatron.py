@@ -1628,13 +1628,24 @@ def compare_first_response_token(
             
             # SGLang's model.norm() returns (hidden_states, residual) tuple
             # The first element is the OUTPUT (normalized hidden states)
-            # The second element is the residual (usually None for final norm)
-            if isinstance(val, (list, tuple)) and len(val) > 0:
-                # Take FIRST element (output), not last
+            # The second element is the residual (input before adding residual)
+            if isinstance(val, (list, tuple)) and len(val) >= 2:
+                # Element 0: OUTPUT (normalized after adding residual)
+                # Element 1: RESIDUAL (input before adding residual)
                 sglang_final_norm = to_tensor(val[0], prefer_last=False)
+                sglang_final_norm_input = to_tensor(val[1], prefer_last=False)
+                if sglang_final_norm_input is not None:
+                    rms_input = (sglang_final_norm_input.float() ** 2).mean().sqrt().item()
+                    print(f"    SGLang norm INPUT (before residual): "
+                          f"shape={sglang_final_norm_input.shape}, RMS={rms_input:.4f}")
+            elif isinstance(val, (list, tuple)) and len(val) > 0:
+                # Take FIRST element (output)
+                sglang_final_norm = to_tensor(val[0], prefer_last=False)
+                sglang_final_norm_input = None
             else:
                 # Single tensor - might be output or input
                 sglang_final_norm = to_tensor(val, prefer_last=True)
+                sglang_final_norm_input = None
             
             if sglang_final_norm is not None:
                 # Extract the last token if it's a sequence
@@ -1782,6 +1793,30 @@ def compare_first_response_token(
             print("    ✓ Final LayerNorm MATCH!")
         else:
             print(f"    ✗ Final LayerNorm DIFFERENT (max_diff={max_diff_fn:.6e})")
+            
+            # If we have the input (before residual), compare that with Megatron
+            if 'sglang_final_norm_input' in locals() and sglang_final_norm_input is not None:
+                print(f"\n    🔍 Comparing SGLang INPUT (before residual) vs Megatron:")
+                sg_input_flat = sglang_final_norm_input.flatten()
+                if sg_input_flat.dim() > 1:
+                    if sg_input_flat.shape[0] == 1:
+                        sg_input_flat = sg_input_flat[0]
+                    else:
+                        sg_input_flat = sg_input_flat[-1]
+                
+                if sg_input_flat.shape == megatron_fn.shape:
+                    diff_input = (sg_input_flat.float() - megatron_fn).abs()
+                    max_diff_input = diff_input.max().item()
+                    mean_diff_input = diff_input.mean().item()
+                    print(f"      Max diff: {max_diff_input:.6e}, Mean diff: {mean_diff_input:.6e}")
+                    if max_diff_input < 1e-4:
+                        print("      ✓ SGLang INPUT matches Megatron!")
+                        print("      → Difference is from residual addition in SGLang")
+                        print(f"      → Residual magnitude: "
+                              f"{((sglang_final_norm.float() - sg_input_flat.float()).abs().max().item()):.6e}")
+                    else:
+                        print(f"      ✗ SGLang INPUT also differs (max_diff={max_diff_input:.6e})")
+            
             if sglang_rms > 5.0:
                 print("    → SGLang value appears to be INPUT (before normalization)")
                 print("    → Need to check SGLang hook structure or find correct key")
