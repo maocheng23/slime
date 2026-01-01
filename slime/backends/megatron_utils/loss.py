@@ -549,7 +549,8 @@ def policy_loss_function(
             debug_logger.info(f"    max: {logit_at_pos.max().item():.6f}")
             debug_logger.info(f"    mean: {logit_at_pos.float().mean().item():.6f}")
             debug_logger.info(f"    logit for target token {first_resp_token}: {logit_at_pos[first_resp_token].item():.6f}")
-            
+            # first 10 logits
+            debug_logger.info(f"    first 10 logits: {logit_at_pos[:10].tolist()}")
             # Top-5 logits at this position
             top_vals, top_ids = torch.topk(logit_at_pos, 5)
             debug_logger.info(f"    Top-5: {list(zip(top_ids.tolist(), [f'{v:.4f}' for v in top_vals.tolist()]))}")
