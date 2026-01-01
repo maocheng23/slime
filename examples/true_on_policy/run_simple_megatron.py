@@ -9,7 +9,7 @@ assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
 MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-0.6B")
 assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
 
-MODE = os.environ.get("SLIME_SCRIPT_MODE", "normal")
+MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
 NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "1"))
@@ -37,10 +37,10 @@ def execute():
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type math "
-        f"--num-rollout {2 if MODE == 'debug_one_sample' else 3000} "
+        f"--num-rollout {1 if MODE == 'debug_one_sample' else 3000} "
         f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 32} "
         f"--n-samples-per-prompt {1 if MODE == 'debug_one_sample' else 8} "
-        f"--rollout-max-response-len {2 if MODE == 'debug_one_sample' else 1024} "
+        f"--rollout-max-response-len {20 if MODE == 'debug_one_sample' else 1024} "
         "--rollout-temperature 0.8 "
         # temp remove this to make test easier
         # "--over-sampling-batch-size 64 "
