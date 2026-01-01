@@ -51,6 +51,7 @@ def compute_logprobs_sglang(
     logits: torch.Tensor,
     temperature: float = 1.0,
     target_token_id: int | None = None,
+    verbose: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Compute log probabilities using SGLang's production sampler path.
@@ -60,17 +61,39 @@ def compute_logprobs_sglang(
         logits_div_temperature = logits.bfloat16().div(sampling_info.temperatures).bfloat16()
         logprobs_via_logsoftmax_kernel = torch.log_softmax(logits_div_temperature, dim=-1)
 
+    IMPORTANT: sampling_info.temperatures is a float32 TENSOR, not a Python float!
+    See sglang/python/sglang/srt/sampling/sampling_batch_info.py:76-78:
+        temperatures = torch.tensor([...], dtype=torch.float)  # torch.float32
+
+    The division bfloat16 / float32 produces float32 intermediate result,
+    which is then converted back to bfloat16.
+
     Args:
         logits: Raw logits tensor
         temperature: Temperature for softmax (default 1.0)
         target_token_id: If provided, return logprob for this token
+        verbose: If True, print intermediate values for debugging
 
     Returns:
         (full_logprobs, target_logprob)
     """
     # Exact SGLang production path from sampler.py lines 111-117
-    logits_div_temperature = logits.bfloat16().div(temperature).bfloat16()
+    # CRITICAL: Use float32 tensor for temperature to match SGLang's precision
+    temp_tensor = torch.tensor(temperature, dtype=torch.float32, device=logits.device)
+    logits_bf16 = logits.bfloat16()
+    logits_div_temperature = logits_bf16.div(temp_tensor).bfloat16()
     logprobs = torch.log_softmax(logits_div_temperature, dim=-1)
+
+    if verbose:
+        logits_flat = logits_div_temperature.flatten()
+        print("    [SGLang] Temperature processing:")
+        print(f"      temperature: {temperature} (as float32 tensor)")
+        print(f"      logits_bf16 dtype: {logits_bf16.dtype}")
+        print(f"      logits_div_temperature dtype: {logits_div_temperature.dtype}")
+        print(f"      logits_div_temperature first 10: {logits_flat[:10].tolist()}")
+        if target_token_id is not None:
+            target_logit = logits_flat[target_token_id].item() if logits_flat.dim() == 1 else logits_div_temperature.flatten()[target_token_id].item()
+            print(f"      logit for token {target_token_id}: {target_logit:.6f}")
 
     target_logprob = None
     if target_token_id is not None:
@@ -89,36 +112,53 @@ def compute_logprobs_megatron(
     target_token_id: int | None = None,
     temperature: float = 1.0,
     true_on_policy_mode: bool = True,
+    verbose: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Compute log probabilities using Megatron's production path.
 
-    This matches the exact code in slime/slime/utils/ppo_utils.py compute_log_probs():
+    This matches the exact code in:
+    1. slime/slime/backends/megatron_utils/loss.py get_responses() - temperature handling
+    2. slime/slime/utils/ppo_utils.py compute_log_probs() - log_softmax
 
-    When true_on_policy_mode=True (default, matches SGLang's path):
-        logits_bf16 = logits.bfloat16()
+    Megatron's true_on_policy_mode path (loss.py:66-73):
+        temp_tensor = torch.tensor(temperature, dtype=torch.float32, device=logits.device)
+        logits = logits.bfloat16().div(temp_tensor).bfloat16()
+
+    Then in ppo_utils.py compute_log_probs():
+        logits_bf16 = logits.bfloat16()  # Already bfloat16, no-op
         log_probs = torch.log_softmax(logits_bf16, dim=-1)
 
-    When true_on_policy_mode=False (original Megatron path):
-        Uses fused_vocab_parallel_cross_entropy (TP-aware, but simplified here)
-        This is the standard log_softmax in float32 for comparison purposes.
+    IMPORTANT: Temperature is applied as float32 tensor to match SGLang's precision!
 
     Args:
         logits: Raw logits tensor
         target_token_id: If provided, return logprob for this token
         temperature: Temperature for softmax (default 1.0)
         true_on_policy_mode: If True, use SGLang-compatible BF16 path
+        verbose: If True, print intermediate values for debugging
 
     Returns:
         (full_logprobs, target_logprob)
     """
     if true_on_policy_mode:
-        # Exact Megatron production path from ppo_utils.py lines 162-170
-        # This matches SGLang's path for true on-policy
+        # Exact Megatron production path from loss.py:66-73 + ppo_utils.py:162-170
+        # CRITICAL: Use float32 tensor for temperature to match SGLang's precision
+        temp_tensor = torch.tensor(temperature, dtype=torch.float32, device=logits.device)
         logits_bf16 = logits.bfloat16()
         if temperature != 1.0:
-            logits_bf16 = logits_bf16.div(temperature).bfloat16()
+            logits_bf16 = logits_bf16.div(temp_tensor).bfloat16()
         logprobs = torch.log_softmax(logits_bf16, dim=-1)
+
+        if verbose:
+            logits_flat = logits_bf16.flatten()
+            print("    [Megatron] Temperature processing (true_on_policy_mode):")
+            print(f"      temperature: {temperature} (as float32 tensor)")
+            print(f"      logits_bf16 dtype: {logits_bf16.dtype}")
+            print(f"      logits_bf16 (after temp) first 10: {logits_flat[:10].tolist()}")
+            if target_token_id is not None:
+                target_logit = logits_flat[target_token_id].item() if logits_flat.dim() == 1 else logits_bf16.flatten()[target_token_id].item()
+                print(f"      logit for token {target_token_id}: {target_logit:.6f}")
     else:
         # Original Megatron path (non-true-on-policy)
         # In production, this uses fused_vocab_parallel_cross_entropy
@@ -127,6 +167,12 @@ def compute_logprobs_megatron(
         if temperature != 1.0:
             logits_scaled = logits_scaled / temperature
         logprobs = torch.log_softmax(logits_scaled, dim=-1)
+
+        if verbose:
+            print("    [Megatron] Temperature processing (non-true_on_policy):")
+            print(f"      temperature: {temperature}")
+            print(f"      logits_scaled dtype: {logits_scaled.dtype}")
+            print(f"      logits_scaled first 10: {logits_scaled.flatten()[:10].tolist()}")
 
     target_logprob = None
     if target_token_id is not None:
@@ -144,26 +190,29 @@ def compute_logprobs_from_logits(
     logits: torch.Tensor,
     temperature: float = 1.0,
     target_token_id: int | None = None,
+    verbose: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Compute log probabilities using the unified SGLang/Megatron true-on-policy path.
 
     This is a compatibility wrapper that uses the true-on-policy formula
     which is identical for both SGLang and Megatron:
+        temp_tensor = torch.tensor(temperature, dtype=torch.float32)
         logits_bf16 = logits.bfloat16()
-        logits_div_temp = logits_bf16.div(temperature).bfloat16()
+        logits_div_temp = logits_bf16.div(temp_tensor).bfloat16()
         logprobs = torch.log_softmax(logits_div_temp, dim=-1)
 
     Args:
         logits: Raw logits tensor
         temperature: Temperature for softmax (default 1.0)
         target_token_id: If provided, return logprob for this token
+        verbose: If True, print intermediate values for debugging
 
     Returns:
         (full_logprobs, target_logprob)
     """
     # Use SGLang's formula as the unified path
-    return compute_logprobs_sglang(logits, temperature, target_token_id)
+    return compute_logprobs_sglang(logits, temperature, target_token_id, verbose=verbose)
 
 
 def print_top_logprobs(
@@ -2774,17 +2823,23 @@ def compare_single_pass_pair(
         print("\n" + "-" * 50)
         print("LOGPROBS COMPARISON (using production paths)")
         print("-" * 50)
-        print("  SGLang:   sampler.py (logits.bfloat16().div(temp).bfloat16() -> log_softmax)")
-        print("  Megatron: ppo_utils.py (logits.bfloat16() -> log_softmax)")
+        print("  SGLang:   sampler.py (logits.bfloat16().div(float32_temp_tensor).bfloat16() -> log_softmax)")
+        print("  Megatron: loss.py + ppo_utils.py (logits.bfloat16().div(float32_temp_tensor).bfloat16() -> log_softmax)")
+        print("\n  NOTE: Both use float32 tensor for temperature division to ensure precision match!")
 
         tok_id = first_response_token
+        temperature = 0.8  # Default temperature, adjust if needed
+        print(f"\n  Using temperature: {temperature}")
+
         # Use SGLang's production path for SGLang logits
+        print("\n  --- SGLang Temperature Processing ---")
         sg_logprobs, sg_target_lp = compute_logprobs_sglang(
-            sglang_logits, temperature=0.8, target_token_id=tok_id
+            sglang_logits, temperature=temperature, target_token_id=tok_id, verbose=True
         )
         # Use Megatron's production path for Megatron logits
+        print("\n  --- Megatron Temperature Processing ---")
         megatron_logprobs, megatron_target_lp = compute_logprobs_megatron(
-            megatron_logits, target_token_id=tok_id, temperature=0.8, true_on_policy_mode=True
+            megatron_logits, target_token_id=tok_id, temperature=temperature, true_on_policy_mode=True, verbose=True
         )
 
         sg_lp_flat = sg_logprobs.flatten()
@@ -3015,18 +3070,25 @@ def compare_single_pass_pair(
                 f"\n  Response token #{token_idx+1} "
                 f"logprobs comparison (using production paths):"
             )
+            # Use temperature=0.8 to match typical rollout settings
+            # Change this if your rollout uses a different temperature
+            resp_temperature = 0.8
+            print(f"    Using temperature: {resp_temperature}")
+
             # Use SGLang's production path for SGLang logits
             sg_logprobs_curr, sg_target_lp = compute_logprobs_sglang(
                 sglang_logits_curr,
-                temperature=1.0,
-                target_token_id=token_id
+                temperature=resp_temperature,
+                target_token_id=token_id,
+                verbose=(token_idx == 0),  # Only verbose for first token
             )
             # Use Megatron's production path for Megatron logits
             megatron_logprobs_curr, megatron_target_lp = compute_logprobs_megatron(
                 megatron_logits_curr,
                 target_token_id=token_id,
-                temperature=1.0,
+                temperature=resp_temperature,
                 true_on_policy_mode=True,
+                verbose=(token_idx == 0),  # Only verbose for first token
             )
 
             sg_lp_flat = sg_logprobs_curr.flatten()
