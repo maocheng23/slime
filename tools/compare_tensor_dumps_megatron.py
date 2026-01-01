@@ -2849,13 +2849,24 @@ def compare_single_pass_pair(
                     megatron_val = megatron_token_logit.float().item()
                     diff = abs(sg_val - megatron_val)
                     print(f"\n    Token #{i+1} (ID={token_id}, pos={resp_pos}):")
-                    print(f"      SGLang:    {sg_val:.8f}")
-                    print(f"      Megatron:  {megatron_val:.8f}")
-                    print(f"      Diff:      {diff:.8e}")
+                    print(f"      Logit for token {token_id}:")
+                    print(f"        SGLang:    {sg_val:.8f}")
+                    print(f"        Megatron:  {megatron_val:.8f}")
+                    print(f"        Diff:      {diff:.8e}")
                     if diff < 1e-5:
-                        print("      ✓ MATCH")
+                        print("        ✓ MATCH")
                     else:
-                        print("      ✗ DIFFER")
+                        print("        ✗ DIFFER")
+                    
+                    # Print first 10 logits values
+                    n_show = min(10, len(sg_tok), len(megatron_tok))
+                    sg_first10 = sg_tok[:n_show].float().tolist()
+                    meg_first10 = megatron_tok[:n_show].float().tolist()
+                    diff_first10 = (sg_tok[:n_show].float() - megatron_tok[:n_show].float()).abs().tolist()
+                    print(f"      First {n_show} logits values:")
+                    print(f"        SGLang:   {[f'{v:.8f}' for v in sg_first10]}")
+                    print(f"        Megatron: {[f'{v:.8f}' for v in meg_first10]}")
+                    print(f"        Diff:     {[f'{v:.8e}' for v in diff_first10]}")
                 else:
                     print(f"\n    Token #{i+1} (ID={token_id}): Index out of bounds")
             else:
@@ -2937,13 +2948,26 @@ def compare_single_pass_pair(
                     megatron_lp_val = megatron_target_lp.float().item()
                     diff = abs(sg_lp_val - megatron_lp_val)
                     print(f"\n    Token #{i+1} (ID={token_id}, pos={resp_pos}):")
-                    print(f"      SGLang (production):   {sg_lp_val:.8f}")
-                    print(f"      Megatron (production): {megatron_lp_val:.8f}")
-                    print(f"      Diff:                  {diff:.8e}")
+                    print(f"      Logprob for token {token_id}:")
+                    print(f"        SGLang (production):   {sg_lp_val:.8f}")
+                    print(f"        Megatron (production): {megatron_lp_val:.8f}")
+                    print(f"        Diff:                  {diff:.8e}")
                     if diff < 1e-5:
-                        print("      ✓ Logprobs MATCH!")
+                        print("        ✓ Logprobs MATCH!")
                     else:
-                        print("      ✗ Logprobs DIFFER!")
+                        print("        ✗ Logprobs DIFFER!")
+                    
+                    # Print first 10 logprobs values
+                    sg_lp_flat = sg_logprobs_curr.flatten()
+                    megatron_lp_flat = megatron_logprobs_curr.flatten()
+                    n_show = min(10, len(sg_lp_flat), len(megatron_lp_flat))
+                    sg_lp_first10 = sg_lp_flat[:n_show].float().tolist()
+                    meg_lp_first10 = megatron_lp_flat[:n_show].float().tolist()
+                    diff_lp_first10 = (sg_lp_flat[:n_show].float() - megatron_lp_flat[:n_show].float()).abs().tolist()
+                    print(f"      First {n_show} logprobs values:")
+                    print(f"        SGLang:   {[f'{v:.8f}' for v in sg_lp_first10]}")
+                    print(f"        Megatron: {[f'{v:.8f}' for v in meg_lp_first10]}")
+                    print(f"        Diff:     {[f'{v:.8e}' for v in diff_lp_first10]}")
                 else:
                     print(f"\n    Token #{i+1} (ID={token_id}): Could not extract logprob")
             else:
