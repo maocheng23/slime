@@ -289,7 +289,11 @@ class MegatronTensorDumper:
         logger.info(f"[MegatronTensorDumper] Registered {hooks_registered} hooks on {len(layers)} layers")
 
     def _create_named_hook(self, name: str):
-        """Create a forward hook for a named module."""
+        """Create a forward hook for a named module.
+        
+        Preserves original dtype instead of converting to bfloat16.
+        This ensures accurate comparison with SGLang dumps.
+        """
 
         def hook(module, input_tuple, output):
             if isinstance(output, tuple):
@@ -298,7 +302,8 @@ class MegatronTensorDumper:
                 out_tensor = output
 
             if isinstance(out_tensor, torch.Tensor):
-                self.add_tensor(name, out_tensor.bfloat16())
+                # Preserve original dtype instead of converting to bfloat16
+                self.add_tensor(name, out_tensor.cpu())
 
         return hook
 
@@ -468,14 +473,19 @@ class MegatronTensorDumper:
                 )
 
     def _create_layer_hook(self, layer_idx: int):
-        """Create a forward hook for a transformer layer."""
+        """Create a forward hook for a transformer layer.
+        
+        Preserves original dtype instead of converting to bfloat16.
+        This ensures accurate comparison with SGLang dumps.
+        """
 
         def hook(module, input_tuple, output):
             # Input is typically (hidden_states, attention_mask, ...)
             if isinstance(input_tuple, tuple) and len(input_tuple) > 0:
                 hidden_states = input_tuple[0]
                 if isinstance(hidden_states, torch.Tensor):
-                    self.add_tensor(f"layer_{layer_idx}_input", hidden_states.bfloat16())
+                    # Preserve original dtype instead of converting to bfloat16
+                    self.add_tensor(f"layer_{layer_idx}_input", hidden_states.cpu())
 
             # Output is typically (hidden_states, ...) or just hidden_states
             if isinstance(output, tuple):
@@ -484,7 +494,8 @@ class MegatronTensorDumper:
                 hidden_states = output
 
             if isinstance(hidden_states, torch.Tensor):
-                self.add_tensor(f"layer_{layer_idx}_output", hidden_states.bfloat16())
+                # Preserve original dtype instead of converting to bfloat16
+                self.add_tensor(f"layer_{layer_idx}_output", hidden_states.cpu())
 
         return hook
 
@@ -546,8 +557,8 @@ class MegatronTensorDumper:
             response_len = seq_len - prompt_len
             self._current_tensors["response_len_from_logits"] = torch.tensor([response_len])
             
-            # Save full logits tensor
-            self._current_tensors["logits_full"] = logits.cpu().bfloat16()
+            # Save full logits tensor (preserve original dtype)
+            self._current_tensors["logits_full"] = logits.cpu()
             
             # Save logits at EACH response position for decode comparison
             response_positions = []
@@ -556,10 +567,10 @@ class MegatronTensorDumper:
                 if pos < seq_len:
                     if is_batch_first:
                         # [batch, seq, vocab] -> take [0, pos, :]
-                        pos_logits = logits[0, pos:pos+1, :].cpu().bfloat16()
+                        pos_logits = logits[0, pos:pos+1, :].cpu()
                     else:
                         # [seq, batch, vocab] -> take [pos, 0, :]
-                        pos_logits = logits[pos:pos+1, 0, :].cpu().bfloat16()
+                        pos_logits = logits[pos:pos+1, 0, :].cpu()
                     self._current_tensors[f"logits_pos_{pos}"] = pos_logits
                     response_positions.append(pos)
             
@@ -568,15 +579,15 @@ class MegatronTensorDumper:
             # For prefill comparison: logits at prompt_len - 1
             if prompt_len > 0 and prompt_len - 1 < seq_len:
                 if is_batch_first:
-                    prompt_end_logits = logits[0, prompt_len-1:prompt_len, :].cpu().bfloat16()
+                    prompt_end_logits = logits[0, prompt_len-1:prompt_len, :].cpu()
                 else:
-                    prompt_end_logits = logits[prompt_len-1:prompt_len, 0, :].cpu().bfloat16()
+                    prompt_end_logits = logits[prompt_len-1:prompt_len, 0, :].cpu()
                 self._current_tensors["logits_at_prompt_end"] = prompt_end_logits
                 self._current_tensors["logits_prompt_end_pos"] = torch.tensor([prompt_len - 1])
             
             # Default position for backwards compatibility
             target_pos = prompt_len if prompt_len < seq_len else 0
-            self._current_tensors["logits"] = logits.cpu().bfloat16()
+            self._current_tensors["logits"] = logits.cpu()
             self._current_tensors["logits_pos"] = torch.tensor([target_pos])
             
             logger.info(f"[MegatronTensorDumper] Saved logits: seq_len={seq_len}, "
@@ -613,15 +624,16 @@ class MegatronTensorDumper:
                 self._current_tensors["logits_at_prompt_end"] = logits[prompt_len-1:prompt_len, :].cpu().bfloat16()
                 self._current_tensors["logits_prompt_end_pos"] = torch.tensor([prompt_len - 1])
             
-            # Default position
+            # Default position (preserve original dtype)
             target_pos = prompt_len if prompt_len < seq_len else 0
-            self._current_tensors["logits"] = logits[target_pos:target_pos+1, :].cpu().bfloat16()
+            self._current_tensors["logits"] = logits[target_pos:target_pos+1, :].cpu()
             self._current_tensors["logits_pos"] = torch.tensor([target_pos])
             
             logger.info(f"[MegatronTensorDumper] Saved logits: seq_len={seq_len}, "
                        f"prompt_len={prompt_len}, response_len={response_len}, vocab_size={vocab_size}")
         else:
-            self._current_tensors["logits"] = logits.cpu().bfloat16()
+            # Preserve original dtype instead of converting to bfloat16
+            self._current_tensors["logits"] = logits.cpu()
 
     def add_logprobs(self, logprobs: torch.Tensor) -> None:
         """Record log probabilities for debugging.
@@ -645,10 +657,12 @@ class MegatronTensorDumper:
             # [seq_len - 1] (shifted)
             seq_len = logprobs.shape[0]
             self._current_tensors["logprobs_seq_len"] = torch.tensor([seq_len])
-            self._current_tensors["logprobs_full"] = logprobs.cpu().bfloat16()
+            # Preserve original dtype instead of converting to bfloat16
+            self._current_tensors["logprobs_full"] = logprobs.cpu()
 
             if first_response_idx < seq_len:
-                first_resp_lp = logprobs[first_response_idx].cpu().bfloat16()
+                # Preserve original dtype instead of converting to bfloat16
+                first_resp_lp = logprobs[first_response_idx].cpu()
                 self._current_tensors["logprobs"] = first_resp_lp.unsqueeze(0)
                 self._current_tensors["logprobs_extracted_idx"] = torch.tensor(
                     [first_response_idx]
@@ -658,13 +672,14 @@ class MegatronTensorDumper:
                     f"idx={first_response_idx}, value={first_resp_lp.item():.6f}"
                 )
             else:
-                self._current_tensors["logprobs"] = logprobs[0:1].cpu().bfloat16()
+                # Preserve original dtype instead of converting to bfloat16
+                self._current_tensors["logprobs"] = logprobs[0:1].cpu()
 
-            # Save first few response logprobs
+            # Save first few response logprobs (preserve original dtype)
             resp_end = min(seq_len, first_response_idx + 5)
             if first_response_idx < seq_len:
                 self._current_tensors["response_logprobs_first5"] = (
-                    logprobs[first_response_idx:resp_end].cpu().bfloat16()
+                    logprobs[first_response_idx:resp_end].cpu()
                 )
 
         elif logprobs.dim() == 2:
@@ -674,7 +689,8 @@ class MegatronTensorDumper:
                 # [seq_len, 1] - Megatron layout
                 seq_len = logprobs.shape[0]
                 self._current_tensors["logprobs_seq_len"] = torch.tensor([seq_len])
-                self._current_tensors["logprobs_full"] = logprobs.cpu().bfloat16()
+                # Preserve original dtype instead of converting to bfloat16
+                self._current_tensors["logprobs_full"] = logprobs.cpu()
 
                 if first_response_idx < seq_len:
                     self._current_tensors["logprobs"] = (
@@ -686,7 +702,8 @@ class MegatronTensorDumper:
                 # [1, seq_len] or [batch, seq_len]
                 seq_len = logprobs.shape[1]
                 self._current_tensors["logprobs_seq_len"] = torch.tensor([seq_len])
-                self._current_tensors["logprobs_full"] = logprobs.cpu().bfloat16()
+                # Preserve original dtype instead of converting to bfloat16
+                self._current_tensors["logprobs_full"] = logprobs.cpu()
 
                 if first_response_idx < seq_len:
                     self._current_tensors["logprobs"] = (
@@ -695,10 +712,15 @@ class MegatronTensorDumper:
                 else:
                     self._current_tensors["logprobs"] = logprobs[:, 0:1].cpu()
         else:
-            self._current_tensors["logprobs"] = logprobs.cpu().bfloat16()
+            # Preserve original dtype instead of converting to bfloat16
+            self._current_tensors["logprobs"] = logprobs.cpu()
 
     def _create_sublayer_hook(self, layer_idx: int, sublayer_name: str):
-        """Create a forward hook for a sublayer (attention or MLP)."""
+        """Create a forward hook for a sublayer (attention or MLP).
+        
+        Preserves original dtype instead of converting to bfloat16.
+        This ensures accurate comparison with SGLang dumps.
+        """
 
         def hook(module, input_tuple, output):
             if isinstance(output, tuple):
@@ -707,7 +729,8 @@ class MegatronTensorDumper:
                 out_tensor = output
 
             if isinstance(out_tensor, torch.Tensor):
-                self.add_tensor(f"layer_{layer_idx}_{sublayer_name}_output", out_tensor.bfloat16())
+                # Preserve original dtype instead of converting to bfloat16
+                self.add_tensor(f"layer_{layer_idx}_{sublayer_name}_output", out_tensor.cpu())
 
         return hook
 
