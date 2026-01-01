@@ -2771,132 +2771,197 @@ def compare_first_response_token(
                 print("     - log_probs tensor is empty/wrong shape")
 
     # =========================================================================
-    # 5. Detailed logprob comparison at TWO positions
+    # 5. Detailed logprob comparison at FIVE positions
     # =========================================================================
     print("\n" + "=" * 70)
-    print("DETAILED LOGPROBS: FIRST AND SECOND RESPONSE TOKENS")
+    print("DETAILED LOGPROBS: FIRST FIVE RESPONSE TOKENS")
     print("=" * 70)
     print("\nPosition Mapping:")
     print("  SGLang decode at first_position=X predicts token at X")
     print("  Megatron logits_pos_N predicts token at N+1")
-    print("\nComparing predictions for:")
-    second_resp_pos = first_response_pos + 1
-    p1 = first_response_pos
-    p2 = second_resp_pos
-    print(f"  1. First response token (pos {p1}):")
-    print(f"     Megatron pos {comparison_pos} vs SGLang first_pos {p1}")
-    print(f"  2. Second response token (pos {p2}):")
-    print(f"     Megatron pos {p1} vs SGLang first_pos {p2}")
+    print("\nComparing predictions for first 5 response tokens:")
 
-    # Get tokens for both positions
-    second_response_token = None
+    # Get tokens for all positions
     input_ids_key = megatron_info.get("input_ids_key", "megatron_input_ids")
+    response_tokens = []
     if input_ids_key in megatron_tensors:
         input_ids = megatron_tensors[input_ids_key].flatten()
-        if second_resp_pos < len(input_ids):
-            second_response_token = input_ids[second_resp_pos].item()
+        for i in range(5):
+            pos = first_response_pos + i
+            if pos < len(input_ids):
+                token_id = input_ids[pos].item()
+                response_tokens.append((pos, token_id))
+                if i == 0:
+                    megatron_pos = comparison_pos + i
+                else:
+                    megatron_pos = first_response_pos + i - 1
+                print(
+                    f"  {i+1}. Response token at pos {pos} "
+                    f"(token_id={token_id}):"
+                )
+                print(
+                    f"     Megatron pos {megatron_pos} vs "
+                    f"SGLang first_pos {pos}"
+                )
 
-    # =========================================================
-    # FIRST RESPONSE TOKEN (position prompt_len)
-    # =========================================================
-    print("\n" + "-" * 50)
-    print(f"FIRST RESPONSE TOKEN (position {first_response_pos})")
-    print(f"Actual token: {first_response_token}")
-    print("-" * 50)
+    # Process each of the first 5 response tokens
+    for token_idx, (resp_pos, token_id) in enumerate(response_tokens):
+        print("\n" + "-" * 50)
+        print(f"RESPONSE TOKEN #{token_idx+1} (position {resp_pos})")
+        print(f"Actual token: {token_id}")
+        print("-" * 50)
 
-    # SGLang: use decode pass at first_position = prompt_len
-    # (We already loaded this as sglang_logits above)
-    if sglang_logits is not None:
-        print_top_logprobs(
-            sglang_logits,
-            actual_token_id=first_response_token,
-            label=f"SGLang (decode, first_pos={first_response_pos})",
-            top_k=10,
-        )
-
-    # Megatron: use logits_pos_{prompt_len - 1}
-    if megatron_logits is not None:
-        print_top_logprobs(
-            megatron_logits,
-            actual_token_id=first_response_token,
-            label=f"Megatron (logits_pos_{comparison_pos})",
-            top_k=10,
-        )
-
-    # =========================================================
-    # SECOND RESPONSE TOKEN (position prompt_len + 1)
-    # =========================================================
-    print("\n" + "-" * 50)
-    print(f"SECOND RESPONSE TOKEN (position {second_resp_pos})")
-    print(f"Actual token: {second_response_token}")
-    print("-" * 50)
-
-    # SGLang: use decode pass at first_position = prompt_len + 1
-    sglang_decode2 = find_sglang_decode_pass(sglang_dir, second_resp_pos)
-    sglang_logits2 = None
-    if sglang_decode2 is not None:
-        decode2_id, decode2_path = sglang_decode2
-        decode2_tensors = torch.load(decode2_path, map_location="cpu")
-        if "logits_processor" in decode2_tensors:
-            sglang_logits2 = decode2_tensors["logits_processor"]
-            print(f"\n  SGLang: decode pass {decode2_id} "
-                  f"(first_pos={second_resp_pos})")
+        # Determine Megatron position for this token
+        if token_idx == 0:
+            # First token: use comparison_pos (prompt_len - 1)
+            megatron_pos = comparison_pos
         else:
-            print(f"\n  SGLang pass {decode2_id} has no logits_processor")
-    else:
-        print(f"\n  No SGLang decode pass for pos {second_resp_pos}")
-        passes = list_all_passes(sglang_dir)
-        decode_passes = []
-        for pid, ppath in passes:
-            info = get_sglang_pass_info(ppath)
-            if info.get("is_decode", False):
-                decode_passes.append((pid, info.get("first_position", "?")))
-        if decode_passes:
-            print(f"  Available decode passes: {decode_passes[:5]}...")
+            # Subsequent tokens: use previous response position
+            megatron_pos = first_response_pos + token_idx - 1
 
-    if sglang_logits2 is not None:
-        print_top_logprobs(
-            sglang_logits2,
-            actual_token_id=second_response_token,
-            label=f"SGLang (decode, first_pos={second_resp_pos})",
-            top_k=10,
-        )
-
-    # Megatron: use logits_pos_{prompt_len} to predict position prompt_len + 1
-    megatron_logits2 = None
-    logits_key2 = f"logits_pos_{first_response_pos}"
-    if logits_key2 in megatron_tensors:
-        megatron_logits2 = megatron_tensors[logits_key2]
-        print(f"\n  Megatron: logits_pos_{first_response_pos}")
-    else:
-        print(f"\n  Megatron does not have {logits_key2}")
-        avail = [k for k in megatron_tensors.keys() if k.startswith("logits_pos_")]
-        if avail:
-            print(f"  Available: {avail[:5]}...")
-
-    if megatron_logits2 is not None:
-        print_top_logprobs(
-            megatron_logits2,
-            actual_token_id=second_response_token,
-            label=f"Megatron (logits_pos_{first_response_pos})",
-            top_k=10,
-        )
-
-    # Compare second response token predictions
-    if sglang_logits2 is not None and megatron_logits2 is not None:
-        print("\n  Second response token comparison:")
-        sg_flat = sglang_logits2.flatten()
-        megatron_flat = megatron_logits2.flatten()
-        if sg_flat.shape == megatron_flat.shape:
-            stats = compute_diff_stats(sg_flat, megatron_flat)
-            print(f"    Max diff:  {stats['max_diff']:.8e}")
-            print(f"    Mean diff: {stats['mean_diff']:.8e}")
-            if stats["max_diff"] < 1e-5:
-                print("    ✓ Second response token logits MATCH!")
+        # =========================================================
+        # Get SGLang logits for this position
+        # =========================================================
+        sglang_logits_curr = None
+        if token_idx == 0:
+            # First token: use already loaded sglang_logits
+            sglang_logits_curr = sglang_logits
+        else:
+            # Subsequent tokens: load from decode pass
+            sglang_decode_curr = find_sglang_decode_pass(sglang_dir, resp_pos)
+            if sglang_decode_curr is not None:
+                decode_id, decode_path = sglang_decode_curr
+                decode_tensors = torch.load(decode_path, map_location="cpu")
+                if "logits_processor" in decode_tensors:
+                    sglang_logits_curr = decode_tensors["logits_processor"]
+                    print(f"\n  SGLang: decode pass {decode_id} "
+                          f"(first_pos={resp_pos})")
+                else:
+                    print(f"\n  SGLang pass {decode_id} has no logits_processor")
             else:
-                print("    ✗ Second response token logits DIFFER!")
+                print(f"\n  No SGLang decode pass for pos {resp_pos}")
+                if token_idx == 1:  # Only show available passes once
+                    passes = list_all_passes(sglang_dir)
+                    decode_passes = []
+                    for pid, ppath in passes:
+                        info = get_sglang_pass_info(ppath)
+                        if info.get("is_decode", False):
+                            decode_passes.append((pid, info.get("first_position", "?")))
+                    if decode_passes:
+                        print(f"  Available decode passes: {decode_passes[:10]}...")
+
+        # =========================================================
+        # Get Megatron logits for this position
+        # =========================================================
+        megatron_logits_curr = None
+        logits_key_curr = f"logits_pos_{megatron_pos}"
+        if logits_key_curr in megatron_tensors:
+            megatron_logits_curr = megatron_tensors[logits_key_curr]
+            print(f"\n  Megatron: {logits_key_curr}")
         else:
-            print(f"    Shape mismatch: {sg_flat.shape} vs {megatron_flat.shape}")
+            print(f"\n  Megatron does not have {logits_key_curr}")
+            if token_idx == 1:  # Only show available keys once
+                avail = [
+                    k for k in megatron_tensors.keys()
+                    if k.startswith("logits_pos_")
+                ]
+                if avail:
+                    print(f"  Available: {avail[:10]}...")
+
+        # =========================================================
+        # Print top logprobs for SGLang
+        # =========================================================
+        if sglang_logits_curr is not None:
+            print_top_logprobs(
+                sglang_logits_curr,
+                actual_token_id=token_id,
+                label=f"SGLang (decode, first_pos={resp_pos})",
+                top_k=10,
+            )
+
+        # =========================================================
+        # Print top logprobs for Megatron
+        # =========================================================
+        if megatron_logits_curr is not None:
+            print_top_logprobs(
+                megatron_logits_curr,
+                actual_token_id=token_id,
+                label=f"Megatron (logits_pos_{megatron_pos})",
+                top_k=10,
+            )
+
+        # =========================================================
+        # Compare logits
+        # =========================================================
+        if sglang_logits_curr is not None and megatron_logits_curr is not None:
+            print(f"\n  Response token #{token_idx+1} logits comparison:")
+            sg_flat = sglang_logits_curr.flatten()
+            megatron_flat = megatron_logits_curr.flatten()
+            if sg_flat.shape == megatron_flat.shape:
+                stats = compute_diff_stats(sg_flat, megatron_flat)
+                print(f"    Max diff:  {stats['max_diff']:.8e}")
+                print(f"    Mean diff: {stats['mean_diff']:.8e}")
+                if stats["max_diff"] < 1e-5:
+                    print(
+                        f"    ✓ Response token #{token_idx+1} "
+                        f"logits MATCH!"
+                    )
+                else:
+                    print(
+                        f"    ✗ Response token #{token_idx+1} "
+                        f"logits DIFFER!"
+                    )
+            else:
+                print(f"    Shape mismatch: {sg_flat.shape} vs {megatron_flat.shape}")
+
+        # =========================================================
+        # Compare logprobs (computed from logits)
+        # =========================================================
+        if (sglang_logits_curr is not None and
+                megatron_logits_curr is not None):
+            print(
+                f"\n  Response token #{token_idx+1} "
+                f"logprobs comparison:"
+            )
+            sg_logprobs_curr, sg_target_lp = compute_logprobs_from_logits(
+                sglang_logits_curr,
+                temperature=1.0,
+                target_token_id=token_id
+            )
+            megatron_logprobs_curr, megatron_target_lp = (
+                compute_logprobs_from_logits(
+                    megatron_logits_curr,
+                    temperature=1.0,
+                    target_token_id=token_id
+                )
+            )
+
+            sg_lp_flat = sg_logprobs_curr.flatten()
+            megatron_lp_flat = megatron_logprobs_curr.flatten()
+
+            if sg_lp_flat.shape == megatron_lp_flat.shape:
+                lp_stats = compute_diff_stats(sg_lp_flat, megatron_lp_flat)
+                print(f"    Max diff:  {lp_stats['max_diff']:.8e}")
+                print(f"    Mean diff: {lp_stats['mean_diff']:.8e}")
+
+                if sg_target_lp is not None and megatron_target_lp is not None:
+                    sg_lp_val = sg_target_lp.float().item()
+                    megatron_lp_val = megatron_target_lp.float().item()
+                    diff = abs(sg_lp_val - megatron_lp_val)
+                    print(f"    Logprob for token {token_id}:")
+                    print(f"      SGLang:  {sg_lp_val:.8f}")
+                    print(f"      Megatron: {megatron_lp_val:.8f}")
+                    print(f"      Diff:    {diff:.8e}")
+                    if diff < 1e-5:
+                        print(
+                            f"      ✓ Response token #{token_idx+1} "
+                            f"logprobs MATCH!"
+                        )
+                    else:
+                        print(
+                            f"      ✗ Response token #{token_idx+1} "
+                            f"logprobs DIFFER!"
+                        )
 
     # =========================================================================
     # SUMMARY
