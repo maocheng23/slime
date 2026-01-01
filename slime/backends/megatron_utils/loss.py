@@ -596,10 +596,45 @@ def policy_loss_function(
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()
 
+    # Compare rollout vs. train log probs when they originate from different stages.
+    # NOTE: In true_on_policy_mode, this comparison measures how much the model weights
+    # have changed between rollout and training. If weights haven't changed, this should be ~0.
+    # The difference increases as training progresses because model weights are updated.
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
+        # old_log_probs: computed with CURRENT training weights (via get_log_probs_and_entropy)
+        #   - If use_rollout_logprobs=False: old_log_probs = batch["log_probs"] (recomputed)
+        #   - If use_rollout_logprobs=True: old_log_probs = batch["rollout_log_probs"] (from rollout)
+        # rollout_log_probs: computed with ROLLOUT-TIME weights (from SGLang)
+        #   - Always from batch["rollout_log_probs"] (computed during rollout phase)
+        #
+        # Both should have the same length (sum(response_lengths)) and correspond to the same tokens.
+        # In true_on_policy_mode, if weights haven't changed, these should match exactly.
+        # The difference indicates how much the model has changed between rollout and training.
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
+        
+        # Verify lengths match (sanity check)
+        if old_log_probs.shape[0] != rollout_log_probs.shape[0]:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(
+                f"Length mismatch: old_log_probs.shape={old_log_probs.shape}, "
+                f"rollout_log_probs.shape={rollout_log_probs.shape}. "
+                f"This indicates a bug in data processing or unpacking."
+            )
+        
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        
+        # In true_on_policy_mode, a significant difference means model weights changed,
+        # which breaks the true on-policy assumption. This is expected as training progresses.
+        if getattr(args, "true_on_policy_mode", False) and train_rollout_logprob_abs_diff > 1e-4:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"true_on_policy_mode: train_rollout_logprob_abs_diff={train_rollout_logprob_abs_diff:.6f} "
+                f"is significant (>1e-4). This indicates model weights changed between rollout and training, "
+                f"which is expected as training progresses but breaks the strict true on-policy assumption."
+            )
 
     reported_loss = {
         "loss": loss.clone().detach(),
