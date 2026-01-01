@@ -173,8 +173,15 @@ def get_log_probs_and_entropy(
         if debug_logprob and sample_idx == 0:
             import logging
             debug_logger = logging.getLogger(__name__)
+            # Get current pass ID if tensor dumping is enabled
+            pass_id = None
+            if os.environ.get("MEGATRON_TENSOR_DUMP_DIR", ""):
+                from slime.backends.megatron_utils.debug_tensor_dump import get_megatron_tensor_dumper
+                dumper = get_megatron_tensor_dumper()
+                if dumper is not None:
+                    pass_id = dumper._forward_pass_id
             debug_logger.info("-" * 60)
-            debug_logger.info("DEBUG: get_log_probs_and_entropy - Sample 0 details")
+            debug_logger.info(f"DEBUG: get_log_probs_and_entropy - Sample 0 details (Pass {pass_id if pass_id is not None else 'N/A'})")
             debug_logger.info("-" * 60)
             debug_logger.info(f"  logits_chunk shape: {logits_chunk.shape}, dtype: {logits_chunk.dtype}")
             debug_logger.info(f"  tokens_chunk shape: {tokens_chunk.shape}")

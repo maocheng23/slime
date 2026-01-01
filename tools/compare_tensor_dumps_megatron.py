@@ -2780,11 +2780,11 @@ def compare_single_pass_pair(
         tok_id = first_response_token
         # Use SGLang's production path for SGLang logits
         sg_logprobs, sg_target_lp = compute_logprobs_sglang(
-            sglang_logits, temperature=1.0, target_token_id=tok_id
+            sglang_logits, temperature=0.8, target_token_id=tok_id
         )
         # Use Megatron's production path for Megatron logits
         megatron_logprobs, megatron_target_lp = compute_logprobs_megatron(
-            megatron_logits, target_token_id=tok_id, temperature=1.0, true_on_policy_mode=True
+            megatron_logits, target_token_id=tok_id, temperature=0.8, true_on_policy_mode=True
         )
 
         sg_lp_flat = sg_logprobs.flatten()
