@@ -204,6 +204,35 @@ class MegatronTrainRayActor(TrainRayActor):
                 for mm_dict in rollout_data["multimodal_inputs"]
             ]
         if "rollout_log_probs" in rollout_data:
+            # Debug logging for rollout_log_probs from SGLang
+            import os
+            if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+                import logging
+                debug_logger = logging.getLogger(__name__)
+                debug_logger.info("-" * 60)
+                debug_logger.info("DEBUG: Processing rollout_log_probs from SGLang")
+                debug_logger.info("-" * 60)
+                for i, (log_prob, total_len, resp_len) in enumerate(zip(
+                    rollout_data["rollout_log_probs"][:3],  # First 3 samples
+                    rollout_data["total_lengths"][:3],
+                    rollout_data["response_lengths"][:3],
+                )):
+                    debug_logger.info(f"  Sample {i}:")
+                    debug_logger.info(f"    total_length: {total_len}, response_length: {resp_len}")
+                    debug_logger.info(f"    rollout_log_probs len: {len(log_prob)}")
+                    if len(log_prob) > 0:
+                        debug_logger.info(f"    rollout_log_probs first 10: {log_prob[:10]}")
+                        debug_logger.info(f"    rollout_log_probs dtype: {type(log_prob[0])}")
+                    # Also log the tokens for verification
+                    if "tokens" in rollout_data:
+                        tokens = rollout_data["tokens"][i]
+                        prompt_len = total_len - resp_len
+                        debug_logger.info(f"    prompt_len: {prompt_len}")
+                        if hasattr(tokens, 'tolist'):
+                            debug_logger.info(f"    response tokens first 10: {tokens[prompt_len:prompt_len+10].tolist()}")
+                        else:
+                            debug_logger.info(f"    response tokens first 10: {tokens[prompt_len:prompt_len+10]}")
+            
             rollout_data["rollout_log_probs"] = [
                 torch.tensor(
                     slice_log_prob_with_cp(log_prob, total_length, response_length),

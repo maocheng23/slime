@@ -131,6 +131,12 @@ def get_log_probs_and_entropy(
     assert non_loss_data
     log_probs_list = []
     entropy_list = []
+    
+    # Debug logging for logprob computation
+    import os
+    debug_logprob = os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1"
+    sample_idx = 0
+    
     for logits_chunk, tokens_chunk in get_responses(
         logits,
         args=args,
@@ -146,12 +152,27 @@ def get_log_probs_and_entropy(
             chunk_size=args.log_probs_chunk_size,
             true_on_policy_mode=getattr(args, "true_on_policy_mode", False),
         )
+        
+        # Debug: print detailed info for first sample
+        if debug_logprob and sample_idx == 0:
+            import logging
+            debug_logger = logging.getLogger(__name__)
+            debug_logger.info("-" * 60)
+            debug_logger.info("DEBUG: get_log_probs_and_entropy - Sample 0 details")
+            debug_logger.info("-" * 60)
+            debug_logger.info(f"  logits_chunk shape: {logits_chunk.shape}, dtype: {logits_chunk.dtype}")
+            debug_logger.info(f"  tokens_chunk shape: {tokens_chunk.shape}")
+            debug_logger.info(f"  tokens_chunk first 10: {tokens_chunk[:10].tolist()}")
+            debug_logger.info(f"  log_prob shape: {log_prob.shape}")
+            debug_logger.info(f"  log_prob first 10: {log_prob[:10].squeeze(-1).tolist()}")
+            debug_logger.info(f"  temperature used: {args.rollout_temperature}")
+            debug_logger.info(f"  true_on_policy_mode: {getattr(args, 'true_on_policy_mode', False)}")
+        sample_idx += 1
 
         log_probs_list.append(log_prob.squeeze(-1))
         entropy_list.append(entropy)
         
         # Save logprobs for debugging (save first sample's first response token)
-        import os
         if os.environ.get("MEGATRON_TENSOR_DUMP_DIR", "") and len(log_probs_list) == 1:
             from slime.backends.megatron_utils.debug_tensor_dump import get_megatron_tensor_dumper
             dumper = get_megatron_tensor_dumper()
@@ -635,6 +656,72 @@ def policy_loss_function(
                 f"is significant (>1e-4). This indicates model weights changed between rollout and training, "
                 f"which is expected as training progresses but breaks the strict true on-policy assumption."
             )
+        
+        # Debug logging for true on-policy mode
+        import os
+        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+            import logging
+            debug_logger = logging.getLogger(__name__)
+            debug_logger.info("=" * 80)
+            debug_logger.info("DEBUG: LOGPROB COMPARISON (train vs rollout)")
+            debug_logger.info("=" * 80)
+            debug_logger.info(f"  old_log_probs (Megatron computed): shape={old_log_probs.shape}, dtype={old_log_probs.dtype}")
+            debug_logger.info(f"  rollout_log_probs (SGLang computed): shape={rollout_log_probs.shape}, dtype={rollout_log_probs.dtype}")
+            debug_logger.info(f"  temperature: {args.rollout_temperature}")
+            debug_logger.info(f"  true_on_policy_mode: {getattr(args, 'true_on_policy_mode', False)}")
+            debug_logger.info(f"  use_rollout_logprobs: {args.use_rollout_logprobs}")
+            
+            # Print per-sample info
+            debug_logger.info("\n  Per-sample info:")
+            debug_logger.info(f"    response_lengths: {response_lengths[:5]}... (total {len(response_lengths)} samples)")
+            debug_logger.info(f"    total_lengths: {total_lengths[:5]}...")
+            
+            # Print first few logprobs from each sample
+            debug_logger.info("\n  First sample comparison (first 10 tokens):")
+            if len(batch["rollout_log_probs"]) > 0:
+                sample_rollout = batch["rollout_log_probs"][0]
+                sample_train = log_probs[0] if isinstance(log_probs, list) else log_probs[:response_lengths[0]]
+                n_show = min(10, len(sample_rollout), len(sample_train))
+                debug_logger.info(f"    SGLang rollout logprobs[0:{n_show}]: {sample_rollout[:n_show].tolist()}")
+                debug_logger.info(f"    Megatron train logprobs[0:{n_show}]: {sample_train[:n_show].tolist()}")
+                diff = (sample_train[:n_show] - sample_rollout[:n_show]).abs()
+                debug_logger.info(f"    Abs diff[0:{n_show}]: {diff.tolist()}")
+                debug_logger.info(f"    Max diff in sample 0: {(sample_train - sample_rollout).abs().max().item():.8f}")
+            
+            # Print overall stats
+            abs_diff = (old_log_probs - rollout_log_probs).abs()
+            debug_logger.info("\n  Overall stats:")
+            debug_logger.info(f"    Mean abs diff: {abs_diff.mean().item():.8f}")
+            debug_logger.info(f"    Max abs diff: {abs_diff.max().item():.8f}")
+            debug_logger.info(f"    Std abs diff: {abs_diff.std().item():.8f}")
+            
+            # Find and print the worst mismatches
+            if abs_diff.numel() > 0:
+                max_idx = abs_diff.argmax().item()
+                debug_logger.info(f"\n  Worst mismatch at index {max_idx}:")
+                debug_logger.info(f"    Megatron: {old_log_probs[max_idx].item():.8f}")
+                debug_logger.info(f"    SGLang:   {rollout_log_probs[max_idx].item():.8f}")
+                debug_logger.info(f"    Diff:     {abs_diff[max_idx].item():.8f}")
+            
+            # Check which sample the worst mismatch belongs to
+            cumsum = 0
+            for i, resp_len in enumerate(response_lengths):
+                if cumsum + resp_len > max_idx:
+                    debug_logger.info(f"    Sample index: {i}, position within sample: {max_idx - cumsum}")
+                    # Print tokens around this position
+                    if "unconcat_tokens" in batch:
+                        tokens = batch["unconcat_tokens"][i]
+                        pos_in_sample = max_idx - cumsum
+                        prompt_len = total_lengths[i] - resp_len
+                        token_pos = prompt_len + pos_in_sample
+                        if token_pos < len(tokens):
+                            debug_logger.info(f"    Token at this position: {tokens[token_pos].item()}")
+                            if token_pos > 0:
+                                debug_logger.info(f"    Previous token (input to model): {tokens[token_pos - 1].item()}")
+                    break
+                cumsum += resp_len
+            
+            debug_logger.info("=" * 80)
 
     reported_loss = {
         "loss": loss.clone().detach(),

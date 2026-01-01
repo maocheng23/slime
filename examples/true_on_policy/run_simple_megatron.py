@@ -168,6 +168,9 @@ def execute():
         f"{true_on_policy_args} "
     )
 
+    # Enable debug logging for logprob comparison (set via env var)
+    debug_logprob_diff = os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0")
+    
     U.execute_train(
         train_args=train_args,
         num_gpus_per_node=NUM_GPUS,
@@ -180,6 +183,9 @@ def execute():
             # Automatically includes last layer (28) - see debug_tensor_dump.py
             "MEGATRON_TENSOR_DUMP_DIR": "/tmp/megatron_tensor_dump" if MODE == "debug_one_sample" else "",
             "MEGATRON_TENSOR_DUMP_LAYERS": "0,1,2" if MODE == "debug_one_sample" else "",  # Last layer (28) added automatically
+            # Debug logging for logprob comparison
+            # Set SLIME_DEBUG_LOGPROB_DIFF=1 to enable detailed per-sample logprob comparison logging
+            "SLIME_DEBUG_LOGPROB_DIFF": debug_logprob_diff,
         },
     )
 
