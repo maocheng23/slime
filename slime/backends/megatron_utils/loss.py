@@ -656,6 +656,8 @@ def policy_loss_function(
                 f"is significant (>1e-4). This indicates model weights changed between rollout and training, "
                 f"which is expected as training progresses but breaks the strict true on-policy assumption."
             )
+            logger.warning("old_log_probs[:10]: " + old_log_probs[:10].tolist())
+            logger.warning("rollout_log_probs[:10]: " + rollout_log_probs[:10].tolist())
         
         # Debug logging for true on-policy mode
         import os
