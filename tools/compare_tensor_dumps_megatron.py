@@ -2789,7 +2789,8 @@ def compare_single_pass_pair(
 
         sg_lp_flat = sg_logprobs.flatten()
         megatron_lp_flat = megatron_logprobs.flatten()
-
+        print(f"    SGLang logprobs first 10: {sg_lp_flat[:10].tolist()}")
+        print(f"    Megatron logprobs first 10: {megatron_lp_flat[:10].tolist()}")
         if sg_lp_flat.shape != megatron_lp_flat.shape:
             min_len = min(len(sg_lp_flat), len(megatron_lp_flat))
             sg_lp_flat = sg_lp_flat[:min_len]
