@@ -197,6 +197,7 @@ def get_log_probs_and_entropy(
             debug_logger.info(f"  temp_log_probs shape: {temp_log_probs.shape}, dtype: {temp_log_probs.dtype}")
             debug_logger.info(f"  temp_log_probs first 10: {temp_log_probs[:, :10].tolist()}")
             debug_logger.info(f"  log_prob shape: {log_prob.shape}")
+            debug_logger.info(f" first 10 token logprobs: {temp_log_probs[range(10), tokens_chunk[:10]].tolist()}")
             debug_logger.info(f"  log_prob first 10: {log_prob[:10].squeeze(-1).tolist()}")
             debug_logger.info(f"  temperature used: {args.rollout_temperature}")
             debug_logger.info(f"  true_on_policy_mode: {getattr(args, 'true_on_policy_mode', False)}")
