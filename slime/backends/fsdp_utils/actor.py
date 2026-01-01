@@ -392,6 +392,7 @@ class FSDPTrainRayActor(TrainRayActor):
                         model_input_ids=model_args["input_ids"],
                         allow_compile=not self.args.true_on_policy_mode,
                         temperature=self.args.rollout_temperature,
+                        true_on_policy_mode=self.args.true_on_policy_mode,
                     )
                     batch[f"{store_prefix}log_probs"] = log_probs_result
                     if store_prefix == "":
@@ -672,6 +673,7 @@ class FSDPTrainRayActor(TrainRayActor):
             model_input_ids=model_args["input_ids"],
             allow_compile=not self.args.true_on_policy_mode,
             temperature=self.args.rollout_temperature,
+            true_on_policy_mode=self.args.true_on_policy_mode,
         )
         
         # Save logprobs for debugging
@@ -999,6 +1001,7 @@ def gather_log_probs_packed(
     allow_compile: bool,
     cu_seqlens: torch.Tensor | float | None = None,
     temperature: torch.Tensor | None = None,
+    true_on_policy_mode: bool = False,
 ) -> torch.Tensor:
     """Gather next-token log probabilities for packed sequences.
 
@@ -1007,6 +1010,8 @@ def gather_log_probs_packed(
         input_ids: Token ids of shape [B, T] or [T].
         cu_seqlens: Optional cumulative sequence lengths (unused here). Present
             for API compatibility with callers.
+        temperature: Temperature for scaling logits.
+        true_on_policy_mode: If True, use SGLang-compatible bfloat16 path for logprob computation.
 
     Returns:
         A tensor of shape [T-1] (or [B, T-1]) with log-probabilities of targets.
@@ -1018,13 +1023,24 @@ def gather_log_probs_packed(
         input_ids = input_ids.squeeze(0)
 
     if temperature is not None:
-        shifted_logits = shifted_logits.div(temperature)
+        if true_on_policy_mode:
+            # Match SGLang's exact computation path when rl_on_policy_target is set:
+            # logits_div_temperature = logits.bfloat16().div(temperatures).bfloat16()
+            # logprobs = torch.log_softmax(logits_div_temperature, dim=-1)
+            shifted_logits = shifted_logits.bfloat16().div(temperature).bfloat16()
+        else:
+            shifted_logits = shifted_logits.div(temperature)
 
     targets = input_ids[1:].to(device=shifted_logits.device)
 
     # Gather log probs for targets
-    selective_log_softmax = selective_log_softmax_compiled if allow_compile else selective_log_softmax_raw
-    return selective_log_softmax(shifted_logits, targets)
+    if true_on_policy_mode:
+        # Use SGLang-compatible path: log_softmax on bfloat16 logits
+        logprobs = shifted_logits.log_softmax(dim=-1)
+        return torch.gather(logprobs, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    else:
+        selective_log_softmax = selective_log_softmax_compiled if allow_compile else selective_log_softmax_raw
+        return selective_log_softmax(shifted_logits, targets)
 
 
 def get_logprob_and_entropy_with_cp(
@@ -1036,6 +1052,7 @@ def get_logprob_and_entropy_with_cp(
     model_input_ids: torch.Tensor,
     allow_compile: bool,
     temperature: float | None = None,
+    true_on_policy_mode: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute log probabilities and entropy in Context Parallel mode.
 
@@ -1057,10 +1074,24 @@ def get_logprob_and_entropy_with_cp(
     if cp_size == 1:
         shifted_logits = logits[:-1, :]
         local_log_probs = gather_log_probs_packed(
-            shifted_logits, target_tokens, allow_compile=allow_compile, temperature=temperature
+            shifted_logits,
+            target_tokens,
+            allow_compile=allow_compile,
+            temperature=temperature,
+            true_on_policy_mode=true_on_policy_mode,
         )
-        log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
-        probs = torch.softmax(shifted_logits, dim=-1)
+        if true_on_policy_mode:
+            # Match SGLang's computation: use bfloat16 for log_softmax
+            shifted_logits_bf16 = shifted_logits.bfloat16()
+            if temperature is not None:
+                shifted_logits_bf16 = shifted_logits_bf16.div(temperature).bfloat16()
+            log_probs_full = shifted_logits_bf16.log_softmax(dim=-1)
+            probs = torch.softmax(shifted_logits_bf16, dim=-1)
+        else:
+            if temperature is not None:
+                shifted_logits = shifted_logits.div(temperature)
+            log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
+            probs = torch.softmax(shifted_logits, dim=-1)
         entropy = -(probs * log_probs_full).sum(dim=-1)
         return local_log_probs, entropy
 
@@ -1080,7 +1111,11 @@ def get_logprob_and_entropy_with_cp(
 
     # Compute local log probs
     local_log_probs = gather_log_probs_packed(
-        logits, local_tokens, allow_compile=allow_compile, temperature=temperature
+        logits,
+        local_tokens,
+        allow_compile=allow_compile,
+        temperature=temperature,
+        true_on_policy_mode=true_on_policy_mode,
     )
 
     # Pad for the last rank
@@ -1089,8 +1124,18 @@ def get_logprob_and_entropy_with_cp(
 
     # Compute entropy
     shifted_logits = logits[:-1, :] if cp_rank == cp_size - 1 else logits
-    log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
-    probs = torch.softmax(shifted_logits, dim=-1)
+    if true_on_policy_mode:
+        # Match SGLang's computation: use bfloat16 for log_softmax
+        shifted_logits_bf16 = shifted_logits.bfloat16()
+        if temperature is not None:
+            shifted_logits_bf16 = shifted_logits_bf16.div(temperature).bfloat16()
+        log_probs_full = shifted_logits_bf16.log_softmax(dim=-1)
+        probs = torch.softmax(shifted_logits_bf16, dim=-1)
+    else:
+        if temperature is not None:
+            shifted_logits = shifted_logits.div(temperature)
+        log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
+        probs = torch.softmax(shifted_logits, dim=-1)
     entropy = -(probs * log_probs_full).sum(dim=-1)
 
     # Pad entropy for the last rank
