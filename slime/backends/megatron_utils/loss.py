@@ -193,7 +193,7 @@ def get_log_probs_and_entropy(
                 debug_logger.info(f"      AAAToken {i}: id={token_id}")
                 debug_logger.info(f"      Logit for token: {logit_for_token:.6f}")
                 debug_logger.info(f"      Logprob for token (Megatron computed): {logprob_for_token:.8f}")
-                debug_logger.info(f"      first 10 logits: {top_logit_vals[:10].tolist()}")
+                debug_logger.info(f"      first 10 logits: {logits_chunk[i][:10].tolist()}")
                 debug_logger.info(f"      Top-5 logprobs: {list(zip(top_logprob_ids.tolist(), [f'{v:.6f}' for v in top_logprob_vals.tolist()]))}")
             
             # Print raw logits statistics
