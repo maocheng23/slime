@@ -2680,7 +2680,13 @@ def compare_single_pass_pair(
     elif "logits_full" in megatron_tensors:
         # Extract from full logits tensor
         full_logits = megatron_tensors["logits_full"]
-        print(f"  Extracting from logits_full: shape={full_logits.shape}")
+        print(f"  Extracting from logits_full: shape={full_logits.shape}, dtype={full_logits.dtype}")
+        if full_logits.dtype == torch.bfloat16:
+            print("  ⚠️  WARNING: logits_full is bfloat16 (OLD dump format)!")
+            print("     This may cause precision differences vs actual training.")
+            print("     Regenerate dumps with the fixed dumper for accurate comparison.")
+        elif full_logits.dtype == torch.float32:
+            print("  ✓ logits_full is float32 (NEW dump format) - Good!")
         # Detect format: [batch, seq, vocab] or [seq, batch, vocab]
         if full_logits.dim() == 3:
             d0, d1, d2 = full_logits.shape

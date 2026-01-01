@@ -181,7 +181,10 @@ def get_log_probs_and_entropy(
                 if dumper is not None:
                     pass_id = dumper._forward_pass_id
             debug_logger.info("-" * 60)
-            debug_logger.info(f"DEBUG: get_log_probs_and_entropy - Sample 0 details (Pass {pass_id if pass_id is not None else 'N/A'})")
+            debug_logger.info("DEBUG: get_log_probs_and_entropy - Sample 0 details")
+            debug_logger.info(f"  *** PASS ID: {pass_id if pass_id is not None else 'N/A'} ***")
+            debug_logger.info("  NOTE: Compare this Pass ID with the dump file you're analyzing!")
+            debug_logger.info("  If analyzing Pass00000 dump, this should show Pass 0 for exact match.")
             debug_logger.info("-" * 60)
             debug_logger.info(f"  logits_chunk shape: {logits_chunk.shape}, dtype: {logits_chunk.dtype}")
             debug_logger.info(f"  tokens_chunk shape: {tokens_chunk.shape}")
@@ -194,18 +197,31 @@ def get_log_probs_and_entropy(
             # Print logits for the first few tokens (at the positions of target tokens)
             debug_logger.info("\n  Logits & Logprobs for first 5 response tokens:")
             # Compute full logprobs for comparison
+            # IMPORTANT: logits_chunk is already bfloat16 from get_responses()
+            # We need to match exactly what compute_log_probs does
+            debug_logger.info(f"  logits_chunk dtype: {logits_chunk.dtype}")
             logprobs_full = torch.log_softmax(logits_chunk, dim=-1)
+            debug_logger.info(f"  logprobs_full dtype: {logprobs_full.dtype}")
+            
             for i in range(min(5, len(tokens_chunk))):
                 token_id = tokens_chunk[i].item()
                 # logits_chunk[i] has shape [vocab_size], get the logit for the target token
                 logit_for_token = logits_chunk[i, token_id].item()
                 logprob_for_token = logprobs_full[i, token_id].item()
+                
+                # Compare with actual log_prob from calculate_log_probs_and_entropy
+                actual_logprob = log_prob[i].item() if i < len(log_prob) else None
+                
                 # Also get top-5 logits and logprobs
                 top_logit_vals, top_logit_ids = torch.topk(logits_chunk[i], 5)
                 top_logprob_vals, top_logprob_ids = torch.topk(logprobs_full[i], 5)
-                debug_logger.info(f"      AAAToken {i}: id={token_id}")
+                debug_logger.info(f"      Token {i}: id={token_id}")
                 debug_logger.info(f"      Logit for token (after temp): {logit_for_token:.6f}")
-                debug_logger.info(f"      Logprob for token (Megatron computed): {logprob_for_token:.8f}")
+                debug_logger.info(f"      Logprob (manual log_softmax): {logprob_for_token:.8f}")
+                debug_logger.info(f"      Logprob (actual from compute_log_probs): {actual_logprob:.8f}" if actual_logprob is not None else "      Logprob (actual): N/A")
+                if actual_logprob is not None:
+                    diff = abs(logprob_for_token - actual_logprob)
+                    debug_logger.info(f"      Diff (manual vs actual): {diff:.8e}")
                 debug_logger.info(f"      first 10 logits (after temp): {logits_chunk[i][:10].tolist()}")
                 debug_logger.info(f"      first 10 logprobs: {logprobs_full[i][:10].tolist()}")
                 debug_logger.info(f"      Top-5 logprobs: {list(zip(top_logprob_ids.tolist(), [f'{v:.6f}' for v in top_logprob_vals.tolist()]))}")
