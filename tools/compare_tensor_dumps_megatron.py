@@ -2968,6 +2968,15 @@ def compare_single_pass_pair(
                     print(f"        SGLang:   {[f'{v:.8f}' for v in sg_lp_first10]}")
                     print(f"        Megatron: {[f'{v:.8f}' for v in meg_lp_first10]}")
                     print(f"        Diff:     {[f'{v:.8e}' for v in diff_lp_first10]}")
+                    
+                    # Print top 5 logprobs and tokens from Megatron
+                    top_k = min(5, len(megatron_lp_flat))
+                    meg_top_values, meg_top_indices = torch.topk(megatron_lp_flat.float(), top_k)
+                    print(f"      Top {top_k} logprobs from Megatron:")
+                    for rank, (val, idx) in enumerate(zip(meg_top_values, meg_top_indices), 1):
+                        is_target = (idx.item() == token_id)
+                        marker = " <-- ACTUAL TOKEN" if is_target else ""
+                        print(f"        {rank}. token_id={idx.item():6d}, logprob={val.item():.8f}{marker}")
                 else:
                     print(f"\n    Token #{i+1} (ID={token_id}): Could not extract logprob")
             else:
