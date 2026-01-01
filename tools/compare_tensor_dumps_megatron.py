@@ -160,6 +160,7 @@ def compute_logprobs_megatron(
             if target_token_id is not None:
                 target_logit = logits_flat[target_token_id].item() if logits_flat.dim() == 1 else logits_bf16.flatten()[target_token_id].item()
                 print(f"      logit for token {target_token_id}: {target_logit:.6f}")
+                import torch.nn.functional as F
                 log_probs = F.log_softmax(logits_bf16, dim=-1)
                 print(f"      temp log_probs dtype: {log_probs.dtype}")
                 print(f"      temp log_probs first 10: {log_probs.flatten()[:10].tolist()}")
