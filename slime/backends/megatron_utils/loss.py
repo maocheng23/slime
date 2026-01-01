@@ -147,6 +147,12 @@ def get_log_probs_and_entropy(
     debug_logprob = os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1"
     sample_idx = 0
     
+    # Save original (raw) logits before temperature processing for debug comparison
+    raw_logits_for_debug = None
+    if debug_logprob:
+        # logits shape: [1, T, V], squeeze to [T, V]
+        raw_logits_for_debug = logits.squeeze(0).clone()
+    
     for logits_chunk, tokens_chunk in get_responses(
         logits,
         args=args,
@@ -191,10 +197,22 @@ def get_log_probs_and_entropy(
                 top_logit_vals, top_logit_ids = torch.topk(logits_chunk[i], 5)
                 top_logprob_vals, top_logprob_ids = torch.topk(logprobs_full[i], 5)
                 debug_logger.info(f"      AAAToken {i}: id={token_id}")
-                debug_logger.info(f"      Logit for token: {logit_for_token:.6f}")
+                debug_logger.info(f"      Logit for token (after temp): {logit_for_token:.6f}")
                 debug_logger.info(f"      Logprob for token (Megatron computed): {logprob_for_token:.8f}")
-                debug_logger.info(f"      first 10 logits: {logits_chunk[i][:10].tolist()}")
+                debug_logger.info(f"      first 10 logits (after temp): {logits_chunk[i][:10].tolist()}")
                 debug_logger.info(f"      Top-5 logprobs: {list(zip(top_logprob_ids.tolist(), [f'{v:.6f}' for v in top_logprob_vals.tolist()]))}")
+                
+                # Also print RAW logits (before temperature processing)
+                if raw_logits_for_debug is not None:
+                    # Calculate the position in the original logits tensor
+                    # For sample 0, response starts at position (total_lengths[0] - response_lengths[0])
+                    prompt_len = total_lengths[0] - response_lengths[0]
+                    raw_pos = prompt_len - 1 + i  # position that predicts token i
+                    if raw_pos < raw_logits_for_debug.shape[0]:
+                        raw_logit_for_token = raw_logits_for_debug[raw_pos, token_id].item()
+                        raw_first_10 = raw_logits_for_debug[raw_pos, :10].tolist()
+                        debug_logger.info(f"      RAW logit for token (before temp): {raw_logit_for_token:.6f}")
+                        debug_logger.info(f"      RAW first 10 logits (before temp): {raw_first_10}")
             
             # Print raw logits statistics
             debug_logger.info("\n  Logits stats (first position):")
