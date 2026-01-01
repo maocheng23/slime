@@ -2711,9 +2711,9 @@ def compare_single_pass_pair(
 
         # Print first 10 logits values
         print("\n  First 10 logits values:")
-        sg_first10 = sg_flat[:10].float32().tolist()
-        meg_first10 = megatron_flat[:10].float32().tolist()
-        diff_first10 = (sg_flat[:10].float32() - megatron_flat[:10].float32()).abs().tolist()
+        sg_first10 = sg_flat[:10].tolist()
+        meg_first10 = megatron_flat[:10].tolist()
+        diff_first10 = (sg_flat[:10] - megatron_flat[:10]).abs().tolist()
         print(f"    SGLang:   {[f'{v:.8f}' for v in sg_first10]}")
         print(f"    Megatron: {[f'{v:.8f}' for v in meg_first10]}")
         print(f"    Diff:     {[f'{v:.8f}' for v in diff_first10]}")
