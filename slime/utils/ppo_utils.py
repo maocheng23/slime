@@ -171,14 +171,10 @@ def compute_log_probs(
         # If we use torch.log_softmax, we get PyTorch's CUDA kernel which
         # produces slightly different numerical results due to different
         # floating-point operation ordering.
-        try:
-            from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
-            logits_bf16 = logits.bfloat16()
-            log_probs = sglang_log_softmax(logits_bf16, dim=-1)
-        except ImportError:
-            # Fallback to torch.log_softmax if SGLang is not available
-            logits_bf16 = logits.bfloat16()
-            log_probs = torch.log_softmax(logits_bf16, dim=-1)
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
+        logits_bf16 = logits.bfloat16()
+        print("[DEBUG]Using SGLang's batch-invariant log_softmax")
+        log_probs = sglang_log_softmax(logits_bf16, dim=-1)
         # Gather log_probs for the target tokens
         gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
         # Convert to float32 to match SGLang's serialization format
