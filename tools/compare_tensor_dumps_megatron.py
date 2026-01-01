@@ -79,10 +79,16 @@ def compute_logprobs_sglang(
     """
     # Exact SGLang production path from sampler.py lines 111-117
     # CRITICAL: Use float32 tensor for temperature to match SGLang's precision
+    # CRITICAL: Use SGLang's batch-invariant log_softmax, NOT PyTorch's!
+    # SGLang uses a custom Triton kernel that produces different numerical results.
     temp_tensor = torch.tensor(temperature, dtype=torch.float32, device=logits.device)
     logits_bf16 = logits.bfloat16()
     logits_div_temperature = logits_bf16.div(temp_tensor).bfloat16()
-    logprobs = torch.log_softmax(logits_div_temperature, dim=-1)
+    try:
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
+        logprobs = sglang_log_softmax(logits_div_temperature, dim=-1)
+    except ImportError:
+        logprobs = torch.log_softmax(logits_div_temperature, dim=-1)
 
     if verbose:
         logits_flat = logits_div_temperature.flatten()
@@ -144,11 +150,17 @@ def compute_logprobs_megatron(
     if true_on_policy_mode:
         # Exact Megatron production path from loss.py:66-73 + ppo_utils.py:162-170
         # CRITICAL: Use float32 tensor for temperature to match SGLang's precision
+        # CRITICAL: Use SGLang's batch-invariant log_softmax, NOT PyTorch's!
+        # SGLang uses a custom Triton kernel that produces different numerical results.
         temp_tensor = torch.tensor(temperature, dtype=torch.float32, device=logits.device)
         logits_bf16 = logits.bfloat16()
         if temperature != 1.0:
             logits_bf16 = logits_bf16.div(temp_tensor).bfloat16()
-        logprobs = torch.log_softmax(logits_bf16, dim=-1)
+        try:
+            from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
+            logprobs = sglang_log_softmax(logits_bf16, dim=-1)
+        except ImportError:
+            logprobs = torch.log_softmax(logits_bf16, dim=-1)
 
         if verbose:
             logits_flat = logits_bf16.flatten()

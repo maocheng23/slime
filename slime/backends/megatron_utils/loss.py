@@ -205,10 +205,17 @@ def get_log_probs_and_entropy(
             # Print logits for the first few tokens (at the positions of target tokens)
             debug_logger.info("\n  Logits & Logprobs for first 5 response tokens:")
             # Compute full logprobs for comparison
-            # IMPORTANT: logits_chunk is already bfloat16 from get_responses()
-            # We need to match exactly what compute_log_probs does
+            # IMPORTANT: Use SGLang's batch-invariant log_softmax for identical results!
+            # SGLang uses a custom Triton kernel that produces different numerical results
+            # than PyTorch's built-in log_softmax due to different FP operation ordering.
             debug_logger.info(f"  logits_chunk dtype: {logits_chunk.dtype}")
-            logprobs_full = torch.log_softmax(logits_chunk, dim=-1)
+            try:
+                from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
+                logprobs_full = sglang_log_softmax(logits_chunk, dim=-1)
+                debug_logger.info("  Using SGLang's batch-invariant log_softmax")
+            except ImportError:
+                logprobs_full = torch.log_softmax(logits_chunk, dim=-1)
+                debug_logger.info("  Using PyTorch's log_softmax (SGLang not available)")
             debug_logger.info(f"  logprobs_full dtype: {logprobs_full.dtype}")
             
             for i in range(min(5, len(tokens_chunk))):

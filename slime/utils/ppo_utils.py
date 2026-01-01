@@ -160,11 +160,25 @@ def compute_log_probs(
     to match SGLang's numerical path for bitwise identical results.
     """
     if true_on_policy_mode:
-        # SGLang-compatible path: use torch.log_softmax with explicit BF16 casts
-        # This matches SGLang's sampler behavior when rl_on_policy_target is set:
-        # logprobs = torch.log_softmax(logits.bfloat16(), dim=-1)
-        logits_bf16 = logits.bfloat16()
-        log_probs = torch.log_softmax(logits_bf16, dim=-1)
+        # SGLang-compatible path: use SGLang's batch-invariant log_softmax
+        # IMPORTANT: SGLang uses a custom Triton kernel for log_softmax when
+        # batch_invariant_mode is enabled. To get bitwise identical results,
+        # we must use the SAME kernel implementation!
+        #
+        # SGLang's path (sampler.py + batch_invariant_ops.py):
+        #   logits.bfloat16() -> log_softmax (Triton kernel) -> bfloat16 result
+        #
+        # If we use torch.log_softmax, we get PyTorch's CUDA kernel which
+        # produces slightly different numerical results due to different
+        # floating-point operation ordering.
+        try:
+            from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
+            logits_bf16 = logits.bfloat16()
+            log_probs = sglang_log_softmax(logits_bf16, dim=-1)
+        except ImportError:
+            # Fallback to torch.log_softmax if SGLang is not available
+            logits_bf16 = logits.bfloat16()
+            log_probs = torch.log_softmax(logits_bf16, dim=-1)
         # Gather log_probs for the target tokens
         gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
         # Convert to float32 to match SGLang's serialization format
