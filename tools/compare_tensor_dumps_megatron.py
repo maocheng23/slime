@@ -165,7 +165,7 @@ def compute_logprobs_megatron(
                 print(f"      temp log_probs dtype: {log_probs.dtype}")
                 print(f"      temp log_probs first 10: {log_probs.flatten()[:10].tolist()}")
                 print(f"      temp log_probs sum: {log_probs.sum().item():.6f}")
-                print(f"      temp log_probs for token {target_token_id}: {log_probs[target_token_id].flatten().item():.6f}")
+                print(f"      temp log_probs for token {target_token_id}: {log_probs.flatten()[target_token_id].item():.6f}")
     else:
         # Original Megatron path (non-true-on-policy)
         # In production, this uses fused_vocab_parallel_cross_entropy
