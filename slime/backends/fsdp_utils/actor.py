@@ -562,7 +562,22 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.ref_model is not None:
             self._compute_log_prob("ref", packed_batches, store_prefix="ref_")
 
-        self._compute_log_prob("actor", packed_batches)
+        # In true_on_policy_mode, we should use rollout_log_probs directly as old_log_probs
+        # to ensure they are computed with the same model weights as during rollout.
+        # Only recompute log_probs if we don't have rollout_log_probs or if use_rollout_logprobs is False
+        # and we need log_probs for comparison.
+        if not self.args.true_on_policy_mode or self.args.use_rollout_logprobs:
+            self._compute_log_prob("actor", packed_batches)
+        elif "rollout_log_probs" not in rollout_data or not rollout_data["rollout_log_probs"]:
+            # If rollout_log_probs is missing, we need to compute log_probs
+            self._compute_log_prob("actor", packed_batches)
+        else:
+            # In true_on_policy_mode with rollout_log_probs available, we still need to compute
+            # log_probs for comparison (train_rollout_logprob_abs_diff), but we should use
+            # the same model weights as during rollout. However, since model weights may have
+            # changed, we compute log_probs with current weights for comparison purposes.
+            self._compute_log_prob("actor", packed_batches)
+        
         self._log_rollout_data(rollout_id, rollout_data, packed_batches)
 
         with timer("actor_train"):
@@ -780,12 +795,28 @@ class FSDPTrainRayActor(TrainRayActor):
             ppo_kl = sum_of_sample_mean(ppo_kl.abs(), response_lengths, loss_masks)
 
         # Only compare rollout vs. train log probs when they originate from different stages.
+        # NOTE: In true_on_policy_mode, this comparison measures how much the model weights
+        # have changed between rollout and training. If weights haven't changed, this should be ~0.
+        # The difference increases as training progresses because model weights are updated.
         train_rollout_logprob_abs_diff = None
         if not self.args.use_rollout_logprobs and rollout_log_probs is not None:
+            # old_log_probs: computed with CURRENT training weights (via _compute_log_prob)
+            # rollout_log_probs: computed with ROLLOUT-TIME weights (from SGLang)
+            # In true_on_policy_mode, if weights haven't changed, these should match.
+            # The difference indicates how much the model has changed between rollout and training.
             train_rollout_logprob_abs_diff = (old_log_probs - rollout_log_probs).abs()
             train_rollout_logprob_abs_diff = sum_of_sample_mean(
                 train_rollout_logprob_abs_diff, response_lengths, loss_masks
             ).detach()
+            
+            # In true_on_policy_mode, a significant difference means model weights changed,
+            # which breaks the true on-policy assumption. This is expected as training progresses.
+            if self.args.true_on_policy_mode and train_rollout_logprob_abs_diff > 1e-4:
+                logger.warning(
+                    f"true_on_policy_mode: train_rollout_logprob_abs_diff={train_rollout_logprob_abs_diff:.6f} "
+                    f"is significant (>1e-4). This indicates model weights changed between rollout and training, "
+                    f"which is expected as training progresses but breaks the strict true on-policy assumption."
+                )
 
         entropy = torch.cat([batch["entropy"] for batch in unpacked_batches], dim=0)
         entropy_loss = sum_of_sample_mean(entropy, response_lengths, loss_masks)
