@@ -1979,12 +1979,14 @@ def compare_first_response_token(
 
     # Megatron final_layernorm OUTPUT
     megatron_final_norm = None
+    megatron_final_norm_raw = None  # Keep raw tensor for dtype check
     for key_pattern in [
         "final_layernorm_at_response_start",
         f"final_layernorm_pos_{first_response_pos}",
         "final_layernorm",
     ]:
         if key_pattern in megatron_tensors:
+            megatron_final_norm_raw = megatron_tensors[key_pattern]
             megatron_final_norm = megatron_tensors[key_pattern]
             if megatron_final_norm.dim() == 2:
                 megatron_final_norm = megatron_final_norm[0]  # [1, dim] -> [dim]
@@ -2151,6 +2153,48 @@ def compare_first_response_token(
             print(f"    Available keys: {[k for k in megatron_tensors.keys() if 'residual' in k.lower()]}")
     
     if sglang_final_norm is not None and megatron_final_norm is not None:
+        # =====================================================================
+        # DTYPE COMPARISON
+        # =====================================================================
+        print(f"\n    🔍 DTYPE COMPARISON:")
+        print(f"    {'='*70}")
+        
+        # Get SGLang element 0 and element 1 dtypes
+        sglang_elem0_dtype = None
+        sglang_elem1_dtype = None
+        if isinstance(sglang_raw_val, (list, tuple)) and len(sglang_raw_val) >= 2:
+            if isinstance(sglang_raw_val[0], torch.Tensor):
+                sglang_elem0_dtype = sglang_raw_val[0].dtype
+            if isinstance(sglang_raw_val[1], torch.Tensor):
+                sglang_elem1_dtype = sglang_raw_val[1].dtype
+        
+        # Get Megatron final_layernorm dtype (from raw tensor before position extraction)
+        megatron_final_norm_dtype = None
+        if megatron_final_norm_raw is not None and isinstance(megatron_final_norm_raw, torch.Tensor):
+            megatron_final_norm_dtype = megatron_final_norm_raw.dtype
+        elif isinstance(megatron_final_norm, torch.Tensor):
+            megatron_final_norm_dtype = megatron_final_norm.dtype
+        
+        print(f"    SGLang model.norm Element 0 (OUTPUT): dtype={sglang_elem0_dtype}")
+        print(f"    SGLang model.norm Element 1 (INPUT):  dtype={sglang_elem1_dtype}")
+        print(f"    Megatron final_layernorm:              dtype={megatron_final_norm_dtype}")
+        
+        # Check dtype alignment
+        dtype_match_elem0 = (sglang_elem0_dtype == megatron_final_norm_dtype)
+        dtype_match_elem1 = (sglang_elem1_dtype == megatron_final_norm_dtype) if sglang_elem1_dtype is not None else None
+        
+        if dtype_match_elem0:
+            print(f"    ✓ Element 0 dtype matches Megatron final_layernorm")
+        else:
+            print(f"    ✗ Element 0 dtype mismatch: SGLang {sglang_elem0_dtype} vs Megatron {megatron_final_norm_dtype}")
+        
+        if dtype_match_elem1 is not None:
+            if dtype_match_elem1:
+                print(f"    ✓ Element 1 dtype matches Megatron final_layernorm")
+            else:
+                print(f"    ⚠ Element 1 dtype differs: SGLang {sglang_elem1_dtype} vs Megatron {megatron_final_norm_dtype}")
+                print(f"      (Note: Element 1 is INPUT before normalization, may have different dtype)")
+        
         # Convert both to float32 for comparison
         sglang_fn = sglang_final_norm.float()
         megatron_fn = megatron_final_norm.float()
@@ -2174,10 +2218,10 @@ def compare_first_response_token(
         print(f"\n    🔍 DETAILED COMPARISON: SGLang Element 0 vs Megatron final_layernorm")
         print(f"    {'='*70}")
         print(f"    SGLang Element 0 (OUTPUT):")
-        print(f"      shape: {sglang_fn.shape}, RMS: {sglang_rms:.4f}")
+        print(f"      shape: {sglang_fn.shape}, dtype: {sglang_elem0_dtype}, RMS: {sglang_rms:.4f}")
         print(f"      first 10: {[f'{v:.4f}' for v in sglang_fn[:10].tolist()]}")
         print(f"    Megatron final_layernorm_at_response_start:")
-        print(f"      shape: {megatron_fn.shape}, RMS: {megatron_rms:.4f}")
+        print(f"      shape: {megatron_fn.shape}, dtype: {megatron_final_norm_dtype}, RMS: {megatron_rms:.4f}")
         print(f"      first 10: {[f'{v:.4f}' for v in megatron_fn[:10].tolist()]}")
         print(f"    Difference:")
         print(f"      Max diff: {max_diff_fn:.6e}, Mean diff: {mean_diff_fn:.6e}")

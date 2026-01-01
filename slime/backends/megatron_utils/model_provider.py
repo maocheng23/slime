@@ -52,8 +52,9 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
         weight: torch.Tensor | None = None,
         runtime_gather_output: bool | None = None,
     ) -> tuple[torch.Tensor, None]:
-        # Cast input and weight to BF16 to match SGLang
+        # Cast input and weight to BF16 to match SGLang's computation
         # SGLang: logits = matmul(hidden_states.bfloat16(), lm_head.weight.T.bfloat16())
+        # But SGLang then converts to float32: logits = logits.float()
         input_bf16 = input_.to(torch.bfloat16)
         if weight is not None:
             weight_bf16 = weight.to(torch.bfloat16)
@@ -65,8 +66,9 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
             else:
                 weight_bf16 = None
         output, bias = self._original_layer(input_bf16, weight=weight_bf16, runtime_gather_output=runtime_gather_output)
-        # Ensure output is in BF16 to match SGLang's logits dtype
-        output = output.to(torch.bfloat16)
+        # Convert to float32 to match SGLang's final logits dtype
+        # SGLang computes in bfloat16 but then converts to float32
+        output = output.to(torch.float32)
         return output, bias
 
     # Delegate all state dict operations to the original layer for checkpoint compatibility
