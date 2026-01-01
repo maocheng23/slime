@@ -160,6 +160,12 @@ def compute_logprobs_megatron(
             if target_token_id is not None:
                 target_logit = logits_flat[target_token_id].item() if logits_flat.dim() == 1 else logits_bf16.flatten()[target_token_id].item()
                 print(f"      logit for token {target_token_id}: {target_logit:.6f}")
+                log_probs = F.log_softmax(logits_bf16, dim=-1)
+                print(f"      temp log_probs dtype: {log_probs.dtype}")
+                print(f"      temp log_probs first 10: {log_probs.flatten()[:10].tolist()}")
+                print(f"      temp log_probs sum: {log_probs.sum().item():.6f}")
+                print(f"      temp log_probs for token {target_token_id}: {log_probs[target_token_id].item():.6f}")
+                print(f"      temp diff: {abs(log_probs[target_token_id].item() - target_logit):.8e}")
     else:
         # Original Megatron path (non-true-on-policy)
         # In production, this uses fused_vocab_parallel_cross_entropy
