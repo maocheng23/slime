@@ -3137,6 +3137,7 @@ def compare_first_response_token(
             sglang_dir=sglang_dir,
             verbose=verbose,
         )
+        break
 
     # Overall summary
     print("\n" + "=" * 70)
