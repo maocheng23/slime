@@ -190,10 +190,10 @@ def get_log_probs_and_entropy(
                 # Also get top-5 logits and logprobs
                 top_logit_vals, top_logit_ids = torch.topk(logits_chunk[i], 5)
                 top_logprob_vals, top_logprob_ids = torch.topk(logprobs_full[i], 5)
-                debug_logger.info(f"    Token {i}: id={token_id}")
+                debug_logger.info(f"      AAAToken {i}: id={token_id}")
                 debug_logger.info(f"      Logit for token: {logit_for_token:.6f}")
                 debug_logger.info(f"      Logprob for token (Megatron computed): {logprob_for_token:.8f}")
-                debug_logger.info(f"      Top-5 logits: {list(zip(top_logit_ids.tolist(), [f'{v:.4f}' for v in top_logit_vals.tolist()]))}")
+                debug_logger.info(f"      first 10 logits: {top_logit_vals[:10].tolist()}")
                 debug_logger.info(f"      Top-5 logprobs: {list(zip(top_logprob_ids.tolist(), [f'{v:.6f}' for v in top_logprob_vals.tolist()]))}")
             
             # Print raw logits statistics
