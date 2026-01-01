@@ -9,7 +9,7 @@ assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
 MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-0.6B")
 assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
 
-MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
+MODE = os.environ.get("SLIME_SCRIPT_MODE", "normal")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
 NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "1"))
@@ -92,12 +92,23 @@ def execute():
             dump_layers.append(last_layer)
         dump_layers_str = f"--sglang-debug-tensor-dump-layers {' '.join(map(str, dump_layers))} "
     
+    # NOTE: For true on-policy mode, CUDA graph should be disabled to ensure
+    # bitwise identical logprobs between SGLang and Megatron.
+    # CUDA graph can cause subtle numerical differences due to:
+    # - Different operation fusion patterns
+    # - Different execution order in async execution
+    # - Memory layout differences
+    disable_cuda_graph_for_true_on_policy = os.environ.get(
+        "SLIME_DISABLE_CUDA_GRAPH_FOR_TRUE_ON_POLICY", "1"
+    ) == "1"
+    
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
         f"--sglang-mem-fraction-static {0.2 if MODEL_NAME == 'Qwen3-4B' else 0.4} "
-        f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
+        # Disable CUDA graph for true on-policy to ensure numerical consistency
+        f"{'--sglang-disable-cuda-graph ' if (MODE == 'debug_one_sample' or disable_cuda_graph_for_true_on_policy) else ''}"
         # Enable tensor dump for layer-by-layer comparison
         f"{'--sglang-debug-tensor-dump-output-folder ' + tensor_dump_dir + ' ' if MODE == 'debug_one_sample' else ''}"
         f"{dump_layers_str}"  # Includes last layer (28) automatically
