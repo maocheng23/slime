@@ -223,6 +223,7 @@ def get_log_probs_and_entropy(
                     diff = abs(logprob_for_token - actual_logprob)
                     debug_logger.info(f"      Diff (manual vs actual): {diff:.8e}")
                 debug_logger.info(f"      first 10 logits (after temp): {logits_chunk[i][:10].tolist()}")
+                debug_logger.info(f"      sum of logits (after temp): {logits_chunk[i].sum().item():.6f}")
                 debug_logger.info(f"      first 10 logprobs: {logprobs_full[i][:10].tolist()}")
                 debug_logger.info(f"      Top-5 logprobs: {list(zip(top_logprob_ids.tolist(), [f'{v:.6f}' for v in top_logprob_vals.tolist()]))}")
                 

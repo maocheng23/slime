@@ -156,6 +156,7 @@ def compute_logprobs_megatron(
             print(f"      temperature: {temperature} (as float32 tensor)")
             print(f"      logits_bf16 dtype: {logits_bf16.dtype}")
             print(f"      logits_bf16 (after temp) first 10: {logits_flat[:10].tolist()}")
+            print(f"      logits_bf16 (after temp) sum: {logits_flat.sum().item():.6f}")
             if target_token_id is not None:
                 target_logit = logits_flat[target_token_id].item() if logits_flat.dim() == 1 else logits_bf16.flatten()[target_token_id].item()
                 print(f"      logit for token {target_token_id}: {target_logit:.6f}")
