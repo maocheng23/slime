@@ -801,40 +801,25 @@ def compare_layer(
     return results
 
 
-def compare_first_response_token(
+def compare_single_pass_pair(
+    megatron_pass_id: int,
+    megatron_path: Path,
     sglang_dir: str,
-    megatron_dir: str,
     verbose: bool = True,
 ) -> None:
     """
-    Compare the first response token between SGLang and Megatron.
+    Compare a single Megatron pass with its corresponding SGLang pass.
 
-    This is the key comparison for true on-policy verification:
-    - SGLang: Uses prefill pass to compute logits for first response token
-    - Megatron: Uses logits at position (prompt_len - 1) from training pass
-
-    We compare:
-    1. Hidden states at each layer for position (prompt_len - 1)
-    2. Logits for the first response token
-    3. Logprobs computed from logits
+    Args:
+        megatron_pass_id: ID of the Megatron pass
+        megatron_path: Path to the Megatron pass file
+        sglang_dir: Directory containing SGLang dumps
+        verbose: Whether to print detailed output
     """
     print("\n" + "=" * 70)
-    print("FIRST RESPONSE TOKEN COMPARISON")
+    print(f"MEGATRON PASS {megatron_pass_id:05d} COMPARISON")
     print("=" * 70)
-    print("\nComparing SGLang prefill pass vs Megatron training pass")
-    print("for the FIRST response token prediction.\n")
 
-    # Find Megatron dump (should only be ONE pass for training)
-    megatron_passes = list_all_passes(megatron_dir)
-    if not megatron_passes:
-        print(f"ERROR: No Megatron dump files found in {megatron_dir}")
-        return
-
-    # Training should have only ONE pass
-    if len(megatron_passes) > 1:
-        print(f"WARNING: Found {len(megatron_passes)} Megatron passes, using first.")
-
-    megatron_pass_id, megatron_path = megatron_passes[0]
     megatron_info = get_megatron_dump_info(megatron_path)
     megatron_tensors = megatron_info["tensors"]
 
@@ -2967,7 +2952,7 @@ def compare_first_response_token(
     # SUMMARY
     # =========================================================================
     print("\n" + "=" * 70)
-    print("TRUE ON-POLICY VERIFICATION SUMMARY")
+    print(f"TRUE ON-POLICY VERIFICATION SUMMARY (Pass {megatron_pass_id:05d})")
     print("=" * 70)
     print("""
 The attention path is the CRITICAL component for true on-policy.
@@ -2990,6 +2975,68 @@ MLP PATH (small differences acceptable):
 If ALL attention components show 0.0 diff, TRUE ON-POLICY is working!
 Small MLP differences (<1e-2) are acceptable and don't affect predictions.
 """)
+    print("=" * 70)
+
+
+def compare_first_response_token(
+    sglang_dir: str,
+    megatron_dir: str,
+    verbose: bool = True,
+) -> None:
+    """
+    Compare the first response token between SGLang and Megatron.
+
+    This function handles multiple Megatron passes (e.g., Pass00000, Pass00002)
+    and compares each with its corresponding SGLang pass.
+
+    This is the key comparison for true on-policy verification:
+    - SGLang: Uses prefill pass to compute logits for first response token
+    - Megatron: Uses logits at position (prompt_len - 1) from training pass
+
+    We compare:
+    1. Hidden states at each layer for position (prompt_len - 1)
+    2. Logits for the first response token
+    3. Logprobs computed from logits
+    """
+    print("\n" + "=" * 70)
+    print("FIRST RESPONSE TOKEN COMPARISON")
+    print("=" * 70)
+    print("\nComparing SGLang prefill pass vs Megatron training pass")
+    print("for the FIRST response token prediction.\n")
+
+    # Find all Megatron passes
+    megatron_passes = list_all_passes(megatron_dir)
+    if not megatron_passes:
+        print(f"ERROR: No Megatron dump files found in {megatron_dir}")
+        return
+
+    print(f"Found {len(megatron_passes)} Megatron pass(es):")
+    for pass_id, path in megatron_passes:
+        info = get_megatron_dump_info(path)
+        prompt_len = info.get('prompt_len', 'N/A')
+        print(f"  Pass {pass_id:05d}: prompt_len={prompt_len}")
+
+    # Process each Megatron pass
+    for pass_idx, (megatron_pass_id, megatron_path) in enumerate(megatron_passes):
+        if pass_idx > 0:
+            # Add separator between passes
+            print("\n" + "=" * 70)
+            print("=" * 70)
+            print("=" * 70)
+
+        compare_single_pass_pair(
+            megatron_pass_id=megatron_pass_id,
+            megatron_path=megatron_path,
+            sglang_dir=sglang_dir,
+            verbose=verbose,
+        )
+
+    # Overall summary
+    print("\n" + "=" * 70)
+    print("OVERALL SUMMARY - ALL PASSES")
+    print("=" * 70)
+    print(f"Compared {len(megatron_passes)} Megatron pass(es) with "
+          f"corresponding SGLang passes.")
     print("=" * 70)
 
 
