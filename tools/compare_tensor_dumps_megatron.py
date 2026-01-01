@@ -3033,17 +3033,17 @@ def compare_single_pass_pair(
 
             if sg_lp_flat.shape == megatron_lp_flat.shape:
                 lp_stats = compute_diff_stats(sg_lp_flat, megatron_lp_flat)
-                print(f"    Max diff:  {lp_stats['max_diff']:.8e}")
-                print(f"    Mean diff: {lp_stats['mean_diff']:.8e}")
+                print(f"    Max diff:  {lp_stats['max_diff']}")
+                print(f"    Mean diff: {lp_stats['mean_diff']}")
 
                 if sg_target_lp is not None and megatron_target_lp is not None:
                     sg_lp_val = sg_target_lp.float().item()
                     megatron_lp_val = megatron_target_lp.float().item()
                     diff = abs(sg_lp_val - megatron_lp_val)
                     print(f"    Logprob for token {token_id}:")
-                    print(f"      SGLang (production):  {sg_lp_val:.8f}")
-                    print(f"      Megatron (production): {megatron_lp_val:.8f}")
-                    print(f"      Diff:    {diff:.8e}")
+                    print(f"      SGLang (production):  {sg_lp_val}")
+                    print(f"      Megatron (production): {megatron_lp_val}")
+                    print(f"      Diff:    {diff}")
                     if diff < 1e-5:
                         print(
                             f"      ✓ Response token #{token_idx+1} "
