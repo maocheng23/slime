@@ -606,22 +606,26 @@ class MegatronTensorDumper:
             response_len = seq_len - prompt_len
             self._current_tensors["response_len_from_logits"] = torch.tensor([response_len])
             
-            # Save full logits tensor
-            self._current_tensors["logits_full"] = logits.cpu().bfloat16()
+            # Save full logits tensor - keep float32 to match training precision
+            # IMPORTANT: Do NOT convert to bfloat16 here! The training code does:
+            #   logits (float32) -> bfloat16() -> div(temp) -> bfloat16() -> log_softmax
+            # If we convert to bfloat16 before saving, we lose precision and get
+            # different logprobs than the actual training.
+            self._current_tensors["logits_full"] = logits.cpu()  # Keep float32!
             
-            # Save logits at EACH response position
+            # Save logits at EACH response position - keep float32!
             response_positions = []
             for i in range(response_len):
                 pos = prompt_len + i
                 if pos < seq_len:
-                    self._current_tensors[f"logits_pos_{pos}"] = logits[pos:pos+1, :].cpu().bfloat16()
+                    self._current_tensors[f"logits_pos_{pos}"] = logits[pos:pos+1, :].cpu()  # Keep float32!
                     response_positions.append(pos)
             
             self._current_tensors["response_logits_positions"] = torch.tensor(response_positions)
             
-            # Prefill comparison
+            # Prefill comparison - keep float32!
             if prompt_len > 0 and prompt_len - 1 < seq_len:
-                self._current_tensors["logits_at_prompt_end"] = logits[prompt_len-1:prompt_len, :].cpu().bfloat16()
+                self._current_tensors["logits_at_prompt_end"] = logits[prompt_len-1:prompt_len, :].cpu()  # Keep float32!
                 self._current_tensors["logits_prompt_end_pos"] = torch.tensor([prompt_len - 1])
             
             # Default position (preserve original dtype)
