@@ -167,7 +167,10 @@ def compute_log_probs(
         log_probs = torch.log_softmax(logits_bf16, dim=-1)
         # Gather log_probs for the target tokens
         gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
-        return gathered
+        # Convert to float32 to match SGLang's serialization format
+        # SGLang's sampler computes in bfloat16, but serializes to float32 via protobuf
+        # This ensures bitwise identical comparison between rollout and train logprobs
+        return gathered.float()
     else:
         # Original path: use fused_vocab_parallel_cross_entropy for TP support
         from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy

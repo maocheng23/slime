@@ -1068,7 +1068,11 @@ def gather_log_probs_packed(
     if true_on_policy_mode:
         # Use SGLang-compatible path: log_softmax on bfloat16 logits
         logprobs = shifted_logits.log_softmax(dim=-1)
-        return torch.gather(logprobs, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+        gathered = torch.gather(logprobs, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+        # Convert to float32 to match SGLang's serialization format
+        # SGLang's sampler computes in bfloat16, but serializes to float32 via protobuf
+        # This ensures bitwise identical comparison between rollout and train logprobs
+        return gathered.float()
     else:
         selective_log_softmax = selective_log_softmax_compiled if allow_compile else selective_log_softmax_raw
         return selective_log_softmax(shifted_logits, targets)
