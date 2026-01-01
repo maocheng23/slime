@@ -9,7 +9,7 @@ assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
 MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-0.6B")
 assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
 
-MODE = os.environ.get("SLIME_SCRIPT_MODE", "normal")
+MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
 NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "1"))
