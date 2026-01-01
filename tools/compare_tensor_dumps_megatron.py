@@ -2714,9 +2714,9 @@ def compare_single_pass_pair(
         sg_first10 = sg_flat[:10].float().tolist()
         meg_first10 = megatron_flat[:10].float().tolist()
         diff_first10 = (sg_flat[:10].float() - megatron_flat[:10].float()).abs().tolist()
-        print(f"    SGLang:   {[f'{v:.4f}' for v in sg_first10]}")
-        print(f"    Megatron: {[f'{v:.4f}' for v in meg_first10]}")
-        print(f"    Diff:     {[f'{v:.4f}' for v in diff_first10]}")
+        print(f"    SGLang:   {[f'{v:.8f}' for v in sg_first10]}")
+        print(f"    Megatron: {[f'{v:.8f}' for v in meg_first10]}")
+        print(f"    Diff:     {[f'{v:.8f}' for v in diff_first10]}")
 
         # Detailed difference analysis
         diff_all = (sg_flat.float() - megatron_flat.float()).abs()
