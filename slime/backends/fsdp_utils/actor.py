@@ -1055,10 +1055,17 @@ def gather_log_probs_packed(
 
     if temperature is not None:
         if true_on_policy_mode:
-            # Match SGLang's exact computation path when rl_on_policy_target is set:
-            # logits_div_temperature = logits.bfloat16().div(temperatures).bfloat16()
-            # logprobs = torch.log_softmax(logits_div_temperature, dim=-1)
-            shifted_logits = shifted_logits.bfloat16().div(temperature).bfloat16()
+            # Match SGLang's EXACT computation path when rl_on_policy_target is set:
+            # SGLang: logits.bfloat16().div(sampling_info.temperatures).bfloat16()
+            # where sampling_info.temperatures is a float32 tensor (sampling_batch_info.py:76-78)
+            # The division bfloat16 / float32 produces float32 intermediate result.
+            # Create float32 temperature tensor to match SGLang's precision
+            temp_tensor = torch.tensor(
+                temperature,
+                dtype=torch.float32,
+                device=shifted_logits.device
+            )
+            shifted_logits = shifted_logits.bfloat16().div(temp_tensor).bfloat16()
         else:
             shifted_logits = shifted_logits.div(temperature)
 

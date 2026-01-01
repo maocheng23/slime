@@ -57,10 +57,20 @@ def get_responses(
     assert logits.dtype == torch.float32, f"{logits.dtype}"
 
     logits = logits.squeeze(0)
-    # For true on-policy mode, match SGLang's temperature handling:
-    # logits.bfloat16().div(temp).bfloat16()
+    # For true on-policy mode, match SGLang's EXACT temperature handling:
+    # SGLang: logits.bfloat16().div(sampling_info.temperatures).bfloat16()
+    # where sampling_info.temperatures is a float32 tensor (see sampling_batch_info.py:76-78)
+    # The division bfloat16 / float32 produces float32 intermediate result,
+    # which is then converted back to bfloat16.
+    # This intermediate precision matters for numerical consistency!
     if getattr(args, "true_on_policy_mode", False):
-        logits = logits.bfloat16().div(args.rollout_temperature).bfloat16()
+        # Create float32 temperature tensor to match SGLang's precision
+        temp_tensor = torch.tensor(
+            args.rollout_temperature,
+            dtype=torch.float32,
+            device=logits.device
+        )
+        logits = logits.bfloat16().div(temp_tensor).bfloat16()
     else:
         logits = logits.div(args.rollout_temperature)
 
