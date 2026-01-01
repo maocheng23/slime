@@ -116,6 +116,12 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
+    
+    # For debugging: request top logprobs to compare with Megatron
+    import os
+    if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+        # Request top-5 logprobs for comparison
+        payload["top_logprobs_num"] = 5
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
@@ -154,6 +160,21 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
         else:
             new_response_tokens, new_response_log_probs = [], []
+        
+        # Debug: log top logprobs from SGLang for first sample
+        import os
+        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+            if "output_top_logprobs" in output["meta_info"]:
+                top_logprobs = output["meta_info"]["output_top_logprobs"]
+                logger.info("=" * 60)
+                logger.info("DEBUG: SGLang output_top_logprobs for first 5 tokens")
+                logger.info("=" * 60)
+                for i, token_top in enumerate(top_logprobs[:5]):
+                    actual_token = new_response_tokens[i] if i < len(new_response_tokens) else None
+                    actual_lp = new_response_log_probs[i] if i < len(new_response_log_probs) else None
+                    logger.info(f"  Token {i}: actual_id={actual_token}, actual_logprob={actual_lp}")
+                    logger.info(f"    Top-5: {token_top[:5] if token_top else 'N/A'}")
+                logger.info("=" * 60)
 
         # Update sample with tokens directly - avoiding re-tokenization
         sample.tokens = sample.tokens + new_response_tokens

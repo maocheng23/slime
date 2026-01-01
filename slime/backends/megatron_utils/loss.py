@@ -167,6 +167,30 @@ def get_log_probs_and_entropy(
             debug_logger.info(f"  log_prob first 10: {log_prob[:10].squeeze(-1).tolist()}")
             debug_logger.info(f"  temperature used: {args.rollout_temperature}")
             debug_logger.info(f"  true_on_policy_mode: {getattr(args, 'true_on_policy_mode', False)}")
+            
+            # Print logits for the first few tokens (at the positions of target tokens)
+            debug_logger.info("\n  Logits & Logprobs for first 5 response tokens:")
+            # Compute full logprobs for comparison
+            logprobs_full = torch.log_softmax(logits_chunk, dim=-1)
+            for i in range(min(5, len(tokens_chunk))):
+                token_id = tokens_chunk[i].item()
+                # logits_chunk[i] has shape [vocab_size], get the logit for the target token
+                logit_for_token = logits_chunk[i, token_id].item()
+                logprob_for_token = logprobs_full[i, token_id].item()
+                # Also get top-5 logits and logprobs
+                top_logit_vals, top_logit_ids = torch.topk(logits_chunk[i], 5)
+                top_logprob_vals, top_logprob_ids = torch.topk(logprobs_full[i], 5)
+                debug_logger.info(f"    Token {i}: id={token_id}")
+                debug_logger.info(f"      Logit for token: {logit_for_token:.6f}")
+                debug_logger.info(f"      Logprob for token (Megatron computed): {logprob_for_token:.8f}")
+                debug_logger.info(f"      Top-5 logits: {list(zip(top_logit_ids.tolist(), [f'{v:.4f}' for v in top_logit_vals.tolist()]))}")
+                debug_logger.info(f"      Top-5 logprobs: {list(zip(top_logprob_ids.tolist(), [f'{v:.6f}' for v in top_logprob_vals.tolist()]))}")
+            
+            # Print raw logits statistics
+            debug_logger.info("\n  Logits stats (first position):")
+            debug_logger.info(f"    logits_chunk[0] min: {logits_chunk[0].min().item():.6f}")
+            debug_logger.info(f"    logits_chunk[0] max: {logits_chunk[0].max().item():.6f}")
+            debug_logger.info(f"    logits_chunk[0] mean: {logits_chunk[0].float().mean().item():.6f}")
         sample_idx += 1
 
         log_probs_list.append(log_prob.squeeze(-1))
@@ -489,6 +513,37 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
 
+    # Debug: print raw logits before processing
+    import os
+    if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+        import logging
+        debug_logger = logging.getLogger(__name__)
+        debug_logger.info("=" * 60)
+        debug_logger.info("DEBUG: policy_loss_function - RAW LOGITS")
+        debug_logger.info("=" * 60)
+        debug_logger.info(f"  logits shape: {logits.shape}, dtype: {logits.dtype}")
+        # Get first response token position
+        prompt_len = total_lengths[0] - response_lengths[0]
+        first_resp_logits_pos = prompt_len - 1  # position that predicts first response token
+        debug_logger.info(f"  prompt_len: {prompt_len}, first_resp_logits_pos: {first_resp_logits_pos}")
+        
+        # Get the target token (first response token)
+        first_resp_token = batch["unconcat_tokens"][0][prompt_len].item()
+        debug_logger.info(f"  first response token id: {first_resp_token}")
+        
+        # Print logit for this position
+        if first_resp_logits_pos < logits.shape[1]:
+            logit_at_pos = logits[0, first_resp_logits_pos, :]
+            debug_logger.info(f"  logits[0, {first_resp_logits_pos}, :] stats:")
+            debug_logger.info(f"    min: {logit_at_pos.min().item():.6f}")
+            debug_logger.info(f"    max: {logit_at_pos.max().item():.6f}")
+            debug_logger.info(f"    mean: {logit_at_pos.float().mean().item():.6f}")
+            debug_logger.info(f"    logit for target token {first_resp_token}: {logit_at_pos[first_resp_token].item():.6f}")
+            
+            # Top-5 logits at this position
+            top_vals, top_ids = torch.topk(logit_at_pos, 5)
+            debug_logger.info(f"    Top-5: {list(zip(top_ids.tolist(), [f'{v:.4f}' for v in top_vals.tolist()]))}")
+
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
@@ -658,6 +713,23 @@ def policy_loss_function(
             )
             logger.warning("old_log_probs[:10]: " + str(old_log_probs[:10].tolist()))
             logger.warning("rollout_log_probs[:10]: " + str(rollout_log_probs[:10].tolist()))
+            logger.warning("abs_diff[:10]: " + str((old_log_probs[:10] - rollout_log_probs[:10]).abs().tolist()))
+            
+            # Print token IDs for verification
+            if "unconcat_tokens" in batch and len(batch["unconcat_tokens"]) > 0:
+                first_sample_tokens = batch["unconcat_tokens"][0]
+                prompt_len = total_lengths[0] - response_lengths[0]
+                response_tokens = first_sample_tokens[prompt_len:prompt_len+10]
+                logger.warning(f"First sample response tokens[0:10]: {response_tokens.tolist()}")
+                logger.warning(f"prompt_len={prompt_len}, response_len={response_lengths[0]}, total_len={total_lengths[0]}")
+            
+            # Print detailed comparison for first few positions
+            for i in range(min(5, len(old_log_probs))):
+                megatron_lp = old_log_probs[i].item()
+                sglang_lp = rollout_log_probs[i].item()
+                diff = abs(megatron_lp - sglang_lp)
+                rel_diff = diff / max(abs(sglang_lp), 1e-10) * 100
+                logger.warning(f"  pos {i}: Megatron={megatron_lp:.8f}, SGLang={sglang_lp:.8f}, diff={diff:.8f} ({rel_diff:.2f}%)")
         
         # Debug logging for true on-policy mode
         import os
