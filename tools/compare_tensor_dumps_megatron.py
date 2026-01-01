@@ -2631,23 +2631,26 @@ def compare_single_pass_pair(
     print("    → Logits comparison (below) is the authoritative check.")
 
     # =========================================================================
-    # 2. Compare logits for first response token
+    # 2. Compare logits for first 5 response tokens
     # =========================================================================
     print("\n" + "=" * 70)
-    print("LOGITS COMPARISON FOR FIRST RESPONSE TOKEN")
+    print("LOGITS COMPARISON FOR FIRST 5 RESPONSE TOKENS")
     print("=" * 70)
 
-    # Get first response token ID
-    first_response_token = None
+    # Get first 5 response token IDs
+    response_tokens = []
     input_ids_key = megatron_info.get("input_ids_key", "megatron_input_ids")
     if input_ids_key in megatron_tensors:
         input_ids = megatron_tensors[input_ids_key].flatten()
-        if first_response_pos < len(input_ids):
-            first_response_token = input_ids[first_response_pos].item()
-            print(
-                f"\nFirst response token ID: {first_response_token} "
-                f"(at position {first_response_pos})"
-            )
+        for i in range(5):
+            pos = first_response_pos + i
+            if pos < len(input_ids):
+                token_id = input_ids[pos].item()
+                response_tokens.append((pos, token_id))
+                print(
+                    f"\nResponse token #{i+1}: ID={token_id} "
+                    f"(at position {pos})"
+                )
 
     # Get SGLang logits
     sglang_logits = None
@@ -2794,83 +2797,157 @@ def compare_single_pass_pair(
                 d = abs(sg_v - meg_v)
                 print(f"      idx {idx}: SGLang={sg_v:.4f}, Meg={meg_v:.4f}, diff={d:.6f}")
 
-        # Compare specific token logit
-        if first_response_token is not None:
-            sg_tok = sglang_logits.flatten()
-            megatron_tok = megatron_logits.flatten()
-            if first_response_token < len(sg_tok):
-                sg_token_logit = sg_tok[first_response_token]
+        # Compare specific token logits for first 5 response tokens
+        print("\n  Logits for first 5 response tokens:")
+        for i, (resp_pos, token_id) in enumerate(response_tokens):
+            # Determine Megatron logits position
+            if i == 0:
+                # First token: use comparison_pos (prompt_len - 1)
+                megatron_logits_pos = comparison_pos
             else:
-                sg_token_logit = None
-            if first_response_token < len(megatron_tok):
-                megatron_token_logit = megatron_tok[first_response_token]
-            else:
-                megatron_token_logit = None
+                # Subsequent tokens: use previous response position
+                megatron_logits_pos = first_response_pos + i - 1
 
-            if sg_token_logit is not None and megatron_token_logit is not None:
-                sg_val = sg_token_logit.float().item()
-                megatron_val = megatron_token_logit.float().item()
-                diff = abs(sg_val - megatron_val)
-                tok = first_response_token
-                print(f"\n  Logit for first response token {tok}:")
-                print(f"    SGLang:  {sg_val:.8f}")
-                print(f"    Megatron: {megatron_val:.8f}")
-                print(f"    Diff:    {diff:.8e}")
+            # Get Megatron logits for this position
+            megatron_logits_curr = None
+            logits_key_curr = f"logits_pos_{megatron_logits_pos}"
+            if logits_key_curr in megatron_tensors:
+                megatron_logits_curr = megatron_tensors[logits_key_curr]
+            elif "logits_full" in megatron_tensors:
+                full_logits = megatron_tensors["logits_full"]
+                if full_logits.dim() == 3:
+                    d0, d1, d2 = full_logits.shape
+                    if d0 == 1:
+                        megatron_logits_curr = full_logits[0, megatron_logits_pos:megatron_logits_pos+1, :]
+                    else:
+                        megatron_logits_curr = full_logits[megatron_logits_pos:megatron_logits_pos+1, 0, :]
+                elif full_logits.dim() == 2:
+                    megatron_logits_curr = full_logits[megatron_logits_pos:megatron_logits_pos+1, :]
+
+            # Get SGLang logits for this position
+            sglang_logits_curr = None
+            if i == 0:
+                # First token: use prefill pass logits
+                sglang_logits_curr = sglang_logits
+            else:
+                # Subsequent tokens: load from decode pass
+                sglang_decode_curr = find_sglang_decode_pass(sglang_dir, resp_pos)
+                if sglang_decode_curr is not None:
+                    decode_id, decode_path = sglang_decode_curr
+                    decode_tensors = torch.load(decode_path, map_location="cpu")
+                    if "logits_processor" in decode_tensors:
+                        sglang_logits_curr = decode_tensors["logits_processor"]
+
+            # Compare logits for this token
+            if sglang_logits_curr is not None and megatron_logits_curr is not None:
+                sg_tok = sglang_logits_curr.flatten()
+                megatron_tok = megatron_logits_curr.flatten()
+                if token_id < len(sg_tok) and token_id < len(megatron_tok):
+                    sg_token_logit = sg_tok[token_id]
+                    megatron_token_logit = megatron_tok[token_id]
+                    sg_val = sg_token_logit.float().item()
+                    megatron_val = megatron_token_logit.float().item()
+                    diff = abs(sg_val - megatron_val)
+                    print(f"\n    Token #{i+1} (ID={token_id}, pos={resp_pos}):")
+                    print(f"      SGLang:    {sg_val:.8f}")
+                    print(f"      Megatron:  {megatron_val:.8f}")
+                    print(f"      Diff:      {diff:.8e}")
+                    if diff < 1e-5:
+                        print("      ✓ MATCH")
+                    else:
+                        print("      ✗ DIFFER")
+                else:
+                    print(f"\n    Token #{i+1} (ID={token_id}): Index out of bounds")
+            else:
+                print(f"\n    Token #{i+1} (ID={token_id}): Missing logits")
+                if sglang_logits_curr is None:
+                    print("      SGLang logits not found")
+                if megatron_logits_curr is None:
+                    print(f"      Megatron logits not found (pos {megatron_logits_pos})")
 
         # =====================================================================
         # 3. Compare logprobs (using respective production functions)
         # =====================================================================
         print("\n" + "-" * 50)
-        print("LOGPROBS COMPARISON (using production paths)")
+        print("LOGPROBS COMPARISON (using production paths) - First 5 Response Tokens")
         print("-" * 50)
         print("  SGLang:   sampler.py (logits.bfloat16().div(float32_temp_tensor).bfloat16() -> log_softmax)")
         print("  Megatron: loss.py + ppo_utils.py (logits.bfloat16().div(float32_temp_tensor).bfloat16() -> log_softmax)")
         print("\n  NOTE: Both use float32 tensor for temperature division to ensure precision match!")
 
-        tok_id = first_response_token
         temperature = 0.8  # Default temperature, adjust if needed
         print(f"\n  Using temperature: {temperature}")
 
-        # Use SGLang's production path for SGLang logits
-        print("\n  --- SGLang Temperature Processing ---")
-        sg_logprobs, sg_target_lp = compute_logprobs_sglang(
-            sglang_logits, temperature=temperature, target_token_id=tok_id, verbose=True
-        )
-        # Use Megatron's production path for Megatron logits
-        print("\n  --- Megatron Temperature Processing ---")
-        megatron_logprobs, megatron_target_lp = compute_logprobs_megatron(
-            megatron_logits, target_token_id=tok_id, temperature=temperature, true_on_policy_mode=True, verbose=True
-        )
-
-        sg_lp_flat = sg_logprobs.flatten()
-        megatron_lp_flat = megatron_logprobs.flatten()
-        print(f"    SGLang logprobs first 10: {sg_lp_flat[:10].tolist()}")
-        print(f"    Megatron logprobs first 10: {megatron_lp_flat[:10].tolist()}")
-        if sg_lp_flat.shape != megatron_lp_flat.shape:
-            min_len = min(len(sg_lp_flat), len(megatron_lp_flat))
-            sg_lp_flat = sg_lp_flat[:min_len]
-            megatron_lp_flat = megatron_lp_flat[:min_len]
-
-        lp_stats = compute_diff_stats(sg_lp_flat, megatron_lp_flat)
-
-        print("\n  Full distribution comparison:")
-        print(f"    Max diff:  {lp_stats['max_diff']:.8e}")
-        print(f"    Mean diff: {lp_stats['mean_diff']:.8e}")
-
-        if sg_target_lp is not None and megatron_target_lp is not None:
-            sg_lp_val = sg_target_lp.float().item()
-            megatron_lp_val = megatron_target_lp.float().item()
-            diff = abs(sg_lp_val - megatron_lp_val)
-            tok = first_response_token
-            print(f"\n  Logprob for first response token {tok}:")
-            print(f"    SGLang (production):  {sg_lp_val:.8f}")
-            print(f"    Megatron (production): {megatron_lp_val:.8f}")
-            print(f"    Diff:    {diff:.8e}")
-
-            if diff < 1e-5:
-                print("    ✓ Logprobs MATCH!")
+        # Compare logprobs for first 5 response tokens
+        print("\n  Logprobs for first 5 response tokens:")
+        for i, (resp_pos, token_id) in enumerate(response_tokens):
+            # Determine Megatron logits position
+            if i == 0:
+                megatron_logits_pos = comparison_pos
             else:
-                print("    ✗ Logprobs DIFFER!")
+                megatron_logits_pos = first_response_pos + i - 1
+
+            # Get Megatron logits for this position
+            megatron_logits_curr = None
+            logits_key_curr = f"logits_pos_{megatron_logits_pos}"
+            if logits_key_curr in megatron_tensors:
+                megatron_logits_curr = megatron_tensors[logits_key_curr]
+            elif "logits_full" in megatron_tensors:
+                full_logits = megatron_tensors["logits_full"]
+                if full_logits.dim() == 3:
+                    d0, d1, d2 = full_logits.shape
+                    if d0 == 1:
+                        megatron_logits_curr = full_logits[0, megatron_logits_pos:megatron_logits_pos+1, :]
+                    else:
+                        megatron_logits_curr = full_logits[megatron_logits_pos:megatron_logits_pos+1, 0, :]
+                elif full_logits.dim() == 2:
+                    megatron_logits_curr = full_logits[megatron_logits_pos:megatron_logits_pos+1, :]
+
+            # Get SGLang logits for this position
+            sglang_logits_curr = None
+            if i == 0:
+                sglang_logits_curr = sglang_logits
+            else:
+                sglang_decode_curr = find_sglang_decode_pass(sglang_dir, resp_pos)
+                if sglang_decode_curr is not None:
+                    decode_id, decode_path = sglang_decode_curr
+                    decode_tensors = torch.load(decode_path, map_location="cpu")
+                    if "logits_processor" in decode_tensors:
+                        sglang_logits_curr = decode_tensors["logits_processor"]
+
+            # Compute logprobs for this token
+            if sglang_logits_curr is not None and megatron_logits_curr is not None:
+                # Use SGLang's production path
+                verbose_first = (i == 0)  # Only verbose for first token
+                if verbose_first:
+                    print(f"\n  --- Token #{i+1} SGLang Temperature Processing ---")
+                sg_logprobs_curr, sg_target_lp = compute_logprobs_sglang(
+                    sglang_logits_curr, temperature=temperature, target_token_id=token_id, verbose=verbose_first
+                )
+                # Use Megatron's production path
+                if verbose_first:
+                    print(f"\n  --- Token #{i+1} Megatron Temperature Processing ---")
+                megatron_logprobs_curr, megatron_target_lp = compute_logprobs_megatron(
+                    megatron_logits_curr, target_token_id=token_id, temperature=temperature, 
+                    true_on_policy_mode=True, verbose=verbose_first
+                )
+
+                if sg_target_lp is not None and megatron_target_lp is not None:
+                    sg_lp_val = sg_target_lp.float().item()
+                    megatron_lp_val = megatron_target_lp.float().item()
+                    diff = abs(sg_lp_val - megatron_lp_val)
+                    print(f"\n    Token #{i+1} (ID={token_id}, pos={resp_pos}):")
+                    print(f"      SGLang (production):   {sg_lp_val:.8f}")
+                    print(f"      Megatron (production): {megatron_lp_val:.8f}")
+                    print(f"      Diff:                  {diff:.8e}")
+                    if diff < 1e-5:
+                        print("      ✓ Logprobs MATCH!")
+                    else:
+                        print("      ✗ Logprobs DIFFER!")
+                else:
+                    print(f"\n    Token #{i+1} (ID={token_id}): Could not extract logprob")
+            else:
+                print(f"\n    Token #{i+1} (ID={token_id}): Missing logits for logprob computation")
 
         # =====================================================================
         # 4. Compare directly-dumped logprobs (if available)
