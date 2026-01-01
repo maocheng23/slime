@@ -47,18 +47,18 @@ def to_tensor(x, prefer_last=True):
     return x
 
 
-def compute_logprobs_from_logits(
+def compute_logprobs_sglang(
     logits: torch.Tensor,
     temperature: float = 1.0,
     target_token_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
-    Compute log probabilities from logits using SGLang's formula.
+    Compute log probabilities using SGLang's production sampler path.
 
-    SGLang formula (when rl_on_policy_target is enabled):
-        logits_bf16 = logits.bfloat16()
-        logits_div_temp = logits_bf16.div(temperature).bfloat16()
-        logprobs = torch.log_softmax(logits_div_temp, dim=-1)
+    This matches the exact code in sglang/python/sglang/srt/layers/sampler.py
+    when rl_on_policy_target is set:
+        logits_div_temperature = logits.bfloat16().div(sampling_info.temperatures).bfloat16()
+        logprobs_via_logsoftmax_kernel = torch.log_softmax(logits_div_temperature, dim=-1)
 
     Args:
         logits: Raw logits tensor
@@ -68,9 +68,9 @@ def compute_logprobs_from_logits(
     Returns:
         (full_logprobs, target_logprob)
     """
-    logits_bf16 = logits.bfloat16()
-    logits_div_temp = logits_bf16.div(temperature).bfloat16()
-    logprobs = torch.log_softmax(logits_div_temp, dim=-1)
+    # Exact SGLang production path from sampler.py lines 111-117
+    logits_div_temperature = logits.bfloat16().div(temperature).bfloat16()
+    logprobs = torch.log_softmax(logits_div_temperature, dim=-1)
 
     target_logprob = None
     if target_token_id is not None:
@@ -84,15 +84,103 @@ def compute_logprobs_from_logits(
     return logprobs, target_logprob
 
 
+def compute_logprobs_megatron(
+    logits: torch.Tensor,
+    target_token_id: int | None = None,
+    temperature: float = 1.0,
+    true_on_policy_mode: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Compute log probabilities using Megatron's production path.
+
+    This matches the exact code in slime/slime/utils/ppo_utils.py compute_log_probs():
+
+    When true_on_policy_mode=True (default, matches SGLang's path):
+        logits_bf16 = logits.bfloat16()
+        log_probs = torch.log_softmax(logits_bf16, dim=-1)
+
+    When true_on_policy_mode=False (original Megatron path):
+        Uses fused_vocab_parallel_cross_entropy (TP-aware, but simplified here)
+        This is the standard log_softmax in float32 for comparison purposes.
+
+    Args:
+        logits: Raw logits tensor
+        target_token_id: If provided, return logprob for this token
+        temperature: Temperature for softmax (default 1.0)
+        true_on_policy_mode: If True, use SGLang-compatible BF16 path
+
+    Returns:
+        (full_logprobs, target_logprob)
+    """
+    if true_on_policy_mode:
+        # Exact Megatron production path from ppo_utils.py lines 162-170
+        # This matches SGLang's path for true on-policy
+        logits_bf16 = logits.bfloat16()
+        if temperature != 1.0:
+            logits_bf16 = logits_bf16.div(temperature).bfloat16()
+        logprobs = torch.log_softmax(logits_bf16, dim=-1)
+    else:
+        # Original Megatron path (non-true-on-policy)
+        # In production, this uses fused_vocab_parallel_cross_entropy
+        # For comparison, we simulate with standard log_softmax in float32
+        logits_scaled = logits.float()
+        if temperature != 1.0:
+            logits_scaled = logits_scaled / temperature
+        logprobs = torch.log_softmax(logits_scaled, dim=-1)
+
+    target_logprob = None
+    if target_token_id is not None:
+        if logprobs.dim() == 1:
+            target_logprob = logprobs[target_token_id]
+        elif logprobs.dim() == 2:
+            target_logprob = logprobs[0, target_token_id]
+        elif logprobs.dim() == 3:
+            target_logprob = logprobs[0, 0, target_token_id]
+
+    return logprobs, target_logprob
+
+
+def compute_logprobs_from_logits(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    target_token_id: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Compute log probabilities using the unified SGLang/Megatron true-on-policy path.
+
+    This is a compatibility wrapper that uses the true-on-policy formula
+    which is identical for both SGLang and Megatron:
+        logits_bf16 = logits.bfloat16()
+        logits_div_temp = logits_bf16.div(temperature).bfloat16()
+        logprobs = torch.log_softmax(logits_div_temp, dim=-1)
+
+    Args:
+        logits: Raw logits tensor
+        temperature: Temperature for softmax (default 1.0)
+        target_token_id: If provided, return logprob for this token
+
+    Returns:
+        (full_logprobs, target_logprob)
+    """
+    # Use SGLang's formula as the unified path
+    return compute_logprobs_sglang(logits, temperature, target_token_id)
+
+
 def print_top_logprobs(
     logits: torch.Tensor,
     actual_token_id: int | None,
     label: str,
     top_k: int = 10,
     temperature: float = 1.0,
+    source: str = "sglang",
+    true_on_policy_mode: bool = True,
 ) -> None:
     """
     Print top-k logprobs and the logprob for the actual predicted token.
+
+    Uses the appropriate production function based on source:
+    - "sglang": Uses SGLang's sampler.py production path
+    - "megatron": Uses Megatron's ppo_utils.py production path
 
     Args:
         logits: Raw logits tensor (vocab_size,) or (1, vocab_size)
@@ -100,8 +188,19 @@ def print_top_logprobs(
         label: Label for printing (e.g., "SGLang pos 90" or "Megatron pos 90")
         top_k: Number of top tokens to show
         temperature: Temperature for softmax
+        source: "sglang" or "megatron" to select the appropriate production function
+        true_on_policy_mode: For Megatron, whether to use true-on-policy BF16 path
     """
-    logprobs, _ = compute_logprobs_from_logits(logits, temperature)
+    # Use the appropriate production function based on source
+    if source == "sglang":
+        logprobs, _ = compute_logprobs_sglang(logits, temperature)
+    elif source == "megatron":
+        logprobs, _ = compute_logprobs_megatron(
+            logits, temperature=temperature, true_on_policy_mode=true_on_policy_mode
+        )
+    else:
+        raise ValueError(f"Unknown source: {source}. Must be 'sglang' or 'megatron'")
+
     logprobs_flat = logprobs.flatten().float()
 
     # Get top-k tokens by logprob
@@ -109,7 +208,7 @@ def print_top_logprobs(
     top_values, top_indices = torch.topk(logprobs_flat, k)
 
     print(f"\n  {label}:")
-    print(f"    Top {top_k} tokens by logprob:")
+    print(f"    Top {top_k} tokens by logprob (using {source} production path):")
     for i, (val, idx) in enumerate(zip(top_values, top_indices)):
         is_actual = (actual_token_id is not None
                      and idx.item() == actual_token_id)
@@ -2670,18 +2769,22 @@ def compare_single_pass_pair(
                 print(f"    Diff:    {diff:.8e}")
 
         # =====================================================================
-        # 3. Compare logprobs (computed from logits)
+        # 3. Compare logprobs (using respective production functions)
         # =====================================================================
         print("\n" + "-" * 50)
-        print("LOGPROBS COMPARISON (computed from logits)")
+        print("LOGPROBS COMPARISON (using production paths)")
         print("-" * 50)
+        print("  SGLang:   sampler.py (logits.bfloat16().div(temp).bfloat16() -> log_softmax)")
+        print("  Megatron: ppo_utils.py (logits.bfloat16() -> log_softmax)")
 
         tok_id = first_response_token
-        sg_logprobs, sg_target_lp = compute_logprobs_from_logits(
+        # Use SGLang's production path for SGLang logits
+        sg_logprobs, sg_target_lp = compute_logprobs_sglang(
             sglang_logits, temperature=1.0, target_token_id=tok_id
         )
-        megatron_logprobs, megatron_target_lp = compute_logprobs_from_logits(
-            megatron_logits, temperature=1.0, target_token_id=tok_id
+        # Use Megatron's production path for Megatron logits
+        megatron_logprobs, megatron_target_lp = compute_logprobs_megatron(
+            megatron_logits, target_token_id=tok_id, temperature=1.0, true_on_policy_mode=True
         )
 
         sg_lp_flat = sg_logprobs.flatten()
@@ -2694,7 +2797,7 @@ def compare_single_pass_pair(
 
         lp_stats = compute_diff_stats(sg_lp_flat, megatron_lp_flat)
 
-        print("  Full distribution comparison:")
+        print("\n  Full distribution comparison:")
         print(f"    Max diff:  {lp_stats['max_diff']:.8e}")
         print(f"    Mean diff: {lp_stats['mean_diff']:.8e}")
 
@@ -2704,8 +2807,8 @@ def compare_single_pass_pair(
             diff = abs(sg_lp_val - megatron_lp_val)
             tok = first_response_token
             print(f"\n  Logprob for first response token {tok}:")
-            print(f"    SGLang:  {sg_lp_val:.8f}")
-            print(f"    Megatron: {megatron_lp_val:.8f}")
+            print(f"    SGLang (production):  {sg_lp_val:.8f}")
+            print(f"    Megatron (production): {megatron_lp_val:.8f}")
             print(f"    Diff:    {diff:.8e}")
 
             if diff < 1e-5:
@@ -2854,7 +2957,7 @@ def compare_single_pass_pair(
                     print(f"  Available: {avail[:10]}...")
 
         # =========================================================
-        # Print top logprobs for SGLang
+        # Print top logprobs for SGLang (using SGLang's production path)
         # =========================================================
         if sglang_logits_curr is not None:
             print_top_logprobs(
@@ -2862,10 +2965,11 @@ def compare_single_pass_pair(
                 actual_token_id=token_id,
                 label=f"SGLang (decode, first_pos={resp_pos})",
                 top_k=10,
+                source="sglang",
             )
 
         # =========================================================
-        # Print top logprobs for Megatron
+        # Print top logprobs for Megatron (using Megatron's production path)
         # =========================================================
         if megatron_logits_curr is not None:
             print_top_logprobs(
@@ -2873,6 +2977,8 @@ def compare_single_pass_pair(
                 actual_token_id=token_id,
                 label=f"Megatron (logits_pos_{megatron_pos})",
                 top_k=10,
+                source="megatron",
+                true_on_policy_mode=True,
             )
 
         # =========================================================
@@ -2900,25 +3006,26 @@ def compare_single_pass_pair(
                 print(f"    Shape mismatch: {sg_flat.shape} vs {megatron_flat.shape}")
 
         # =========================================================
-        # Compare logprobs (computed from logits)
+        # Compare logprobs (using respective production functions)
         # =========================================================
         if (sglang_logits_curr is not None and
                 megatron_logits_curr is not None):
             print(
                 f"\n  Response token #{token_idx+1} "
-                f"logprobs comparison:"
+                f"logprobs comparison (using production paths):"
             )
-            sg_logprobs_curr, sg_target_lp = compute_logprobs_from_logits(
+            # Use SGLang's production path for SGLang logits
+            sg_logprobs_curr, sg_target_lp = compute_logprobs_sglang(
                 sglang_logits_curr,
                 temperature=1.0,
                 target_token_id=token_id
             )
-            megatron_logprobs_curr, megatron_target_lp = (
-                compute_logprobs_from_logits(
-                    megatron_logits_curr,
-                    temperature=1.0,
-                    target_token_id=token_id
-                )
+            # Use Megatron's production path for Megatron logits
+            megatron_logprobs_curr, megatron_target_lp = compute_logprobs_megatron(
+                megatron_logits_curr,
+                target_token_id=token_id,
+                temperature=1.0,
+                true_on_policy_mode=True,
             )
 
             sg_lp_flat = sg_logprobs_curr.flatten()
@@ -2934,8 +3041,8 @@ def compare_single_pass_pair(
                     megatron_lp_val = megatron_target_lp.float().item()
                     diff = abs(sg_lp_val - megatron_lp_val)
                     print(f"    Logprob for token {token_id}:")
-                    print(f"      SGLang:  {sg_lp_val:.8f}")
-                    print(f"      Megatron: {megatron_lp_val:.8f}")
+                    print(f"      SGLang (production):  {sg_lp_val:.8f}")
+                    print(f"      Megatron (production): {megatron_lp_val:.8f}")
                     print(f"      Diff:    {diff:.8e}")
                     if diff < 1e-5:
                         print(
