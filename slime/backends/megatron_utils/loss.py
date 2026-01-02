@@ -1001,9 +1001,9 @@ def policy_loss_function(
             logger.warning("sum of abs_diff[:100]: " + str((old_log_probs[:100] - rollout_log_probs[:100]).abs().sum().item()))
             logger.warning("sum of abs_diff[:200]: " + str((old_log_probs[:200] - rollout_log_probs[:200]).abs().sum().item()))
             logger.warning("sum of abs_diff[:300]: " + str((old_log_probs[:300] - rollout_log_probs[:300]).abs().sum().item()))
-            logger.warning("sum of abs_diff[:400]: " + str((old_log_probs[:400] - rollout_log_probs[:400]).abs().sum().item()))
-            logger.warning("sum of abs_diff[:500]: " + str((old_log_probs[:500] - rollout_log_probs[:500]).abs().sum().item()))
-            logger.warning("sum of abs_diff[:600]: " + str((old_log_probs[:600] - rollout_log_probs[:600]).abs().sum().item()))
+            # logger.warning("sum of abs_diff[:400]: " + str((old_log_probs[:400] - rollout_log_probs[:400]).abs().sum().item()))
+            # logger.warning("sum of abs_diff[:500]: " + str((old_log_probs[:500] - rollout_log_probs[:500]).abs().sum().item()))
+            # logger.warning("sum of abs_diff[:600]: " + str((old_log_probs[:600] - rollout_log_probs[:600]).abs().sum().item()))
             logger.warning("sum of abs_diff[-1]: " + str((old_log_probs[-1] - rollout_log_probs[-1]).abs().item()))
             logger.warning("max of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().max().item()))
             logger.warning("mean of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().mean().item()))
@@ -1060,10 +1060,91 @@ def policy_loss_function(
                             logger.warning(f"    Sample {sample_idx} total_length: {total_length}, prompt_len: {prompt_len}")
                         break
                 
+                # Print detailed info for the first difference position
+                logger.warning(f"\n  === DETAILED ANALYSIS: Position {first_diff_idx} (First Difference) ===")
+                logger.warning(f"  This is response token position {first_diff_idx} (0-indexed within response)")
+                
+                # Find which sample this belongs to and compute absolute position
+                response_lengths = batch["response_lengths"]
+                total_lengths = batch["total_lengths"]
+                sample_boundaries = [0]
+                for rl in response_lengths:
+                    sample_boundaries.append(sample_boundaries[-1] + rl)
+                
+                diff_sample_idx = -1
+                pos_in_sample = -1
+                absolute_seq_pos = -1
+                for i, boundary in enumerate(sample_boundaries[1:], 1):
+                    if first_diff_idx < boundary:
+                        diff_sample_idx = i - 1
+                        pos_in_sample = first_diff_idx - sample_boundaries[i - 1]
+                        prompt_len = total_lengths[diff_sample_idx] - response_lengths[diff_sample_idx]
+                        # Absolute position in the full sequence
+                        # Response token at position pos_in_sample corresponds to sequence position (prompt_len + pos_in_sample)
+                        # But the logits for this token are at position (prompt_len + pos_in_sample - 1)
+                        absolute_seq_pos = prompt_len + pos_in_sample
+                        logits_pos = prompt_len + pos_in_sample - 1  # Logits position (predicts next token)
+                        break
+                
+                if diff_sample_idx != -1:
+                    logger.warning(f"  Sample index: {diff_sample_idx}")
+                    logger.warning(f"  Position within sample (response): {pos_in_sample}")
+                    logger.warning(f"  Prompt length: {total_lengths[diff_sample_idx] - response_lengths[diff_sample_idx]}")
+                    logger.warning(f"  Total length: {total_lengths[diff_sample_idx]}")
+                    logger.warning(f"  Response length: {response_lengths[diff_sample_idx]}")
+                    logger.warning(f"  Absolute sequence position (token position): {absolute_seq_pos}")
+                    logger.warning(f"  Logits position (predicts token at {absolute_seq_pos}): {logits_pos}")
+                    
+                    # Print token ID at this position
+                    if "unconcat_tokens" in batch and diff_sample_idx < len(batch["unconcat_tokens"]):
+                        tokens = batch["unconcat_tokens"][diff_sample_idx]
+                        if absolute_seq_pos < len(tokens):
+                            token_id = tokens[absolute_seq_pos].item()
+                            logger.warning(f"  Token ID at position {absolute_seq_pos}: {token_id}")
+                        else:
+                            logger.warning(f"  Token ID: N/A (position {absolute_seq_pos} out of bounds, len={len(tokens)})")
+                    
+                    logger.warning(f"\n  === POSSIBLE CHUNKED PREFILL BOUNDARY ===")
+                    # Check if position 369 might be at a chunked prefill boundary
+                    # Common chunked_prefill_size values: 1024, 2048, 4096, 8192, etc.
+                    common_chunk_sizes = [256, 512, 1024, 2048, 4096, 8192, 16384]
+                    prompt_len = total_lengths[diff_sample_idx] - response_lengths[diff_sample_idx]
+                    total_seq_len_at_diff = prompt_len + pos_in_sample
+                    
+                    logger.warning(f"  Checking if position {pos_in_sample} (absolute {total_seq_len_at_diff}) is at a chunk boundary:")
+                    for chunk_size in common_chunk_sizes:
+                        # Check if this position is near a chunk boundary
+                        # Chunk boundaries are typically at: prompt_len + n * chunk_size
+                        chunk_boundary_after_prompt = prompt_len + chunk_size
+                        if abs(total_seq_len_at_diff - chunk_boundary_after_prompt) < 10:
+                            logger.warning(f"    ⚠️  Position {total_seq_len_at_diff} is near chunk boundary at {chunk_boundary_after_prompt} (chunk_size={chunk_size})")
+                            logger.warning(f"    This suggests SGLang may have switched from prefill chunk to decode mode!")
+                            logger.warning(f"    Check SGLang's chunked_prefill_size configuration.")
+                    
+                    # Also check if this is near the transition from prefill to decode
+                    # In SGLang, prefill processes prompt + some response tokens, then switches to decode
+                    # The transition point depends on chunked_prefill_size
+                    if pos_in_sample > 0:
+                        logger.warning(f"  Note: Position {pos_in_sample} is response token #{pos_in_sample + 1}")
+                        logger.warning(f"  If SGLang uses chunked prefill, tokens after chunk_size may be processed differently.")
+                    
+                    logger.warning(f"\n  === ACTION REQUIRED ===")
+                    logger.warning(f"  To debug this difference, check:")
+                    logger.warning(f"  1. SGLang's chunked_prefill_size configuration")
+                    logger.warning(f"  2. Whether position {pos_in_sample} is at a chunk boundary")
+                    logger.warning(f"  3. Raw logits at sequence position {logits_pos} (before temperature scaling)")
+                    logger.warning(f"  4. Temperature scaling process for position {logits_pos}")
+                    logger.warning(f"  5. Logits after temperature scaling at position {logits_pos}")
+                    logger.warning(f"  6. Compare with SGLang's logits at the same position")
+                    logger.warning(f"  In dump files, look for:")
+                    logger.warning(f"    - Megatron: logits_pos_{logits_pos} or logits_full[{logits_pos}]")
+                    logger.warning(f"    - SGLang: decode pass with first_position={absolute_seq_pos}")
+                    logger.warning(f"    - SGLang: Check if this is the first decode pass after prefill chunk")
+                
                 # Check surrounding positions
                 start_idx = max(0, first_diff_idx - 5)
                 end_idx = min(len(old_log_probs), first_diff_idx + 6)
-                logger.warning(f"  Surrounding positions [{start_idx}:{end_idx}]:")
+                logger.warning(f"\n  Surrounding positions [{start_idx}:{end_idx}]:")
                 for i in range(start_idx, end_idx):
                     diff_val = abs_diff[i].item()
                     old_val = old_log_probs[i].item()
