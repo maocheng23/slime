@@ -81,14 +81,32 @@ def compute_logprobs_sglang(
     # CRITICAL: Use float32 tensor for temperature to match SGLang's precision
     # CRITICAL: Use SGLang's batch-invariant log_softmax, NOT PyTorch's!
     # SGLang uses a custom Triton kernel that produces different numerical results.
-    temp_tensor = torch.tensor(temperature, dtype=torch.float32, device=logits.device)
+    # CRITICAL: Triton kernel requires CUDA tensor, so move to CUDA if needed
+    original_device = logits.device
+    device = original_device
+    if device.type == 'cpu' and torch.cuda.is_available():
+        # Move to CUDA for Triton kernel
+        logits = logits.cuda()
+        device = logits.device
+    
+    temp_tensor = torch.tensor(temperature, dtype=torch.float32, device=device)
     logits_bf16 = logits.bfloat16()
     logits_div_temperature = logits_bf16.div(temp_tensor).bfloat16()
     try:
         from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
-        logprobs = sglang_log_softmax(logits_div_temperature, dim=-1)
-    except ImportError:
+        # Triton kernel requires CUDA
+        if logits_div_temperature.device.type == 'cuda':
+            logprobs = sglang_log_softmax(logits_div_temperature, dim=-1)
+        else:
+            # Fallback to PyTorch if CUDA not available
+            logprobs = torch.log_softmax(logits_div_temperature, dim=-1)
+    except (ImportError, ValueError):
+        # Fallback to PyTorch if SGLang kernel not available or error occurs
         logprobs = torch.log_softmax(logits_div_temperature, dim=-1)
+
+    # Move result back to original device if it was moved to CUDA
+    if original_device.type == 'cpu' and logprobs.device.type == 'cuda':
+        logprobs = logprobs.cpu()
 
     if verbose:
         logits_flat = logits_div_temperature.flatten()
@@ -152,15 +170,33 @@ def compute_logprobs_megatron(
         # CRITICAL: Use float32 tensor for temperature to match SGLang's precision
         # CRITICAL: Use SGLang's batch-invariant log_softmax, NOT PyTorch's!
         # SGLang uses a custom Triton kernel that produces different numerical results.
-        temp_tensor = torch.tensor(temperature, dtype=torch.float32, device=logits.device)
+        # CRITICAL: Triton kernel requires CUDA tensor, so move to CUDA if needed
+        original_device = logits.device
+        device = original_device
+        if device.type == 'cpu' and torch.cuda.is_available():
+            # Move to CUDA for Triton kernel
+            logits = logits.cuda()
+            device = logits.device
+        
+        temp_tensor = torch.tensor(temperature, dtype=torch.float32, device=device)
         logits_bf16 = logits.bfloat16()
         if temperature != 1.0:
             logits_bf16 = logits_bf16.div(temp_tensor).bfloat16()
         try:
             from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
-            logprobs = sglang_log_softmax(logits_bf16, dim=-1)
-        except ImportError:
+            # Triton kernel requires CUDA
+            if logits_bf16.device.type == 'cuda':
+                logprobs = sglang_log_softmax(logits_bf16, dim=-1)
+            else:
+                # Fallback to PyTorch if CUDA not available
+                logprobs = torch.log_softmax(logits_bf16, dim=-1)
+        except (ImportError, ValueError):
+            # Fallback to PyTorch if SGLang kernel not available or error occurs
             logprobs = torch.log_softmax(logits_bf16, dim=-1)
+
+        # Move result back to original device if it was moved to CUDA
+        if original_device.type == 'cpu' and logprobs.device.type == 'cuda':
+            logprobs = logprobs.cpu()
 
         if verbose:
             logits_flat = logits_bf16.flatten()
@@ -3335,7 +3371,7 @@ def compare_first_response_token(
             sglang_dir=sglang_dir,
             verbose=verbose,
         )
-        break
+        # Continue to next pass (removed break to process all passes)
 
     # Overall summary
     print("\n" + "=" * 70)
