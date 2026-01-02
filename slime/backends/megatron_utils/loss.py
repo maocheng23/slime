@@ -414,9 +414,8 @@ def get_log_probs_and_entropy(
                 if actual_logprob is not None:
                     diff = abs(logprob_for_token - actual_logprob)
                     debug_logger.info(f"      Diff (manual vs actual): {diff:.8e}")
-                debug_logger.info(f"  logits max: {logit_for_token.max().item()}, min: {logit_for_token.min().item()}, mean: {logit_for_token.mean().item()}, std: {logit_for_token.std().item()}, sum: {logit_for_token.sum().item()}")
                 debug_logger.info(f"  logits_div_temperature max: {logits_chunk[i].max().item()}, min: {logits_chunk[i].min().item()}, mean: {logits_chunk[i].mean().item()}, std: {logits_chunk[i].std().item()}, sum: {logits_chunk[i].sum().item()}")
-                debug_logger.info(f"  logprobs_via_logsoftmax_kernel max: {actual_logprob.max().item()}, min: {logprobs_via_logsoftmax_kernel.min().item()}, mean: {logprobs_via_logsoftmax_kernel.mean().item()}, std: {logprobs_via_logsoftmax_kernel.std().item()}, sum: {logprobs_via_logsoftmax_kernel.sum().item()}")
+                debug_logger.info(f"  logprobs_via_logsoftmax_kernel max: {logprobs_full[i].max().item()}, min: {logprobs_full[i].min().item()}, mean: {logprobs_full[i].mean().item()}, std: {logprobs_full[i].std().item()}, sum: {logprobs_full[i].sum().item()}")
                     
                 debug_logger.info(f"      first 10 logits (after temp): {logits_chunk[i][:10].tolist()}")
                 debug_logger.info(f"      sum of logits (after temp): {logits_chunk[i].sum().item():.6f}")
