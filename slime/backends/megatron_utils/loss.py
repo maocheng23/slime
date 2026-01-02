@@ -75,7 +75,7 @@ def get_responses(
             import logging
             debug_logger = logging.getLogger(__name__)
             debug_logger.info(f"  temp_tensor shape: {temp_tensor.shape}, dtype: {temp_tensor.dtype}")
-            debug_logger.info(f"  temp_tensor first 10: {temp_tensor[:10].tolist()}")
+            debug_logger.info(f"  temp_tensor first 10: {temp_tensor}")
             debug_logger.info(f"  args.rollout_temperature: {args.rollout_temperature}")
         logits = logits.bfloat16().div(temp_tensor).bfloat16()
     else:
