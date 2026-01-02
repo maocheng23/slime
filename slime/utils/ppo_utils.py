@@ -174,7 +174,8 @@ def compute_log_probs(
         from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
         logits_bf16 = logits.bfloat16()
         # Triton kernel requires CUDA tensor
-        print(f "[DEBUG] WARNING:  torch.log_softmax", {torch.log_softmax.__module__})
+        temp = torch.log_softmax.__module__
+        print(f "[DEBUG] WARNING:  torch.log_softmax, {temp}")
         # if logits_bf16.device.type == 'cuda':
         #     print(f"[DEBUG] Using SGLang's batch-invariant log_softmax (device={logits_bf16.device})")
         #     log_probs = sglang_log_softmax(logits_bf16, dim=-1)
