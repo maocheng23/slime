@@ -90,7 +90,8 @@ def get_responses(
             debug_logger.info(f"  logits sum (before temp): {logits.sum().item():.8f}")
             debug_logger.info(f"  logits first row, first 10 (before temp): {logits[0, :10].tolist() if logits.dim() >= 2 else logits[:10].tolist()}")
             debug_logger.info(f"  temp_tensor shape: {temp_tensor.shape}, dtype: {temp_tensor.dtype}")
-            debug_logger.info(f"  temp_tensor value: {temp_tensor.item()}")
+            debug_logger.info(f"  temp_tensor values (first 10): {temp_tensor[:10, 0].tolist() if temp_tensor.dim() >= 2 else temp_tensor[:10].tolist()}")
+            debug_logger.info(f"  temp_tensor min: {temp_tensor.min().item():.8f}, max: {temp_tensor.max().item():.8f}")
             debug_logger.info(f"  args.rollout_temperature: {args.rollout_temperature}")
             
             # Perform division step by step to check intermediate results
