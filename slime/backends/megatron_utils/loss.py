@@ -65,7 +65,14 @@ def get_responses(
     # This intermediate precision matters for numerical consistency!
     if getattr(args, "true_on_policy_mode", False):
         # Create float32 temperature tensor to match SGLang's precision
-        temp_tensor = torch.tensor(
+        # CRITICAL: SGLang uses shape [batch_size, 1] for temperatures
+        # To match exactly, we should use shape [seq_len, 1] for broadcasting
+        # However, since all tokens use the same temperature, we can use a scalar
+        # But to ensure bitwise identical results, we'll match SGLang's shape pattern
+        # when batch_size=1, SGLang uses [1, 1], so we should use [seq_len, 1]
+        seq_len = logits.shape[0]
+        temp_tensor = torch.full(
+            (seq_len, 1),
             args.rollout_temperature,
             dtype=torch.float32,
             device=logits.device
@@ -74,9 +81,43 @@ def get_responses(
         if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
             import logging
             debug_logger = logging.getLogger(__name__)
+            debug_logger.info("=" * 80)
+            debug_logger.info("DEBUG: Megatron temperature processing")
+            debug_logger.info("=" * 80)
+            debug_logger.info(f"  logits shape (before temp): {logits.shape}, dtype: {logits.dtype}")
+            debug_logger.info(f"  logits min (before temp): {logits.min().item():.8f}")
+            debug_logger.info(f"  logits max (before temp): {logits.max().item():.8f}")
+            debug_logger.info(f"  logits sum (before temp): {logits.sum().item():.8f}")
+            debug_logger.info(f"  logits first row, first 10 (before temp): {logits[0, :10].tolist() if logits.dim() >= 2 else logits[:10].tolist()}")
             debug_logger.info(f"  temp_tensor shape: {temp_tensor.shape}, dtype: {temp_tensor.dtype}")
-            debug_logger.info(f"  temp_tensor first 10: {temp_tensor}")
+            debug_logger.info(f"  temp_tensor value: {temp_tensor.item()}")
             debug_logger.info(f"  args.rollout_temperature: {args.rollout_temperature}")
+            
+            # Perform division step by step to check intermediate results
+            logits_bf16 = logits.bfloat16()
+            debug_logger.info(f"  logits_bf16 shape: {logits_bf16.shape}, dtype: {logits_bf16.dtype}")
+            debug_logger.info(f"  logits_bf16 min: {logits_bf16.min().item():.8f}")
+            debug_logger.info(f"  logits_bf16 max: {logits_bf16.max().item():.8f}")
+            debug_logger.info(f"  logits_bf16 sum: {logits_bf16.sum().item():.8f}")
+            debug_logger.info(f"  logits_bf16 first row, first 10: {logits_bf16[0, :10].tolist() if logits_bf16.dim() >= 2 else logits_bf16[:10].tolist()}")
+            
+            # Division: bfloat16 / float32 -> produces float32 intermediate
+            div_result = logits_bf16.div(temp_tensor)
+            debug_logger.info(f"  div_result (intermediate) shape: {div_result.shape}, dtype: {div_result.dtype}")
+            debug_logger.info(f"  div_result min: {div_result.min().item():.8f}")
+            debug_logger.info(f"  div_result max: {div_result.max().item():.8f}")
+            debug_logger.info(f"  div_result sum: {div_result.sum().item():.8f}")
+            debug_logger.info(f"  div_result first row, first 10: {div_result[0, :10].tolist() if div_result.dim() >= 2 else div_result[:10].tolist()}")
+            
+            # Convert back to bfloat16
+            logits_after_temp = div_result.bfloat16()
+            debug_logger.info(f"  logits_after_temp shape: {logits_after_temp.shape}, dtype: {logits_after_temp.dtype}")
+            debug_logger.info(f"  logits_after_temp min: {logits_after_temp.min().item():.8f}")
+            debug_logger.info(f"  logits_after_temp max: {logits_after_temp.max().item():.8f}")
+            debug_logger.info(f"  logits_after_temp sum: {logits_after_temp.sum().item():.8f}")
+            debug_logger.info(f"  logits_after_temp first row, first 10: {logits_after_temp[0, :10].tolist() if logits_after_temp.dim() >= 2 else logits_after_temp[:10].tolist()}")
+            debug_logger.info("=" * 80)
+        
         logits = logits.bfloat16().div(temp_tensor).bfloat16()
     else:
         logits = logits.div(args.rollout_temperature)
