@@ -365,6 +365,36 @@ def compare_layer27_and_logits(
     megatron_tensors = torch.load(megatron_pass_path, map_location="cpu")
     sglang_tensors = torch.load(sglang_pass_path, map_location="cpu")
     
+    # Verify SGLang pass info
+    print("\nVerifying SGLang pass...")
+    sglang_info = {}
+    if "model.forward_batch_info.input_ids" in sglang_tensors:
+        sglang_input_ids = sglang_tensors["model.forward_batch_info.input_ids"]
+        if sglang_input_ids.numel() > 0:
+            sglang_info["first_token_id"] = sglang_input_ids.flatten()[0].item()
+            sglang_info["seq_len"] = sglang_input_ids.numel()
+    
+    if "model.forward_batch_info.positions" in sglang_tensors:
+        sglang_positions = sglang_tensors["model.forward_batch_info.positions"]
+        if sglang_positions.numel() > 0:
+            sglang_info["first_position"] = sglang_positions.flatten()[0].item()
+            sglang_info["last_position"] = sglang_positions.flatten()[-1].item()
+    
+    sglang_info["is_decode"] = sglang_info.get("seq_len", 0) == 1
+    sglang_info["is_prefill"] = sglang_info.get("seq_len", 0) > 1
+    
+    print(f"  SGLang pass type: {'DECODE' if sglang_info.get('is_decode') else 'PREFILL' if sglang_info.get('is_prefill') else 'UNKNOWN'}")
+    if "first_position" in sglang_info:
+        print(f"  First position: {sglang_info['first_position']}")
+    if "first_token_id" in sglang_info:
+        print(f"  First token ID: {sglang_info['first_token_id']}")
+        if sglang_info['first_token_id'] != response_token_id:
+            print(f"  ⚠️  WARNING: SGLang pass token ID ({sglang_info['first_token_id']}) != "
+                  f"requested token ID ({response_token_id})")
+            print(f"     This pass processes token {sglang_info['first_token_id']}, not {response_token_id}")
+        else:
+            print(f"  ✓ Token ID matches: {response_token_id}")
+    
     # Find response position in Megatron dump
     # Note: response_position is the position that PREDICTS the response token
     # (i.e., prompt_len - 1 for first response token)
@@ -594,6 +624,55 @@ def compare_layer27_and_logits(
     print("=" * 70)
 
 
+def find_sglang_pass_for_token(
+    sglang_dir: str,
+    token_id: int,
+) -> Optional[tuple[int, str]]:
+    """
+    Find SGLang decode pass that processes a specific token ID.
+    
+    Args:
+        sglang_dir: Directory containing SGLang pass files
+        token_id: Token ID to find
+    
+    Returns:
+        (pass_id, pass_path) or None if not found
+    """
+    from pathlib import Path
+    
+    dump_path = Path(sglang_dir)
+    if not dump_path.exists():
+        return None
+    
+    # Find all pass files
+    passes = []
+    for f in dump_path.glob("*/Pass*.pt"):
+        name = f.stem
+        if name.startswith("Pass"):
+            try:
+                pass_id = int(name[4:])
+                passes.append((pass_id, f))
+            except ValueError:
+                continue
+    
+    passes = sorted(passes, key=lambda x: x[0])
+    
+    # Check each decode pass
+    for pass_id, path in passes:
+        try:
+            tensors = torch.load(path, map_location="cpu")
+            if "model.forward_batch_info.input_ids" in tensors:
+                input_ids = tensors["model.forward_batch_info.input_ids"]
+                if input_ids.numel() == 1:  # Decode pass has single token
+                    first_token_id = input_ids.flatten()[0].item()
+                    if first_token_id == token_id:
+                        return (pass_id, str(path))
+        except Exception:
+            continue
+    
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare Layer 27 output and logits between SGLang and Megatron"
@@ -607,8 +686,15 @@ def main():
     parser.add_argument(
         "--sglang-pass",
         type=str,
-        required=True,
-        help="Path to SGLang pass file (decode pass with single token)"
+        required=False,
+        help="Path to SGLang pass file (decode pass with single token). "
+             "If not provided, will search in sglang-dir"
+    )
+    parser.add_argument(
+        "--sglang-dir",
+        type=str,
+        required=False,
+        help="Directory containing SGLang pass files (used if --sglang-pass not provided)"
     )
     parser.add_argument(
         "--response-token-id",
@@ -627,14 +713,31 @@ def main():
     
     # Validate paths
     megatron_path = Path(args.megatron_pass)
-    sglang_path = Path(args.sglang_pass)
-    
     if not megatron_path.exists():
         print(f"ERROR: Megatron pass file not found: {megatron_path}")
         return
     
-    if not sglang_path.exists():
-        print(f"ERROR: SGLang pass file not found: {sglang_path}")
+    # Determine SGLang pass path
+    sglang_path = None
+    if args.sglang_pass:
+        sglang_path = Path(args.sglang_pass)
+        if not sglang_path.exists():
+            print(f"ERROR: SGLang pass file not found: {sglang_path}")
+            return
+    elif args.sglang_dir:
+        # Search for pass with matching token ID
+        print(f"Searching for SGLang pass with token ID {args.response_token_id}...")
+        result = find_sglang_pass_for_token(args.sglang_dir, args.response_token_id)
+        if result:
+            pass_id, pass_path = result
+            print(f"✓ Found Pass {pass_id:05d} with token ID {args.response_token_id}")
+            sglang_path = Path(pass_path)
+        else:
+            print(f"ERROR: Could not find SGLang pass with token ID {args.response_token_id}")
+            print(f"  Searched in: {args.sglang_dir}")
+            return
+    else:
+        print("ERROR: Must provide either --sglang-pass or --sglang-dir")
         return
     
     compare_layer27_and_logits(
