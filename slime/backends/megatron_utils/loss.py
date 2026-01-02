@@ -989,7 +989,20 @@ def policy_loss_function(
             )
         
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
-        
+        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("train_rollout_logprob_abs_diff: " + str(train_rollout_logprob_abs_diff.item()))
+            logger.warning("old_log_probs[:10]: " + str(old_log_probs[:10].tolist()))
+            logger.warning("rollout_log_probs[:10]: " + str(rollout_log_probs[:10].tolist()))
+            logger.warning("old_log_probs.shape: " + str(old_log_probs.shape) + "max: " + str(old_log_probs.max().item()) + "min: " + str(old_log_probs.min().item()) + "sum: " + str(old_log_probs.sum().item()))
+            logger.warning("rollout_log_probs.shape: " + str(rollout_log_probs.shape) + "max: " + str(rollout_log_probs.max().item()) + "min: " + str(rollout_log_probs.min().item()) + "sum: " + str(rollout_log_probs.sum().item()))
+            logger.warning("abs_diff[:100]: " + str((old_log_probs[:100] - rollout_log_probs[:100]).abs().tolist()))
+            logger.warning("sum of abs_diff[:100]: " + str((old_log_probs[:100] - rollout_log_probs[:100]).abs().sum().item()))
+            logger.warning("sum of abs_diff[:200]: " + str((old_log_probs[:200] - rollout_log_probs[:200]).abs().sum().item()))
+            logger.warning("sum of abs_diff[:300]: " + str((old_log_probs[:300] - rollout_log_probs[:300]).abs().sum().item()))
+            logger.wanring("sum of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().max().item()))
+            
         # In true_on_policy_mode, a significant difference means model weights changed,
         # which breaks the true on-policy assumption. This is expected as training progresses.
         if getattr(args, "true_on_policy_mode", False) and train_rollout_logprob_abs_diff > 1e-4:
@@ -1005,6 +1018,10 @@ def policy_loss_function(
             logger.warning("old_log_probs.shape: " + str(old_log_probs.shape) + "max: " + str(old_log_probs.max().item()) + "min: " + str(old_log_probs.min().item()) + "sum: " + str(old_log_probs.sum().item()))
             logger.warning("rollout_log_probs.shape: " + str(rollout_log_probs.shape) + "max: " + str(rollout_log_probs.max().item()) + "min: " + str(rollout_log_probs.min().item()) + "sum: " + str(rollout_log_probs.sum().item()))
             logger.warning("abs_diff[:100]: " + str((old_log_probs[:100] - rollout_log_probs[:100]).abs().tolist()))
+            logger.warning("sum of abs_diff[:100]: " + str((old_log_probs[:100] - rollout_log_probs[:100]).abs().sum().item()))
+            logger.warning("sum of abs_diff[:200]: " + str((old_log_probs[:200] - rollout_log_probs[:200]).abs().sum().item()))
+            logger.warning("sum of abs_diff[:300]: " + str((old_log_probs[:300] - rollout_log_probs[:300]).abs().sum().item()))
+            logger.wanring("sum of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().max().item()))
             
             # Print token IDs for verification
             if "unconcat_tokens" in batch and len(batch["unconcat_tokens"]) > 0:
