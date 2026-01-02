@@ -199,8 +199,7 @@ def get_log_probs_and_entropy(
             debug_logger.info(f"  logits_chunk first 10: {logits_chunk[:, :10].tolist()}")
             _true_on_policy_mode=getattr(args, "true_on_policy_mode", False),
             debug_logger.info(f"  true_on_policy_mode: {_true_on_policy_mode}")
-            import torch.nn.functional as F
-            temp_log_probs = F.log_softmax(logits_chunk, dim=-1) 
+            temp_log_probs = torch.log_softmax(logits_chunk, dim=-1) 
             debug_logger.info(f"  temp_log_probs shape: {temp_log_probs.shape}, dtype: {temp_log_probs.dtype}")
             debug_logger.info(f"  temp_log_probs first 10: {temp_log_probs[:, :10].tolist()}")
             debug_logger.info(f"  log_prob shape: {log_prob.shape}")
