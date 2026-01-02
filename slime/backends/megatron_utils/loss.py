@@ -229,8 +229,6 @@ def get_log_probs_and_entropy(
                 dumper = get_megatron_tensor_dumper()
                 if dumper is not None:
                     pass_id = dumper._forward_pass_id
-            if pass_id == 3:
-                raise ValueError("Pass 3 is not supported")
             debug_logger.info("-" * 60)
             debug_logger.info("DEBUG: get_log_probs_and_entropy - Sample 0 details")
             debug_logger.info(f"  *** PASS ID: {pass_id if pass_id is not None else 'N/A'} ***")
