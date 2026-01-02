@@ -245,6 +245,7 @@ def get_log_probs_and_entropy(
                 debug_logger.info(f"      Logit for token (after temp): {logit_for_token:.6f}")
                 debug_logger.info(f"      Logprob (manual log_softmax): {logprob_for_token:.8f}")
                 debug_logger.info(f"      Logprob (actual from compute_log_probs): {actual_logprob:.8f}" if actual_logprob is not None else "      Logprob (actual): N/A")
+                debug_logger.info(f"    temp_logprob_for_token: {temp_log_probs[i][token_id].item():.8f}")
                 if actual_logprob is not None:
                     diff = abs(logprob_for_token - actual_logprob)
                     debug_logger.info(f"      Diff (manual vs actual): {diff:.8e}")
@@ -254,6 +255,9 @@ def get_log_probs_and_entropy(
                 debug_logger.info(f"      Top-5 logprobs: {list(zip(top_logprob_ids.tolist(), [f'{v:.6f}' for v in top_logprob_vals.tolist()]))}")
                 debug_logger.info(f"        sum of logprobs: {logprobs_full[i].sum().item():.8f}")
                 debug_logger.info(f"        logprobs_type: {logprobs_full[i].dtype}")
+                debug_logger.info(f"        temp_logprobs_first 10: {temp_log_probs[i][:10].tolist()}")
+                debug_logger.info(f"        temp_logprobs_sum: {temp_log_probs[i].sum().item():.8f}")
+                debug_logger.info(f"        temp_logprobs_type: {temp_log_probs[i].dtype}")
                 # Also print RAW logits (before temperature processing)
                 if raw_logits_for_debug is not None:
                     # Calculate the position in the original logits tensor
