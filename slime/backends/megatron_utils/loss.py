@@ -201,9 +201,6 @@ def get_log_probs_and_entropy(
             debug_logger.info(f"  logits_chunk first 10: {logits_chunk[:, :10].tolist()}")
             _true_on_policy_mode=getattr(args, "true_on_policy_mode", False),
             debug_logger.info(f"  true_on_policy_mode: {_true_on_policy_mode}")
-            temp_log_probs = torch.log_softmax(logits_chunk, dim=-1) 
-            debug_logger.info(f"  temp_log_probs shape: {temp_log_probs.shape}, dtype: {temp_log_probs.dtype}")
-            debug_logger.info(f"  temp_log_probs first 10: {temp_log_probs[:, :10].tolist()}")
             debug_logger.info(f"  log_prob shape: {log_prob.shape}")
             debug_logger.info(f" temp irst 10 token logprobs: {temp_log_probs[range(10), tokens_chunk[:10]].tolist()}")
             debug_logger.info(f"  log_prob first 10: {log_prob[:10].squeeze(-1).tolist()}")
@@ -415,19 +412,19 @@ def get_log_probs_and_entropy(
                 debug_logger.info(f"      Logit for token (after temp): {logit_for_token:.6f}")
                 debug_logger.info(f"      Logprob (manual log_softmax): {logprob_for_token:.8f}")
                 debug_logger.info(f"      Logprob (actual from compute_log_probs): {actual_logprob:.8f}" if actual_logprob is not None else "      Logprob (actual): N/A")
-                debug_logger.info(f"    temp_logprob_for_token: {temp_log_probs[i][token_id].item():.8f}")
                 if actual_logprob is not None:
                     diff = abs(logprob_for_token - actual_logprob)
                     debug_logger.info(f"      Diff (manual vs actual): {diff:.8e}")
+                debug_logger.info(f"  logits max: {logit_for_token.max().item()}, min: {logit_for_token.min().item()}, mean: {logit_for_token.mean().item()}, std: {logit_for_token.std().item()}, sum: {logit_for_token.sum().item()}")
+                debug_logger.info(f"  logits_div_temperature max: {logits_chunk[i].max().item()}, min: {logits_chunk[i].min().item()}, mean: {logits_chunk[i].mean().item()}, std: {logits_chunk[i].std().item()}, sum: {logits_chunk[i].sum().item()}")
+                debug_logger.info(f"  logprobs_via_logsoftmax_kernel max: {actual_logprob.max().item()}, min: {logprobs_via_logsoftmax_kernel.min().item()}, mean: {logprobs_via_logsoftmax_kernel.mean().item()}, std: {logprobs_via_logsoftmax_kernel.std().item()}, sum: {logprobs_via_logsoftmax_kernel.sum().item()}")
+                    
                 debug_logger.info(f"      first 10 logits (after temp): {logits_chunk[i][:10].tolist()}")
                 debug_logger.info(f"      sum of logits (after temp): {logits_chunk[i].sum().item():.6f}")
                 debug_logger.info(f"      first 10 logprobs: {logprobs_full[i][:10].tolist()}")
                 debug_logger.info(f"      Top-5 logprobs: {list(zip(top_logprob_ids.tolist(), [f'{v:.6f}' for v in top_logprob_vals.tolist()]))}")
                 debug_logger.info(f"        sum of logprobs: {logprobs_full[i].sum().item():.8f}")
                 debug_logger.info(f"        logprobs_type: {logprobs_full[i].dtype}")
-                debug_logger.info(f"        temp_logprobs_first 10: {temp_log_probs[i][:10].tolist()}")
-                debug_logger.info(f"        temp_logprobs_sum: {temp_log_probs[i].sum().item():.8f}")
-                debug_logger.info(f"        temp_logprobs_type: {temp_log_probs[i].dtype}")
                 # Also print RAW logits (before temperature processing)
                 if raw_logits_for_debug is not None:
                     # Calculate the position in the original logits tensor
