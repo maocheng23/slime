@@ -70,6 +70,8 @@ def get_responses(
             dtype=torch.float32,
             device=logits.device
         )
+        debug_logger.info(f"  temp_tensor shape: {temp_tensor.shape}, dtype: {temp_tensor.dtype}")
+        debug_logger.info(f"  temp_tensor first 10: {temp_tensor[:10].tolist()}")
         logits = logits.bfloat16().div(temp_tensor).bfloat16()
     else:
         logits = logits.div(args.rollout_temperature)
