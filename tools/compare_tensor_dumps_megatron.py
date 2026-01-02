@@ -2886,41 +2886,51 @@ def compare_single_pass_pair(
         else:
             print("  ✗ Logits DIFFER!")
 
-        # Print first 10 logits values
-        print("\n  First 10 logits values:")
-        sg_first10 = sg_flat[:10].tolist()
-        meg_first10 = megatron_flat[:10].tolist()
-        diff_first10 = (sg_flat[:10] - megatron_flat[:10]).abs().tolist()
-        print(f"    SGLang:   {[f'{v:.8f}' for v in sg_first10]}")
-        print(f"    Megatron: {[f'{v:.8f}' for v in meg_first10]}")
-        print(f"    Diff:     {[f'{v:.8f}' for v in diff_first10]}")
-
-        # Detailed difference analysis
+        # Full logits comparison (all vocab tokens)
         diff_all = (sg_flat.float() - megatron_flat.float()).abs()
         nonzero_diff_mask = diff_all > 1e-6
         num_diff = nonzero_diff_mask.sum().item()
         total_vocab = len(diff_all)
         pct_diff = 100.0 * num_diff / total_vocab
-        print("\n  Detailed difference analysis:")
+        
+        print("\n  Full logits comparison (all vocab tokens):")
         print(f"    Total vocab size: {total_vocab}")
         print(f"    Exact matches (diff < 1e-6): {total_vocab - num_diff}")
         print(f"    With differences: {num_diff} ({pct_diff:.2f}%)")
+        
+        # Overall statistics
+        print(f"\n  Overall statistics:")
+        print(f"    SGLang logits:   min={sg_flat.float().min().item():.8f}, max={sg_flat.float().max().item():.8f}, mean={sg_flat.float().mean().item():.8f}, sum={sg_flat.float().sum().item():.8f}")
+        print(f"    Megatron logits: min={megatron_flat.float().min().item():.8f}, max={megatron_flat.float().max().item():.8f}, mean={megatron_flat.float().mean().item():.8f}, sum={megatron_flat.float().sum().item():.8f}")
+        print(f"    Difference:     min={diff_all.min().item():.8e}, max={diff_all.max().item():.8e}, mean={diff_all.mean().item():.8e}, sum={diff_all.sum().item():.8f}")
 
         if num_diff > 0:
             # Distribution of differences
             nonzero_diffs = diff_all[nonzero_diff_mask]
+            print(f"\n  Non-zero differences statistics:")
             print(f"    Min non-zero diff: {nonzero_diffs.min().item():.6e}")
             print(f"    Max diff: {nonzero_diffs.max().item():.6e}")
             print(f"    Mean of non-zero diffs: {nonzero_diffs.mean().item():.6e}")
+            print(f"    Std of non-zero diffs: {nonzero_diffs.std().item():.6e}")
 
             # Find indices with largest differences
-            top_diff_indices = diff_all.topk(5).indices.tolist()
-            print(f"    Top 5 differing indices: {top_diff_indices}")
-            for idx in top_diff_indices:
+            top_k = min(20, total_vocab)  # Show top 20 differences
+            top_diff_indices = diff_all.topk(top_k).indices.tolist()
+            print(f"\n  Top {top_k} differing indices:")
+            for rank, idx in enumerate(top_diff_indices, 1):
                 sg_v = sg_flat[idx].float().item()
                 meg_v = megatron_flat[idx].float().item()
                 d = abs(sg_v - meg_v)
-                print(f"      idx {idx}: SGLang={sg_v:.4f}, Meg={meg_v:.4f}, diff={d:.6f}")
+                print(f"    {rank:2d}. idx {idx:6d}: SGLang={sg_v:12.8f}, Meg={meg_v:12.8f}, diff={d:.6e}")
+        
+        # Print first 10 logits values for reference
+        print("\n  First 10 logits values (for reference):")
+        sg_first10 = sg_flat[:10].tolist()
+        meg_first10 = megatron_flat[:10].tolist()
+        diff_first10 = (sg_flat[:10] - megatron_flat[:10]).abs().tolist()
+        print(f"    SGLang:   {[f'{v:.8f}' for v in sg_first10]}")
+        print(f"    Megatron: {[f'{v:.8f}' for v in meg_first10]}")
+        print(f"    Diff:     {[f'{v:.8e}' for v in diff_first10]}")
 
         # Compare specific token logits for first 5 response tokens
         print("\n  Logits for first 5 response tokens:")
@@ -2983,12 +2993,41 @@ def compare_single_pass_pair(
                     else:
                         print("        ✗ DIFFER")
                     
-                    # Print first 10 logits values
+                    # Full logits comparison for this token
+                    diff_tok_all = (sg_tok.float() - megatron_tok.float()).abs()
+                    nonzero_diff_tok = (diff_tok_all > 1e-6).sum().item()
+                    total_vocab_tok = len(diff_tok_all)
+                    pct_diff_tok = 100.0 * nonzero_diff_tok / total_vocab_tok
+                    
+                    print(f"\n      Full logits comparison (all {total_vocab_tok} vocab tokens):")
+                    print(f"        Exact matches (diff < 1e-6): {total_vocab_tok - nonzero_diff_tok}")
+                    print(f"        With differences: {nonzero_diff_tok} ({pct_diff_tok:.2f}%)")
+                    print(f"        Max diff: {diff_tok_all.max().item():.8e}")
+                    print(f"        Mean diff: {diff_tok_all.mean().item():.8e}")
+                    print(f"        Sum diff: {diff_tok_all.sum().item():.8f}")
+                    print(f"        SGLang sum: {sg_tok.float().sum().item():.8f}")
+                    print(f"        Megatron sum: {megatron_tok.float().sum().item():.8f}")
+                    
+                    if nonzero_diff_tok > 0:
+                        nonzero_diffs_tok = diff_tok_all[diff_tok_all > 1e-6]
+                        print(f"        Non-zero diffs - min: {nonzero_diffs_tok.min().item():.8e}, max: {nonzero_diffs_tok.max().item():.8e}, mean: {nonzero_diffs_tok.mean().item():.8e}")
+                        
+                        # Show top 10 differing indices
+                        top_k_tok = min(10, total_vocab_tok)
+                        top_diff_indices_tok = diff_tok_all.topk(top_k_tok).indices.tolist()
+                        print(f"        Top {top_k_tok} differing indices:")
+                        for rank, idx in enumerate(top_diff_indices_tok, 1):
+                            sg_v = sg_tok[idx].float().item()
+                            meg_v = megatron_tok[idx].float().item()
+                            d = diff_tok_all[idx].item()
+                            print(f"          {rank:2d}. idx {idx:6d}: SGLang={sg_v:12.8f}, Meg={meg_v:12.8f}, diff={d:.8e}")
+                    
+                    # Print first 10 logits values for reference
                     n_show = min(10, len(sg_tok), len(megatron_tok))
                     sg_first10 = sg_tok[:n_show].float().tolist()
                     meg_first10 = megatron_tok[:n_show].float().tolist()
                     diff_first10 = (sg_tok[:n_show].float() - megatron_tok[:n_show].float()).abs().tolist()
-                    print(f"      First {n_show} logits values:")
+                    print(f"\n      First {n_show} logits values (for reference):")
                     print(f"        SGLang:   {[f'{v:.8f}' for v in sg_first10]}")
                     print(f"        Megatron: {[f'{v:.8f}' for v in meg_first10]}")
                     print(f"        Diff:     {[f'{v:.8e}' for v in diff_first10]}")
@@ -3082,14 +3121,43 @@ def compare_single_pass_pair(
                     else:
                         print("        ✗ Logprobs DIFFER!")
                     
-                    # Print first 10 logprobs values
+                    # Full logprobs comparison for this token
                     sg_lp_flat = sg_logprobs_curr.flatten()
                     megatron_lp_flat = megatron_logprobs_curr.flatten()
+                    diff_lp_all = (sg_lp_flat.float() - megatron_lp_flat.float()).abs()
+                    nonzero_diff_lp = (diff_lp_all > 1e-6).sum().item()
+                    total_vocab_lp = len(diff_lp_all)
+                    pct_diff_lp = 100.0 * nonzero_diff_lp / total_vocab_lp
+                    
+                    print(f"\n      Full logprobs comparison (all {total_vocab_lp} vocab tokens):")
+                    print(f"        Exact matches (diff < 1e-6): {total_vocab_lp - nonzero_diff_lp}")
+                    print(f"        With differences: {nonzero_diff_lp} ({pct_diff_lp:.2f}%)")
+                    print(f"        Max diff: {diff_lp_all.max().item():.8e}")
+                    print(f"        Mean diff: {diff_lp_all.mean().item():.8e}")
+                    print(f"        Sum diff: {diff_lp_all.sum().item():.8f}")
+                    print(f"        SGLang sum: {sg_lp_flat.float().sum().item():.8f}")
+                    print(f"        Megatron sum: {megatron_lp_flat.float().sum().item():.8f}")
+                    
+                    if nonzero_diff_lp > 0:
+                        nonzero_diffs_lp = diff_lp_all[diff_lp_all > 1e-6]
+                        print(f"        Non-zero diffs - min: {nonzero_diffs_lp.min().item():.8e}, max: {nonzero_diffs_lp.max().item():.8e}, mean: {nonzero_diffs_lp.mean().item():.8e}")
+                        
+                        # Show top 10 differing indices
+                        top_k_diff = min(10, total_vocab_lp)
+                        top_diff_indices_lp = diff_lp_all.topk(top_k_diff).indices.tolist()
+                        print(f"        Top {top_k_diff} differing indices:")
+                        for rank, idx in enumerate(top_diff_indices_lp, 1):
+                            sg_v = sg_lp_flat[idx].float().item()
+                            meg_v = megatron_lp_flat[idx].float().item()
+                            d = diff_lp_all[idx].item()
+                            print(f"          {rank:2d}. idx {idx:6d}: SGLang={sg_v:12.8f}, Meg={meg_v:12.8f}, diff={d:.8e}")
+                    
+                    # Print first 10 logprobs values for reference
                     n_show = min(10, len(sg_lp_flat), len(megatron_lp_flat))
                     sg_lp_first10 = sg_lp_flat[:n_show].float().tolist()
                     meg_lp_first10 = megatron_lp_flat[:n_show].float().tolist()
                     diff_lp_first10 = (sg_lp_flat[:n_show].float() - megatron_lp_flat[:n_show].float()).abs().tolist()
-                    print(f"      First {n_show} logprobs values:")
+                    print(f"\n      First {n_show} logprobs values (for reference):")
                     print(f"        SGLang:   {[f'{v:.8f}' for v in sg_lp_first10]}")
                     print(f"        Megatron: {[f'{v:.8f}' for v in meg_lp_first10]}")
                     print(f"        Diff:     {[f'{v:.8e}' for v in diff_lp_first10]}")
@@ -3097,7 +3165,7 @@ def compare_single_pass_pair(
                     # Print top 5 logprobs and tokens from Megatron
                     top_k = min(5, len(megatron_lp_flat))
                     meg_top_values, meg_top_indices = torch.topk(megatron_lp_flat.float(), top_k)
-                    print(f"      Top {top_k} logprobs from Megatron:")
+                    print(f"\n      Top {top_k} logprobs from Megatron:")
                     for rank, (val, idx) in enumerate(zip(meg_top_values, meg_top_indices), 1):
                         is_target = (idx.item() == token_id)
                         marker = " <-- ACTUAL TOKEN" if is_target else ""
@@ -3283,14 +3351,44 @@ def compare_single_pass_pair(
                 stats = compute_diff_stats(sg_flat, megatron_flat)
                 print(f"    Max diff:  {stats['max_diff']:.8e}")
                 print(f"    Mean diff: {stats['mean_diff']:.8e}")
+                
+                # Full logits comparison
+                diff_all = (sg_flat.float() - megatron_flat.float()).abs()
+                nonzero_diff = (diff_all > 1e-6).sum().item()
+                total_vocab = len(diff_all)
+                pct_diff = 100.0 * nonzero_diff / total_vocab
+                
+                print(f"\n    Full logits comparison (all {total_vocab} vocab tokens):")
+                print(f"      Exact matches (diff < 1e-6): {total_vocab - nonzero_diff}")
+                print(f"      With differences: {nonzero_diff} ({pct_diff:.2f}%)")
+                print(f"      Max diff: {diff_all.max().item():.8e}")
+                print(f"      Mean diff: {diff_all.mean().item():.8e}")
+                print(f"      Sum diff: {diff_all.sum().item():.8f}")
+                print(f"      SGLang sum: {sg_flat.float().sum().item():.8f}")
+                print(f"      Megatron sum: {megatron_flat.float().sum().item():.8f}")
+                
+                if nonzero_diff > 0:
+                    nonzero_diffs = diff_all[diff_all > 1e-6]
+                    print(f"      Non-zero diffs - min: {nonzero_diffs.min().item():.8e}, max: {nonzero_diffs.max().item():.8e}, mean: {nonzero_diffs.mean().item():.8e}")
+                    
+                    # Show top 10 differing indices
+                    top_k_diff = min(10, total_vocab)
+                    top_diff_indices = diff_all.topk(top_k_diff).indices.tolist()
+                    print(f"      Top {top_k_diff} differing indices:")
+                    for rank, idx in enumerate(top_diff_indices, 1):
+                        sg_v = sg_flat[idx].float().item()
+                        meg_v = megatron_flat[idx].float().item()
+                        d = diff_all[idx].item()
+                        print(f"        {rank:2d}. idx {idx:6d}: SGLang={sg_v:12.8f}, Meg={meg_v:12.8f}, diff={d:.8e}")
+                
                 if stats["max_diff"] < 1e-5:
                     print(
-                        f"    ✓ Response token #{token_idx+1} "
+                        f"\n    ✓ Response token #{token_idx+1} "
                         f"logits MATCH!"
                     )
                 else:
                     print(
-                        f"    ✗ Response token #{token_idx+1} "
+                        f"\n    ✗ Response token #{token_idx+1} "
                         f"logits DIFFER!"
                     )
             else:
@@ -3331,17 +3429,46 @@ def compare_single_pass_pair(
 
             if sg_lp_flat.shape == megatron_lp_flat.shape:
                 lp_stats = compute_diff_stats(sg_lp_flat, megatron_lp_flat)
-                print(f"    Max diff:  {lp_stats['max_diff']}")
-                print(f"    Mean diff: {lp_stats['mean_diff']}")
+                print(f"    Max diff:  {lp_stats['max_diff']:.8e}")
+                print(f"    Mean diff: {lp_stats['mean_diff']:.8e}")
+                
+                # Full logprobs comparison
+                diff_lp_all = (sg_lp_flat.float() - megatron_lp_flat.float()).abs()
+                nonzero_diff_lp = (diff_lp_all > 1e-6).sum().item()
+                total_vocab_lp = len(diff_lp_all)
+                pct_diff_lp = 100.0 * nonzero_diff_lp / total_vocab_lp
+                
+                print(f"\n    Full logprobs comparison (all {total_vocab_lp} vocab tokens):")
+                print(f"      Exact matches (diff < 1e-6): {total_vocab_lp - nonzero_diff_lp}")
+                print(f"      With differences: {nonzero_diff_lp} ({pct_diff_lp:.2f}%)")
+                print(f"      Max diff: {diff_lp_all.max().item():.8e}")
+                print(f"      Mean diff: {diff_lp_all.mean().item():.8e}")
+                print(f"      Sum diff: {diff_lp_all.sum().item():.8f}")
+                print(f"      SGLang sum: {sg_lp_flat.float().sum().item():.8f}")
+                print(f"      Megatron sum: {megatron_lp_flat.float().sum().item():.8f}")
+                
+                if nonzero_diff_lp > 0:
+                    nonzero_diffs_lp = diff_lp_all[diff_lp_all > 1e-6]
+                    print(f"      Non-zero diffs - min: {nonzero_diffs_lp.min().item():.8e}, max: {nonzero_diffs_lp.max().item():.8e}, mean: {nonzero_diffs_lp.mean().item():.8e}")
+                    
+                    # Show top 10 differing indices
+                    top_k_diff = min(10, total_vocab_lp)
+                    top_diff_indices_lp = diff_lp_all.topk(top_k_diff).indices.tolist()
+                    print(f"      Top {top_k_diff} differing indices:")
+                    for rank, idx in enumerate(top_diff_indices_lp, 1):
+                        sg_v = sg_lp_flat[idx].float().item()
+                        meg_v = megatron_lp_flat[idx].float().item()
+                        d = diff_lp_all[idx].item()
+                        print(f"        {rank:2d}. idx {idx:6d}: SGLang={sg_v:12.8f}, Meg={meg_v:12.8f}, diff={d:.8e}")
 
                 if sg_target_lp is not None and megatron_target_lp is not None:
                     sg_lp_val = sg_target_lp.float().item()
                     megatron_lp_val = megatron_target_lp.float().item()
                     diff = abs(sg_lp_val - megatron_lp_val)
-                    print(f"    Logprob for token {token_id}:")
-                    print(f"      SGLang (production):  {sg_lp_val}")
-                    print(f"      Megatron (production): {megatron_lp_val}")
-                    print(f"      Diff:    {diff}")
+                    print(f"\n    Logprob for token {token_id}:")
+                    print(f"      SGLang (production):  {sg_lp_val:.8f}")
+                    print(f"      Megatron (production): {megatron_lp_val:.8f}")
+                    print(f"      Diff:    {diff:.8e}")
                     if diff < 1e-5:
                         print(
                             f"      ✓ Response token #{token_idx+1} "

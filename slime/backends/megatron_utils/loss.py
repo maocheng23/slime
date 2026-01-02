@@ -1005,7 +1005,73 @@ def policy_loss_function(
             logger.warning("sum of abs_diff[:500]: " + str((old_log_probs[:500] - rollout_log_probs[:500]).abs().sum().item()))
             logger.warning("sum of abs_diff[:600]: " + str((old_log_probs[:600] - rollout_log_probs[:600]).abs().sum().item()))
             logger.warning("sum of abs_diff[-1]: " + str((old_log_probs[-1] - rollout_log_probs[-1]).abs().item()))
-            logger.warning("sum of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().max().item()))
+            logger.warning("max of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().max().item()))
+            logger.warning("mean of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().mean().item()))
+            
+            # Show sample boundaries and differences per sample
+            abs_diff = (old_log_probs - rollout_log_probs).abs()
+            response_lengths = batch["response_lengths"]
+            total_lengths = batch["total_lengths"]
+            sample_boundaries = [0]
+            for rl in response_lengths:
+                sample_boundaries.append(sample_boundaries[-1] + rl)
+            
+            logger.warning("\n  Sample-by-sample analysis (RESPONSE ONLY):")
+            logger.warning(f"    Number of samples: {len(response_lengths)}")
+            logger.warning(f"    Sample boundaries: {sample_boundaries}")
+            for i in range(len(response_lengths)):
+                start = sample_boundaries[i]
+                end = sample_boundaries[i + 1]
+                sample_diff = abs_diff[start:end]
+                sample_max_diff = sample_diff.max().item()
+                sample_mean_diff = sample_diff.mean().item()
+                sample_sum_diff = sample_diff.sum().item()
+                num_nonzero = (sample_diff > 1e-8).sum().item()
+                prompt_len = total_lengths[i] - response_lengths[i]
+                logger.warning(f"    Sample {i} [response pos {start}:{end}]: "
+                             f"response_length={response_lengths[i]}, prompt_len={prompt_len}, "
+                             f"max_diff={sample_max_diff:.8e}, mean_diff={sample_mean_diff:.8e}, "
+                             f"sum_diff={sample_sum_diff:.8f}, nonzero={num_nonzero}/{response_lengths[i]}")
+            
+            # Find the first position where difference appears
+            nonzero_mask = abs_diff > 1e-8
+            if nonzero_mask.any():
+                first_diff_idx = nonzero_mask.nonzero(as_tuple=False).flatten()[0].item()
+                logger.warning(f"  First difference at position {first_diff_idx}:")
+                logger.warning(f"    old_log_probs[{first_diff_idx}]: {old_log_probs[first_diff_idx].item():.8f}")
+                logger.warning(f"    rollout_log_probs[{first_diff_idx}]: {rollout_log_probs[first_diff_idx].item():.8f}")
+                logger.warning(f"    abs_diff[{first_diff_idx}]: {abs_diff[first_diff_idx].item():.8e}")
+                
+                # Check which sample this position belongs to
+                response_lengths = batch["response_lengths"]
+                sample_boundaries = [0]
+                for rl in response_lengths:
+                    sample_boundaries.append(sample_boundaries[-1] + rl)
+                logger.warning(f"  Sample boundaries (cumulative response lengths): {sample_boundaries}")
+                for i, boundary in enumerate(sample_boundaries[1:], 1):
+                    if first_diff_idx < boundary:
+                        sample_idx = i - 1
+                        pos_in_sample = first_diff_idx - sample_boundaries[i - 1]
+                        logger.warning(f"    Position {first_diff_idx} is in sample {sample_idx}, at position {pos_in_sample} within that sample")
+                        logger.warning(f"    Sample {sample_idx} response_length: {response_lengths[sample_idx]}")
+                        if i > 0:
+                            total_length = batch["total_lengths"][sample_idx]
+                            prompt_len = total_length - response_lengths[sample_idx]
+                            logger.warning(f"    Sample {sample_idx} total_length: {total_length}, prompt_len: {prompt_len}")
+                        break
+                
+                # Check surrounding positions
+                start_idx = max(0, first_diff_idx - 5)
+                end_idx = min(len(old_log_probs), first_diff_idx + 6)
+                logger.warning(f"  Surrounding positions [{start_idx}:{end_idx}]:")
+                for i in range(start_idx, end_idx):
+                    diff_val = abs_diff[i].item()
+                    old_val = old_log_probs[i].item()
+                    rollout_val = rollout_log_probs[i].item()
+                    marker = " <-- FIRST DIFF" if i == first_diff_idx else ""
+                    logger.warning(f"    pos {i}: old={old_val:.8f}, rollout={rollout_val:.8f}, diff={diff_val:.8e}{marker}")
+            else:
+                logger.warning("  No differences found (all < 1e-8)")
             
         # In true_on_policy_mode, a significant difference means model weights changed,
         # which breaks the true on-policy assumption. This is expected as training progresses.
@@ -1025,7 +1091,7 @@ def policy_loss_function(
             logger.warning("sum of abs_diff[:100]: " + str((old_log_probs[:100] - rollout_log_probs[:100]).abs().sum().item()))
             logger.warning("sum of abs_diff[:200]: " + str((old_log_probs[:200] - rollout_log_probs[:200]).abs().sum().item()))
             logger.warning("sum of abs_diff[:300]: " + str((old_log_probs[:300] - rollout_log_probs[:300]).abs().sum().item()))
-            logger.wanring("sum of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().max().item()))
+            logger.warning("sum of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().max().item()))
             
             # Print token IDs for verification
             if "unconcat_tokens" in batch and len(batch["unconcat_tokens"]) > 0:
