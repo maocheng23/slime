@@ -215,14 +215,19 @@ def get_log_probs_and_entropy(
             # IMPORTANT: Use SGLang's batch-invariant log_softmax for identical results!
             # SGLang uses a custom Triton kernel that produces different numerical results
             # than PyTorch's built-in log_softmax due to different FP operation ordering.
-            debug_logger.info(f"  logits_chunk dtype: {logits_chunk.dtype}")
+            debug_logger.info(f"  logits_chunk dtype: {logits_chunk.dtype}, device: {logits_chunk.device}")
             try:
                 from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
-                logprobs_full = sglang_log_softmax(logits_chunk, dim=-1)
-                debug_logger.info("  Using SGLang's batch-invariant log_softmax")
-            except ImportError:
+                # Triton kernel requires CUDA tensor
+                if logits_chunk.device.type == 'cuda':
+                    logprobs_full = sglang_log_softmax(logits_chunk, dim=-1)
+                    debug_logger.info("  Using SGLang's batch-invariant log_softmax (Triton kernel)")
+                else:
+                    logprobs_full = torch.log_softmax(logits_chunk, dim=-1)
+                    debug_logger.info("  Using PyTorch's log_softmax (logits not on CUDA)")
+            except (ImportError, ValueError) as e:
                 logprobs_full = torch.log_softmax(logits_chunk, dim=-1)
-                debug_logger.info("  Using PyTorch's log_softmax (SGLang not available)")
+                debug_logger.info(f"  Using PyTorch's log_softmax (SGLang error: {e})")
             debug_logger.info(f"  logprobs_full dtype: {logprobs_full.dtype}")
             
             for i in range(min(5, len(tokens_chunk))):
