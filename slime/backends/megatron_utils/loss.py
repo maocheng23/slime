@@ -237,8 +237,6 @@ def get_log_probs_and_entropy(
             debug_logger.info("-" * 60)
             debug_logger.info(f"  logits_chunk shape: {logits_chunk.shape}, dtype: {logits_chunk.dtype}")
             debug_logger.info(f"  tokens_chunk shape: {tokens_chunk.shape}")
-            debug_logger.info(f"  tokens_chunk first 10: {tokens_chunk[:10].tolist()}")
-            debug_logger.info(f"  logits_chunk first 10: {logits_chunk[:, :10].tolist()}")
             _true_on_policy_mode=getattr(args, "true_on_policy_mode", False),
             debug_logger.info(f"  true_on_policy_mode: {_true_on_policy_mode}")
             debug_logger.info(f"  log_prob shape: {log_prob.shape}")
@@ -1004,7 +1002,9 @@ def policy_loss_function(
             )
             logger.warning("old_log_probs[:10]: " + str(old_log_probs[:10].tolist()))
             logger.warning("rollout_log_probs[:10]: " + str(rollout_log_probs[:10].tolist()))
-            logger.warning("abs_diff[:10]: " + str((old_log_probs[:10] - rollout_log_probs[:10]).abs().tolist()))
+            logger.warning("old_log_probs.shape: " + str(old_log_probs.shape) + "max: " + str(old_log_probs.max().item()) + "min: " + str(old_log_probs.min().item()) + "sum: " + str(old_log_probs.sum().item()))
+            logger.warning("rollout_log_probs.shape: " + str(rollout_log_probs.shape) + "max: " + str(rollout_log_probs.max().item()) + "min: " + str(rollout_log_probs.min().item()) + "sum: " + str(rollout_log_probs.sum().item()))
+            logger.warning("abs_diff[:100]: " + str((old_log_probs[:100] - rollout_log_probs[:100]).abs().tolist()))
             
             # Print token IDs for verification
             if "unconcat_tokens" in batch and len(batch["unconcat_tokens"]) > 0:
