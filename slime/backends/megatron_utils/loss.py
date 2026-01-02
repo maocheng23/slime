@@ -432,6 +432,7 @@ def get_log_probs_and_entropy(
                     if raw_pos < raw_logits_for_debug.shape[0]:
                         raw_logit_for_token = raw_logits_for_debug[raw_pos, token_id].item()
                         raw_first_10 = raw_logits_for_debug[raw_pos, :10].tolist()
+                        debug_logger.info(f"      RAW logits max: {raw_logits_for_debug[raw_pos, :].max().item():.6f}, min: {raw_logits_for_debug[raw_pos, :].min().item():.6f}, sum: {raw_logits_for_debug[raw_pos, :].sum().item():.6f}")
                         debug_logger.info(f"      RAW logit for token (before temp): {raw_logit_for_token:.6f}")
                         debug_logger.info(f"      RAW first 10 logits (before temp): {raw_first_10}")
             

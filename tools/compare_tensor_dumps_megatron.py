@@ -496,6 +496,40 @@ def find_sglang_prefill_pass(
     return (prefill_passes[0][0], prefill_passes[0][1])
 
 
+def print_bitwise_comparison(stats: dict[str, float], indent: str = "      ") -> bool:
+    """
+    Print min/max/sum comparison for bitwise identical check.
+    
+    Args:
+        stats: Dictionary from compute_diff_stats
+        indent: Indentation string for output
+        
+    Returns:
+        True if bitwise identical, False otherwise
+    """
+    print(f"{indent}Min/Max/Sum comparison (for bitwise identical check):")
+    print(f"{indent}  Min:  SGLang={stats['t1_min']:.8e}, Megatron={stats['t2_min']:.8e}, "
+          f"diff={abs(stats['t1_min'] - stats['t2_min']):.8e}")
+    print(f"{indent}  Max:  SGLang={stats['t1_max']:.8e}, Megatron={stats['t2_max']:.8e}, "
+          f"diff={abs(stats['t1_max'] - stats['t2_max']):.8e}")
+    print(f"{indent}  Sum:  SGLang={stats['t1_sum']:.8e}, Megatron={stats['t2_sum']:.8e}, "
+          f"diff={stats['sum_diff']:.8e}")
+    
+    # Check if bitwise identical
+    is_bitwise_identical = (
+        stats['max_diff'] < 1e-8 and
+        abs(stats['t1_min'] - stats['t2_min']) < 1e-8 and
+        abs(stats['t1_max'] - stats['t2_max']) < 1e-8 and
+        stats['sum_diff'] < 1e-8
+    )
+    if is_bitwise_identical:
+        print(f"{indent}  ✓✓✓ BITWISE IDENTICAL ✓✓✓")
+    else:
+        print(f"{indent}  ✗ Not bitwise identical (check individual differences above)")
+    
+    return is_bitwise_identical
+
+
 def compute_diff_stats(t1: torch.Tensor, t2: torch.Tensor) -> dict[str, float]:
     """Compute difference statistics between two tensors."""
     t1_f = t1.float()
@@ -514,6 +548,9 @@ def compute_diff_stats(t1: torch.Tensor, t2: torch.Tensor) -> dict[str, float]:
         "t2_max": t2_f.max().item(),
         "t1_min": t1_f.min().item(),
         "t2_min": t2_f.min().item(),
+        "t1_sum": t1_f.sum().item(),
+        "t2_sum": t2_f.sum().item(),
+        "sum_diff": (t1_f.sum() - t2_f.sum()).abs().item(),
     }
 
 
@@ -841,6 +878,9 @@ def compare_hidden_states_at_position(
             print(f"    SGLang:   {[f'{v:.4f}' for v in sg_vals]}")
             print(f"    Diff:     {[f'{v:.4f}' for v in diff_vals]} "
                   f"(max={max_diff_shown:.4f})")
+            
+            # Print min/max/sum comparison for bitwise identical check
+            print_bitwise_comparison(stats, indent="    ")
 
     # Summary
     if significant_diff_layers:
@@ -895,8 +935,12 @@ def compare_layer(
             return ("NOT_FOUND", None)
 
         min_len = min(sg.numel(), meg.numel())
-        diff = (sg[:min_len].float() - meg[:min_len].float()).abs()
-        max_diff = diff.max().item()
+        sg_aligned = sg[:min_len]
+        meg_aligned = meg[:min_len]
+        
+        # Use compute_diff_stats for comprehensive comparison
+        stats = compute_diff_stats(sg_aligned, meg_aligned)
+        max_diff = stats['max_diff']
 
         if verbose:
             # Get dtypes for comparison
@@ -918,8 +962,16 @@ def compare_layer(
             print(f"      SGLang first 10:   {sg_vals}")
             print(f"      Megatron first 10: {meg_vals}")
             print(f"      Max diff: {max_diff:.6e}")
-            if max_diff < 1e-5:
-                print("      ✓ MATCH")
+            
+            # Print min/max/sum comparison for bitwise identical check
+            is_bitwise_identical = print_bitwise_comparison(stats, indent="      ")
+            
+            if is_bitwise_identical:
+                print("      ✓ MATCH (bitwise identical)")
+            elif max_diff < 1e-5:
+                print("      ✓ MATCH (but not bitwise identical)")
+            else:
+                print("      ✗ NOT MATCH")
 
         if max_diff < 1e-5:
             return ("MATCH", max_diff)
@@ -1201,13 +1253,25 @@ def compare_single_pass_pair(
         if meg_qkv_ln_91 in megatron_tensors:
             meg_ln = megatron_tensors[meg_qkv_ln_91].flatten()
             min_len = min(sg_ln_flat.numel(), meg_ln.numel())
-            diff = (sg_ln_flat[:min_len].float() - meg_ln[:min_len].float()).abs()
-            max_diff = diff.max().item()
+            sg_aligned = sg_ln_flat[:min_len]
+            meg_aligned = meg_ln[:min_len]
+            
+            # Use compute_diff_stats for comprehensive comparison
+            stats = compute_diff_stats(sg_aligned, meg_aligned)
+            max_diff = stats['max_diff']
+            
             print(f"    Megatron shape: {megatron_tensors[meg_qkv_ln_91].shape}")
             print(f"    Megatron first 10: {[f'{v:.4f}' for v in meg_ln[:10].float().tolist()]}")
             print(f"    Max diff: {max_diff:.6e}")
-            if max_diff < 1e-5:
-                print("    ✓ Input LayerNorm MATCH!")
+            
+            # Print min/max/sum comparison for bitwise identical check
+            is_bitwise_identical = print_bitwise_comparison(stats, indent="    ")
+            
+            if is_bitwise_identical:
+                print("    ✓ Input LayerNorm MATCH (bitwise identical)!")
+                comparison_results["input_layernorm"] = ("MATCH", max_diff)
+            elif max_diff < 1e-5:
+                print("    ✓ Input LayerNorm MATCH (but not bitwise identical)!")
                 comparison_results["input_layernorm"] = ("MATCH", max_diff)
             else:
                 comparison_results["input_layernorm"] = ("DIFF", max_diff)
