@@ -1001,7 +1001,11 @@ def policy_loss_function(
             logger.warning("sum of abs_diff[:100]: " + str((old_log_probs[:100] - rollout_log_probs[:100]).abs().sum().item()))
             logger.warning("sum of abs_diff[:200]: " + str((old_log_probs[:200] - rollout_log_probs[:200]).abs().sum().item()))
             logger.warning("sum of abs_diff[:300]: " + str((old_log_probs[:300] - rollout_log_probs[:300]).abs().sum().item()))
-            logger.wanring("sum of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().max().item()))
+            logger.warning("sum of abs_diff[:400]: " + str((old_log_probs[:400] - rollout_log_probs[:400]).abs().sum().item()))
+            logger.warning("sum of abs_diff[:500]: " + str((old_log_probs[:500] - rollout_log_probs[:500]).abs().sum().item()))
+            logger.warning("sum of abs_diff[:600]: " + str((old_log_probs[:600] - rollout_log_probs[:600]).abs().sum().item()))
+            logger.warning("sum of abs_diff[-1]: " + str((old_log_probs[-1] - rollout_log_probs[-1]).abs().item()))
+            logger.warning("sum of abs_diff: " + str((old_log_probs - rollout_log_probs).abs().max().item()))
             
         # In true_on_policy_mode, a significant difference means model weights changed,
         # which breaks the true on-policy assumption. This is expected as training progresses.
