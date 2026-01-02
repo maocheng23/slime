@@ -253,8 +253,8 @@ def get_log_probs_and_entropy(
                 debug_logger.info(f"      sum of logits (after temp): {logits_chunk[i].sum().item():.6f}")
                 debug_logger.info(f"      first 10 logprobs: {logprobs_full[i][:10].tolist()}")
                 debug_logger.info(f"      Top-5 logprobs: {list(zip(top_logprob_ids.tolist(), [f'{v:.6f}' for v in top_logprob_vals.tolist()]))}")
-                debug_logger.info(f"        sum of logprobs: {logprobs_full.sum().item():.8f}")
-                debug_logger.info(f"        logprobs_type: {logprobs_full.dtype}")
+                debug_logger.info(f"        sum of logprobs: {logprobs_full[i].sum().item():.8f}")
+                debug_logger.info(f"        logprobs_type: {logprobs_full[i].dtype}")
                 # Also print RAW logits (before temperature processing)
                 if raw_logits_for_debug is not None:
                     # Calculate the position in the original logits tensor
