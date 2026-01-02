@@ -145,6 +145,9 @@ def execute():
         "--use-sglang-attention "
         "--deterministic-mode "
         "--true-on-policy-mode "
+        # NOTE: fa3 backend already uses num_splits=1 when enable_deterministic_inference=True
+        # (see flashattention_backend.py:367-372)
+        # The triton_attention_split_tile_size is only for triton backend, not fa3
     )
     true_on_policy_envs = {
         # TODO note: "Ring" in original RL PR, "allreduce:tree" in SGLang
@@ -152,6 +155,22 @@ def execute():
         # "NCCL_ALGO": "allreduce:tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        # Disable chunked logprobs processing to ensure bitwise identical results
+        # NOTE: In decode phase, each request processes one token, so pruned_states.shape[0] = batch_size
+        # This is usually < 2048, so chunked processing wouldn't trigger anyway.
+        # However, in prefill phase (especially with chunked prefill), multiple tokens may be processed,
+        # which could trigger chunked logprobs processing and cause numerical differences.
+        # By disabling it, we ensure consistent processing path across all phases.
+        #
+        # How it works:
+        # - In logits_processor.py, should_skip_chunking = not enable_logprobs_chunk OR ...
+        # - Setting enable_logprobs_chunk=False ensures should_skip_chunking=True
+        # - This forces all tokens to use non-chunked path (single _get_logits call)
+        # - Result: Consistent computation order → bitwise identical results
+        "SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK": "False",
+        # Set a very large chunk size as a safety measure (even if enabled, won't trigger)
+        # Default is 2048, so 999999 ensures chunking never triggers
+        "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "999999",
     }
 
     train_args = (
