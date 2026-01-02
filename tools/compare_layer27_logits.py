@@ -19,7 +19,6 @@ Usage:
 """
 
 import argparse
-import re
 from pathlib import Path
 from typing import Optional
 
@@ -139,45 +138,59 @@ def extract_layer27_output(
                     return tensor
     
     elif source == "megatron":
-        # Megatron: extract at specific position
+        # Megatron: use _at_response_start suffix (already extracted at response position)
+        # Try MLP output first (most common), then full layer output
         keys_to_try = [
-            f"layer_{layer_idx}_output_at_response_start",
-            f"layer_{layer_idx}_output",
+            f"layer_{layer_idx}_mlp_output_at_response_start",  # MLP output (before residual)
+            f"layer_{layer_idx}_output_at_response_start",  # Full layer output (MLP + residual)
+            f"layer_{layer_idx}_mlp_output",  # Fallback without suffix
+            f"layer_{layer_idx}_output",  # Fallback without suffix
         ]
         
         for key in keys_to_try:
             if key in tensors:
                 tensor = tensors[key]
                 if tensor is not None:
-                    # Extract at response position
-                    if response_position is not None:
+                    # _at_response_start tensors are already at response position (single token)
+                    # Regular tensors need position extraction
+                    if "_at_response_start" in key:
+                        # Already extracted at response position, just flatten
                         if tensor.dim() == 2:
-                            # [seq_len, hidden] -> extract at position
-                            if response_position < tensor.shape[0]:
-                                tensor = tensor[response_position]
-                            else:
-                                return None
+                            tensor = tensor[0]  # [1, hidden] -> [hidden]
                         elif tensor.dim() == 3:
-                            # [batch, seq_len, hidden] or [seq_len, batch, hidden]
-                            d0, d1, d2 = tensor.shape
-                            if d0 == 1:
-                                # [1, seq_len, hidden]
-                                if response_position < d1:
-                                    tensor = tensor[0, response_position]
-                                else:
-                                    return None
-                            else:
-                                # [seq_len, 1, hidden]
-                                if response_position < d0:
-                                    tensor = tensor[response_position, 0]
-                                else:
-                                    return None
+                            tensor = tensor[0, 0]  # [1, 1, hidden] -> [hidden]
+                        elif tensor.dim() == 1:
+                            pass  # Already [hidden]
                     else:
-                        # No position specified, take first token
-                        if tensor.dim() == 2:
-                            tensor = tensor[0]
-                        elif tensor.dim() == 3:
-                            tensor = tensor[0, 0] if tensor.shape[0] == 1 else tensor[0, 0]
+                        # Need to extract at response position
+                        if response_position is not None:
+                            if tensor.dim() == 2:
+                                # [seq_len, hidden] -> extract at position
+                                if response_position < tensor.shape[0]:
+                                    tensor = tensor[response_position]
+                                else:
+                                    continue  # Try next key
+                            elif tensor.dim() == 3:
+                                # [batch, seq_len, hidden] or [seq_len, batch, hidden]
+                                d0, d1, d2 = tensor.shape
+                                if d0 == 1:
+                                    # [1, seq_len, hidden]
+                                    if response_position < d1:
+                                        tensor = tensor[0, response_position]
+                                    else:
+                                        continue
+                                else:
+                                    # [seq_len, 1, hidden]
+                                    if response_position < d0:
+                                        tensor = tensor[response_position, 0]
+                                    else:
+                                        continue
+                        else:
+                            # No position specified, take first token
+                            if tensor.dim() == 2:
+                                tensor = tensor[0]
+                            elif tensor.dim() == 3:
+                                tensor = tensor[0, 0] if tensor.shape[0] == 1 else tensor[0, 0]
                     return tensor
     
     return None
@@ -211,6 +224,8 @@ def extract_logits(
     
     elif source == "megatron":
         # Megatron: extract logits at specific position
+        # Note: response_position is the position BEFORE the response token
+        # (i.e., prompt_len - 1), which predicts the first response token
         if response_position is not None:
             # Try position-specific key first
             logits_key = f"logits_pos_{response_position}"
@@ -259,6 +274,9 @@ def find_response_position(
     """
     Find the position of the response token in Megatron dump.
     
+    Megatron has both prefill (prompt) and response tokens.
+    We need to find the first response token position.
+    
     Args:
         megatron_tensors: Dictionary of tensors from Megatron dump
         response_token_id: The token ID to find
@@ -266,6 +284,13 @@ def find_response_position(
     Returns:
         Position index or None if not found
     """
+    # First, try to get prompt_len to determine response start
+    prompt_len = None
+    for key in ["prompt_len", "debug_prompt_len"]:
+        if key in megatron_tensors:
+            prompt_len = int(megatron_tensors[key].item())
+            break
+    
     # Try to find input_ids
     input_ids_key = None
     for key in ["megatron_input_ids", "input_ids"]:
@@ -274,6 +299,9 @@ def find_response_position(
             break
     
     if input_ids_key is None:
+        # If no input_ids, use prompt_len - 1 as fallback (position before first response)
+        if prompt_len is not None:
+            return prompt_len - 1
         return None
     
     input_ids = megatron_tensors[input_ids_key]
@@ -282,8 +310,29 @@ def find_response_position(
     
     # Find the position of response_token_id
     positions = (input_ids == response_token_id).nonzero(as_tuple=True)[0]
+    
     if len(positions) > 0:
-        return positions[0].item()
+        found_pos = positions[0].item()
+        
+        # If we have prompt_len, verify this is in the response part
+        if prompt_len is not None:
+            if found_pos < prompt_len:
+                # Token found in prefill part, use prompt_len as response start
+                print(f"  Note: Token {response_token_id} found at position {found_pos} (in prefill)")
+                print(f"  Using prompt_len={prompt_len} as response start position")
+                return prompt_len - 1  # Position before first response token
+            else:
+                # Token found in response part
+                return found_pos
+        else:
+            # No prompt_len, return first occurrence
+            return found_pos
+    
+    # Token not found, use prompt_len - 1 as fallback
+    if prompt_len is not None:
+        print(f"  Note: Token {response_token_id} not found in input_ids")
+        print(f"  Using prompt_len={prompt_len} - 1 = {prompt_len - 1} as response position")
+        return prompt_len - 1
     
     return None
 
@@ -317,20 +366,37 @@ def compare_layer27_and_logits(
     sglang_tensors = torch.load(sglang_pass_path, map_location="cpu")
     
     # Find response position in Megatron dump
+    # Note: response_position is the position that PREDICTS the response token
+    # (i.e., prompt_len - 1 for first response token)
     response_position = find_response_position(megatron_tensors, response_token_id)
     if response_position is None:
-        print(f"\n⚠️  WARNING: Could not find response token {response_token_id} in Megatron dump")
+        print(f"\n⚠️  WARNING: Could not determine response position")
         print("  Available input_ids keys:", [k for k in megatron_tensors.keys() if "input" in k.lower() or "id" in k.lower()])
         # Try to use prompt_len - 1 as fallback
-        if "prompt_len" in megatron_tensors:
-            prompt_len = int(megatron_tensors["prompt_len"].item())
+        prompt_len = None
+        for key in ["prompt_len", "debug_prompt_len"]:
+            if key in megatron_tensors:
+                prompt_len = int(megatron_tensors[key].item())
+                break
+        if prompt_len is not None:
             response_position = prompt_len - 1
             print(f"  Using fallback position: {response_position} (prompt_len - 1)")
         else:
             print("  ERROR: Cannot determine response position")
             return
     else:
-        print(f"\n✓ Found response token at position: {response_position}")
+        # Get prompt_len for context
+        prompt_len = None
+        for key in ["prompt_len", "debug_prompt_len"]:
+            if key in megatron_tensors:
+                prompt_len = int(megatron_tensors[key].item())
+                break
+        
+        if prompt_len is not None:
+            print(f"\n✓ Using position: {response_position} (predicts token at position {response_position + 1})")
+            print(f"  prompt_len: {prompt_len}, response starts at position {prompt_len}")
+        else:
+            print(f"\n✓ Using position: {response_position}")
     
     # =========================================================================
     # 1. Compare Layer 27 Output
@@ -350,7 +416,13 @@ def compare_layer27_and_logits(
     
     if meg_layer27 is None:
         print("  ✗ Megatron layer 27 output: NOT FOUND")
-        print(f"    Available Megatron keys with 'layer_27': {[k for k in megatron_tensors.keys() if 'layer_27' in k][:10]}")
+        layer27_keys = [k for k in megatron_tensors.keys() if 'layer_27' in k]
+        print(f"    Available Megatron keys with 'layer_27': {layer27_keys[:15]}")
+        print(f"    Tried keys:")
+        print(f"      - layer_27_mlp_output_at_response_start")
+        print(f"      - layer_27_output_at_response_start")
+        print(f"      - layer_27_mlp_output")
+        print(f"      - layer_27_output")
     else:
         print(f"  ✓ Megatron layer 27 output: shape={meg_layer27.shape}, dtype={meg_layer27.dtype}")
     
