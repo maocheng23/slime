@@ -90,6 +90,7 @@ def extract_layer27_output(
     tensors: dict,
     source: str,
     response_position: Optional[int] = None,
+    use_at_response_start: bool = False,
 ) -> Optional[torch.Tensor]:
     """
     Extract layer 27 output from tensor dump.
@@ -138,14 +139,23 @@ def extract_layer27_output(
                     return tensor
     
     elif source == "megatron":
-        # Megatron: use _at_response_start suffix (already extracted at response position)
-        # Try MLP output first (most common), then full layer output
-        keys_to_try = [
-            f"layer_{layer_idx}_mlp_output_at_response_start",  # MLP output (before residual)
-            f"layer_{layer_idx}_output_at_response_start",  # Full layer output (MLP + residual)
-            f"layer_{layer_idx}_mlp_output",  # Fallback without suffix
-            f"layer_{layer_idx}_output",  # Fallback without suffix
-        ]
+        # Megatron: determine which key to use based on position
+        # _at_response_start = position prompt_len (first response token)
+        # No suffix = position prompt_len - 1 (last prompt token)
+        # For later response tokens, need to extract from full tensor
+        
+        if use_at_response_start:
+            # Use _at_response_start keys (position prompt_len)
+            keys_to_try = [
+                f"layer_{layer_idx}_mlp_output_at_response_start",  # MLP output
+                f"layer_{layer_idx}_output_at_response_start",  # Full layer output
+            ]
+        else:
+            # Extract from full tensor at specific position
+            keys_to_try = [
+                f"layer_{layer_idx}_mlp_output",  # Full tensor, extract at position
+                f"layer_{layer_idx}_output",  # Full tensor, extract at position
+            ]
         
         for key in keys_to_try:
             if key in tensors:
@@ -401,38 +411,67 @@ def compare_layer27_and_logits(
     else:
         print(f"  ⚠️  Could not extract token ID from SGLang pass, using provided: {response_token_id}")
     
-    # Find response position in Megatron dump
-    # Note: response_position is the position that PREDICTS the response token
-    # (i.e., prompt_len - 1 for first response token)
-    response_position = find_response_position(megatron_tensors, response_token_id)
-    if response_position is None:
-        print(f"\n⚠️  WARNING: Could not determine response position")
-        print("  Available input_ids keys:", [k for k in megatron_tensors.keys() if "input" in k.lower() or "id" in k.lower()])
-        # Try to use prompt_len - 1 as fallback
-        prompt_len = None
-        for key in ["prompt_len", "debug_prompt_len"]:
-            if key in megatron_tensors:
-                prompt_len = int(megatron_tensors[key].item())
-                break
-        if prompt_len is not None:
-            response_position = prompt_len - 1
-            print(f"  Using fallback position: {response_position} (prompt_len - 1)")
+    # Determine Megatron position based on SGLang decode pass position
+    # Key insight from debug_tensor_dump.py:
+    # - _at_response_start suffix = extracted at position prompt_len (first response token)
+    # - No suffix = extracted at position prompt_len - 1 (last prompt token)
+    #
+    # For SGLang decode pass:
+    # - SGLang decode pass at first_position=X processes token at X
+    # - Its layer 27 output should compare with Megatron position X
+    # - Use _at_response_start key if X == prompt_len, otherwise extract from full tensor
+    
+    prompt_len = None
+    for key in ["prompt_len", "debug_prompt_len"]:
+        if key in megatron_tensors:
+            prompt_len = int(megatron_tensors[key].item())
+            break
+    
+    sglang_position = None
+    if "first_position" in sglang_info:
+        sglang_position = sglang_info["first_position"]
+    
+    # Determine if we should use _at_response_start key
+    use_at_response_start = False
+    if sglang_position is not None and prompt_len is not None:
+        if sglang_position == prompt_len:
+            # First response token: use _at_response_start key
+            use_at_response_start = True
+            response_position = prompt_len  # For logging
+            print(f"\n✓ Position mapping:")
+            print(f"  SGLang decode pass processes token at position: {sglang_position} (first response token)")
+            print(f"  Using Megatron '_at_response_start' key (position {prompt_len})")
         else:
-            print("  ERROR: Cannot determine response position")
-            return
+            # Later response token: need to extract from full tensor
+            response_position = sglang_position
+            print(f"\n✓ Position mapping:")
+            print(f"  SGLang decode pass processes token at position: {sglang_position}")
+            print(f"  Megatron position {sglang_position} (will extract from full tensor)")
+            if prompt_len is not None:
+                print(f"  prompt_len: {prompt_len}, response starts at position {prompt_len}")
     else:
-        # Get prompt_len for context
-        prompt_len = None
-        for key in ["prompt_len", "debug_prompt_len"]:
-            if key in megatron_tensors:
-                prompt_len = int(megatron_tensors[key].item())
-                break
-        
-        if prompt_len is not None:
-            print(f"\n✓ Using position: {response_position} (predicts token at position {response_position + 1})")
-            print(f"  prompt_len: {prompt_len}, response starts at position {prompt_len}")
+        # Fallback: use token ID to find position
+        print(f"\n⚠️  Could not determine SGLang position, using token ID lookup")
+        response_position = find_response_position(megatron_tensors, response_token_id)
+        if response_position is None:
+            print(f"  Could not find token {response_token_id} in Megatron")
+            if prompt_len is not None:
+                response_position = prompt_len
+                use_at_response_start = True
+                print(f"  Using fallback: position {prompt_len} with '_at_response_start' key")
+            else:
+                print("  ERROR: Cannot determine response position")
+                return
         else:
-            print(f"\n✓ Using position: {response_position}")
+            if prompt_len is not None:
+                print(f"  Found token at position: {response_position}")
+                print(f"  prompt_len: {prompt_len}, response starts at position {prompt_len}")
+                if response_position == prompt_len:
+                    use_at_response_start = True
+                elif response_position < prompt_len:
+                    print(f"  ⚠️  Token found in prefill, using prompt_len = {prompt_len} with '_at_response_start' key")
+                    response_position = prompt_len
+                    use_at_response_start = True
     
     # =========================================================================
     # 1. Compare Layer 27 Output
@@ -442,7 +481,7 @@ def compare_layer27_and_logits(
     print("-" * 70)
     
     sg_layer27 = extract_layer27_output(sglang_tensors, "sglang")
-    meg_layer27 = extract_layer27_output(megatron_tensors, "megatron", response_position)
+    meg_layer27 = extract_layer27_output(megatron_tensors, "megatron", response_position, use_at_response_start=use_at_response_start)
     
     if sg_layer27 is None:
         print("  ✗ SGLang layer 27 output: NOT FOUND")
@@ -654,8 +693,9 @@ def find_sglang_pass_for_token(
     if not dump_path.exists():
         return None
     
-    # Find all pass files
+    # Find all pass files - try multiple patterns
     passes = []
+    # Pattern 1: */Pass*.pt (subdirectory)
     for f in dump_path.glob("*/Pass*.pt"):
         name = f.stem
         if name.startswith("Pass"):
@@ -664,15 +704,29 @@ def find_sglang_pass_for_token(
                 passes.append((pass_id, f))
             except ValueError:
                 continue
+    # Pattern 2: Pass*.pt (direct in directory)
+    for f in dump_path.glob("Pass*.pt"):
+        name = f.stem
+        if name.startswith("Pass"):
+            try:
+                pass_id = int(name[4:])
+                if (pass_id, f) not in passes:  # Avoid duplicates
+                    passes.append((pass_id, f))
+            except ValueError:
+                continue
     
     passes = sorted(passes, key=lambda x: x[0])
     
     # If token_index is provided, calculate pass ID directly
     if token_index is not None:
         target_pass_id = first_decode_pass + token_index - 1
+        print(f"  Looking for pass ID: {target_pass_id} (first_decode_pass={first_decode_pass} + token_index={token_index} - 1)")
+        print(f"  Found {len(passes)} passes: {[p[0] for p in passes[:10]]}...")
         for pass_id, path in passes:
             if pass_id == target_pass_id:
                 return (pass_id, str(path))
+        print(f"  ERROR: Pass {target_pass_id} not found!")
+        print(f"  Available pass IDs: {[p[0] for p in passes[:20]]}")
         return None
     
     # If token_id is provided, search by token ID
@@ -749,6 +803,12 @@ def main():
         sglang_path = Path(args.sglang_pass)
         if not sglang_path.exists():
             print(f"ERROR: SGLang pass file not found: {sglang_path}")
+            print(f"  Current working directory: {Path.cwd()}")
+            print(f"  Absolute path: {sglang_path.resolve()}")
+            # Try to find the file
+            if sglang_path.parent.exists():
+                print(f"  Directory exists: {sglang_path.parent}")
+                print(f"  Files in directory: {list(sglang_path.parent.glob('*.pt'))[:10]}")
             return
     elif args.sglang_dir:
         # Search for pass by token index or token ID
