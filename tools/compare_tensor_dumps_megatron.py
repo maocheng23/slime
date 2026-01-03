@@ -3490,13 +3490,14 @@ def compare_single_pass_pair(
             print("=" * 70)
             
             # Determine Megatron position for layer extraction
-            if token_idx == 0:
-                megatron_layer_pos = comparison_pos
-            else:
-                megatron_layer_pos = first_response_pos + token_idx - 1
+            # For response position resp_pos, Megatron layer values are at position resp_pos - 1
+            # (same as megatron_pos used for logits)
+            # Note: token_idx has been modified (token_idx = token_idx + 368), so we use resp_pos directly
+            megatron_layer_pos = resp_pos - 1
             
             print(f"\nExtracting layer values at response position {resp_pos}")
             print(f"Megatron position for layer extraction: {megatron_layer_pos}")
+            print(f"  (Note: Megatron layer values at position N are used to predict token at N+1)")
             
             # Debug: print available Megatron keys for first layer
             print(f"\nDebug: Available Megatron keys for layer 0:")
@@ -3653,7 +3654,10 @@ def compare_single_pass_pair(
                                 meg_key_used = meg_key_base
                     
                     # If base key didn't work, try _at_response_start key
-                    if meg_val is None and meg_key_at_start in megatron_tensors:
+                    # Note: _at_response_start is only for first response position,
+                    # so for positions 369/370 we skip this
+                    if (meg_val is None and meg_key_at_start in megatron_tensors and
+                            resp_pos == first_response_pos):
                         meg_tensor = megatron_tensors[meg_key_at_start]
                         if isinstance(meg_tensor, torch.Tensor):
                             # _at_response_start tensors are already at response position
