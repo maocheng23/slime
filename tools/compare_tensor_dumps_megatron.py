@@ -4037,7 +4037,14 @@ def compare_single_pass_pair(
                                 print(f"      === QKV Parts Comparison (Qwen3-0.6B: Q[0-2047], K[2048-3071], V[3072-4095]) ===")
                                 
                                 # Q part: [0:2048]
-                                sg_q = sg_val[0:2048].float()
+                                sg_q = sg_val[0:1024].float()
+                                meg_q = meg_val[0:1024].float()
+                                q_diff = (sg_q - meg_q).abs()
+                                q_stats = {
+                                    'max_diff 1024': q_diff.max().item(),
+                                    'mean_diff 1024': q_diff.mean().item(),
+                                }
+                                g_q = sg_val[0:2048].float()
                                 meg_q = meg_val[0:2048].float()
                                 q_diff = (sg_q - meg_q).abs()
                                 q_stats = {
@@ -4046,9 +4053,9 @@ def compare_single_pass_pair(
                                 }
                                 print(f"      Q part [0:2048]:")
                                 print(f"        max_diff={q_stats['max_diff']:.8e}, mean_diff={q_stats['mean_diff']:.8e}")
-                                print(f"        SGLang first 100:   {[f'{v:.6f}' for v in sg_q[:100].tolist()]}")
-                                print(f"        Megatron first 100: {[f'{v:.6f}' for v in meg_q[:100].tolist()]}")
-                                print(f"        Diff first 100:     {[f'{d:.8e}' for d in q_diff[:100].tolist()]}")
+                                print(f"        SGLang last 100:   {[f'{v:.6f}' for v in sg_q[-100:].tolist()]}")
+                                print(f"        Megatron last 100: {[f'{v:.6f}' for v in meg_q[-100:].tolist()]}")
+                                print(f"        Diff last 100:     {[f'{d:.8e}' for d in q_diff[-100:].tolist()]}")
                                 
                                 # K part: [2048:3072]
                                 sg_k = sg_val[2048:3072].float()
