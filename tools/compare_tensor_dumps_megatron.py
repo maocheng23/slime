@@ -4008,11 +4008,99 @@ def compare_single_pass_pair(
                                                 continue
                                         
                                         if converted_meg_val is None:
-                                            # Try reverse: maybe SGLang is interleaved and Megatron is continuous?
-                                            # This is less likely but worth trying
-                                            print(f"      Trying reverse conversion (SGLang interleaved -> Megatron continuous)...")
-                                            # This would require knowing the format, skip for now
-                                            pass
+                                            # Try format: per-head storage (each head is 128 dim)
+                                            # Possible formats:
+                                            # 1. All Q heads, then all K heads, then all V heads: [q0(128)...q15(128), k0(128)...k7(128), v0(128)...v7(128)]
+                                            # 2. Per-head interleaved: [q0(128) k0(128) v0(128), q1(128) k1(128) v1(128), ...]
+                                            print(f"      Trying per-head format conversion...")
+                                            
+                                            # Try format 1: [all Q heads, all K heads, all V heads]
+                                            # For Qwen3-0.6B: 16 Q heads * 128 + 8 K heads * 128 + 8 V heads * 128 = 4096
+                                            for head_dim in [64, 128, 256]:
+                                                if total_size % head_dim != 0:
+                                                    continue
+                                                num_heads_total = total_size // head_dim
+                                                # Try different splits: Q heads + K heads + V heads
+                                                for num_kv_heads in [1, 2, 4, 8]:
+                                                    if num_heads_total >= 3 * num_kv_heads:
+                                                        num_q_heads = num_heads_total - 2 * num_kv_heads
+                                                        if num_q_heads > 0 and num_q_heads % num_kv_heads == 0:
+                                                            # Format: [Q_heads, K_heads, V_heads] where each head is head_dim
+                                                            try:
+                                                                # Reshape to [num_heads_total, head_dim]
+                                                                meg_reshaped = meg_val.float().reshape(num_heads_total, head_dim)
+                                                                
+                                                                # Split into Q, K, V
+                                                                q_heads = meg_reshaped[:num_q_heads, :].reshape(-1)  # [num_q_heads * head_dim]
+                                                                k_heads = meg_reshaped[num_q_heads:num_q_heads+num_kv_heads, :].reshape(-1)  # [num_kv_heads * head_dim]
+                                                                v_heads = meg_reshaped[num_q_heads+num_kv_heads:, :].reshape(-1)  # [num_kv_heads * head_dim]
+                                                                
+                                                                # Repeat K and V to match Q heads (GQA expansion)
+                                                                if num_q_heads > num_kv_heads:
+                                                                    repeat_factor = num_q_heads // num_kv_heads
+                                                                    k_heads = k_heads.repeat_interleave(repeat_factor)
+                                                                    v_heads = v_heads.repeat_interleave(repeat_factor)
+                                                                
+                                                                # Concatenate: [Q, K, V] (SGLang format)
+                                                                converted = torch.cat([q_heads, k_heads, v_heads])
+                                                                
+                                                                # Compare with SGLang
+                                                                if converted.numel() == sg_size:
+                                                                    converted_diff = (sg_val.float() - converted).abs()
+                                                                    if converted_diff.max().item() < 1e-4:
+                                                                        converted_meg_val = converted
+                                                                        print(f"      ✓ Per-head format conversion successful (format: all Q, all K, all V)!")
+                                                                        print(f"      Detected: head_dim={head_dim}, num_q_heads={num_q_heads}, "
+                                                                              f"num_kv_heads={num_kv_heads}")
+                                                                        print(f"      After conversion: max_diff={converted_diff.max().item():.8e}, "
+                                                                              f"mean_diff={converted_diff.mean().item():.8e}")
+                                                                        break
+                                                            except Exception as e:
+                                                                continue
+                                                
+                                                # Try format 2: per-head interleaved [q0 k0 v0, q1 k1 v1, ...]
+                                                # For Qwen3-0.6B: 8 groups, each with [q0(128) k0(128) v0(128), q1(128) k1(128) v1(128)]
+                                                for num_kv_heads in [1, 2, 4, 8]:
+                                                    num_q_heads = num_kv_heads * 2  # For Qwen3-0.6B: 16 Q heads, 8 KV heads
+                                                    if num_heads_total == num_q_heads + 2 * num_kv_heads:
+                                                        try:
+                                                            # Reshape to [num_kv_heads, 3, head_dim] (each group: q, k, v)
+                                                            # But wait, this doesn't match the interleaved format
+                                                            # Actually, interleaved per group: [q0 q1 k0 v0, q2 q3 k1 v1, ...]
+                                                            # So it's [num_kv_heads, (num_q_heads/num_kv_heads + 2), head_dim]
+                                                            q_per_group = num_q_heads // num_kv_heads
+                                                            meg_reshaped = meg_val.float().reshape(num_kv_heads, q_per_group + 2, head_dim)
+                                                            
+                                                            # Extract Q, K, V
+                                                            q = meg_reshaped[:, :q_per_group, :].reshape(-1)
+                                                            k = meg_reshaped[:, q_per_group:q_per_group+1, :].reshape(-1)
+                                                            v = meg_reshaped[:, q_per_group+1:, :].reshape(-1)
+                                                            
+                                                            # Repeat K and V
+                                                            if num_q_heads > num_kv_heads:
+                                                                repeat_factor = num_q_heads // num_kv_heads
+                                                                k = k.repeat_interleave(repeat_factor)
+                                                                v = v.repeat_interleave(repeat_factor)
+                                                            
+                                                            converted = torch.cat([q, k, v])
+                                                            
+                                                            if converted.numel() == sg_size:
+                                                                converted_diff = (sg_val.float() - converted).abs()
+                                                                if converted_diff.max().item() < 1e-4:
+                                                                    converted_meg_val = converted
+                                                                    print(f"      ✓ Per-head interleaved format conversion successful!")
+                                                                    print(f"      Detected: head_dim={head_dim}, num_q_heads={num_q_heads}, "
+                                                                          f"num_kv_heads={num_kv_heads}")
+                                                                    print(f"      After conversion: max_diff={converted_diff.max().item():.8e}, "
+                                                                          f"mean_diff={converted_diff.mean().item():.8e}")
+                                                                    break
+                                                        except Exception as e:
+                                                            continue
+                                                
+                                                if converted_meg_val is not None:
+                                                    break
+                                            if converted_meg_val is not None:
+                                                break
                                     
                                     if converted_meg_val is not None:
                                         # Use converted value for comparison
@@ -4037,14 +4125,14 @@ def compare_single_pass_pair(
                                 print(f"      === QKV Parts Comparison (Qwen3-0.6B: Q[0-2047], K[2048-3071], V[3072-4095]) ===")
                                 
                                 # Q part: [0:2048]
-                                sg_q = sg_val[0:1024].float()
-                                meg_q = meg_val[0:1024].float()
+                                sg_q = sg_val[0:128].float()
+                                meg_q = meg_val[0:128].float()
                                 q_diff = (sg_q - meg_q).abs()
                                 q_stats = {
                                     'max_diff 1024': q_diff.max().item(),
                                     'mean_diff 1024': q_diff.mean().item(),
                                 }
-                                g_q = sg_val[0:2048].float()
+                                sg_q = sg_val[0:2048].float()
                                 meg_q = meg_val[0:2048].float()
                                 q_diff = (sg_q - meg_q).abs()
                                 q_stats = {
