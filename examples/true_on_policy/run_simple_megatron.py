@@ -148,6 +148,14 @@ def execute():
         # NOTE: fa3 backend already uses num_splits=1 when enable_deterministic_inference=True
         # (see flashattention_backend.py:367-372)
         # The triton_attention_split_tile_size is only for triton backend, not fa3
+        #
+        # For true on-policy consistency with SGLang:
+        # 1. --use-cpu-initialization: Initialize RoPE inv_freq on CPU (matches SGLang's behavior)
+        #    SGLang computes inv_freq on CPU for numerical stability when rl_on_policy_target is set
+        # 2. --no-rope-fusion: Disable TE's fused RoPE kernel, use native implementation
+        #    This ensures the same RoPE computation path as SGLang's forward_native
+        "--use-cpu-initialization "
+        "--no-rope-fusion "
     )
     true_on_policy_envs = {
         # TODO note: "Ring" in original RL PR, "allreduce:tree" in SGLang
