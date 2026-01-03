@@ -4046,9 +4046,9 @@ def compare_single_pass_pair(
                                 }
                                 print(f"      Q part [0:2048]:")
                                 print(f"        max_diff={q_stats['max_diff']:.8e}, mean_diff={q_stats['mean_diff']:.8e}")
-                                print(f"        SGLang first 10:   {[f'{v:.6f}' for v in sg_q[:10].tolist()]}")
-                                print(f"        Megatron first 10: {[f'{v:.6f}' for v in meg_q[:10].tolist()]}")
-                                print(f"        Diff first 10:     {[f'{d:.8e}' for d in q_diff[:10].tolist()]}")
+                                print(f"        SGLang first 100:   {[f'{v:.6f}' for v in sg_q[:100].tolist()]}")
+                                print(f"        Megatron first 100: {[f'{v:.6f}' for v in meg_q[:100].tolist()]}")
+                                print(f"        Diff first 100:     {[f'{d:.8e}' for d in q_diff[:100].tolist()]}")
                                 
                                 # K part: [2048:3072]
                                 sg_k = sg_val[2048:3072].float()
