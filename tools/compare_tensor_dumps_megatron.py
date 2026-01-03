@@ -4124,6 +4124,68 @@ def compare_single_pass_pair(
                                 # For Qwen3-0.6B: Q(0-2047), K(2048-3071), V(3072-4095)
                                 print(f"      === QKV Parts Comparison (Qwen3-0.6B: Q[0-2047], K[2048-3071], V[3072-4095]) ===")
                                 
+                                # First, try to detect and convert Megatron's interleaved format
+                                # Megatron format: [q0 q1 k0 v0 | q2 q3 k1 v1 | ...] (8 groups, each with 2 Q + 1 K + 1 V, 128 dim each)
+                                # SGLang format: [Q_all(2048), K_all(1024), V_all(1024)]
+                                print(f"      --- Trying Megatron interleaved -> SGLang continuous conversion ---")
+                                
+                                # Qwen3-0.6B config: num_heads=16, num_kv_heads=8, head_dim=128
+                                num_kv_heads = 8
+                                num_q_heads = 16
+                                head_dim = 128
+                                q_per_group = num_q_heads // num_kv_heads  # 2
+                                
+                                # Reshape Megatron: [8 groups, 4 heads per group (2 Q + 1 K + 1 V), 128 dim]
+                                try:
+                                    meg_reshaped = meg_val.float().reshape(num_kv_heads, q_per_group + 2, head_dim)
+                                    # meg_reshaped shape: [8, 4, 128]
+                                    # Each group: [q0, q1, k0, v0] for group 0, [q2, q3, k1, v1] for group 1, etc.
+                                    
+                                    # Extract Q, K, V
+                                    meg_q_interleaved = meg_reshaped[:, :q_per_group, :].reshape(-1)  # [8, 2, 128] -> [2048]
+                                    meg_k_interleaved = meg_reshaped[:, q_per_group:q_per_group+1, :].reshape(-1)  # [8, 1, 128] -> [1024]
+                                    meg_v_interleaved = meg_reshaped[:, q_per_group+1:, :].reshape(-1)  # [8, 1, 128] -> [1024]
+                                    
+                                    # Concatenate to SGLang format: [Q, K, V]
+                                    meg_converted = torch.cat([meg_q_interleaved, meg_k_interleaved, meg_v_interleaved])
+                                    
+                                    # Compare with SGLang
+                                    converted_diff = (sg_val.float() - meg_converted).abs()
+                                    print(f"      After interleaved->continuous conversion:")
+                                    print(f"        max_diff={converted_diff.max().item():.8e}, mean_diff={converted_diff.mean().item():.8e}")
+                                    
+                                    if converted_diff.max().item() < 1e-4:
+                                        print(f"        ✓ CONVERSION SUCCESSFUL! Megatron uses interleaved format.")
+                                        # Print first 10 of each part after conversion
+                                        print(f"        Q part first 10 (after conversion): {[f'{v:.6f}' for v in meg_q_interleaved[:10].tolist()]}")
+                                        print(f"        SGLang Q part first 10:              {[f'{v:.6f}' for v in sg_val[:10].float().tolist()]}")
+                                    else:
+                                        print(f"        ✗ Conversion didn't help. Trying other formats...")
+                                        
+                                        # Try printing the structure to understand the format
+                                        print(f"      --- Debugging format structure ---")
+                                        print(f"      First 128 values (head 0):")
+                                        print(f"        SGLang:   {[f'{v:.4f}' for v in sg_val[:10].float().tolist()]} ... {[f'{v:.4f}' for v in sg_val[118:128].float().tolist()]}")
+                                        print(f"        Megatron: {[f'{v:.4f}' for v in meg_val[:10].float().tolist()]} ... {[f'{v:.4f}' for v in meg_val[118:128].float().tolist()]}")
+                                        
+                                        print(f"      Values at 128-256 (head 1):")
+                                        print(f"        SGLang:   {[f'{v:.4f}' for v in sg_val[128:138].float().tolist()]} ... {[f'{v:.4f}' for v in sg_val[246:256].float().tolist()]}")
+                                        print(f"        Megatron: {[f'{v:.4f}' for v in meg_val[128:138].float().tolist()]} ... {[f'{v:.4f}' for v in meg_val[246:256].float().tolist()]}")
+                                        
+                                        # Check if Megatron's 128-256 matches SGLang's somewhere else
+                                        meg_head1 = meg_val[128:256].float()
+                                        for offset in [0, 128, 256, 384, 512, 1024, 2048, 3072]:
+                                            if offset + 128 <= sg_val.numel():
+                                                sg_slice = sg_val[offset:offset+128].float()
+                                                diff = (meg_head1 - sg_slice).abs().max().item()
+                                                if diff < 1e-4:
+                                                    print(f"        Found match! Megatron[128:256] matches SGLang[{offset}:{offset+128}] (diff={diff:.8e})")
+                                                    break
+                                        else:
+                                            print(f"        No direct match found for Megatron[128:256]")
+                                except Exception as e:
+                                    print(f"      Conversion failed with error: {e}")
+                                
                                 # Q part: [0:2048]
                                 sg_q = sg_val[0:128].float()
                                 meg_q = meg_val[0:128].float()
