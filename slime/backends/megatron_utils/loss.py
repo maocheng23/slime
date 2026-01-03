@@ -989,7 +989,7 @@ def policy_loss_function(
             )
         
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
-        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "2":
             import logging
             logger = logging.getLogger(__name__)
             logger.warning("train_rollout_logprob_abs_diff: " + str(train_rollout_logprob_abs_diff.item()))
