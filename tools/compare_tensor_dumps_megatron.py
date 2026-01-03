@@ -3745,33 +3745,7 @@ def compare_single_pass_pair(
                             elif meg_tensor.dim() == 1:
                                 meg_val = meg_tensor.flatten()
                             meg_key_used = meg_key_pos
-                            if layer_idx == 0 and comp_name == "qkv_proj":
-                                print(f"    Debug {comp_name}: Using _pos_{megatron_layer_pos} key, tensor shape: {meg_tensor.shape}")
-                                print(f"    Debug {comp_name}: Megatron tensor numel: {meg_tensor.numel()}")
-                                # Try to infer QKV dimensions
-                                total_size = meg_tensor.numel()
-                                print(f"    Debug {comp_name}: Total size: {total_size}")
-                                # For Qwen3-0.6B: hidden_size=1024, num_heads=16, num_kv_heads=8, head_dim=128
-                                # qkv_size = num_heads * head_dim + 2 * num_kv_heads * head_dim
-                                # = 16 * 128 + 2 * 8 * 128 = 2048 + 2048 = 4096
-                                # Try to infer
-                                for head_dim in [64, 128, 256]:
-                                    remaining = total_size // head_dim
-                                    for num_kv_heads in [1, 2, 4, 8]:
-                                        if remaining >= 2 * num_kv_heads:
-                                            num_heads = remaining - 2 * num_kv_heads
-                                            if num_heads > 0:
-                                                q_size = num_heads * head_dim
-                                                kv_size = num_kv_heads * head_dim
-                                                total_qkv = q_size + 2 * kv_size
-                                                print(f"    Debug {comp_name}: Possible config: head_dim={head_dim}, "
-                                                      f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
-                                                      f"q_size={q_size}, kv_size={kv_size}, "
-                                                      f"total_qkv={total_qkv}")
-                                                # Check if this matches Qwen3-0.6B config
-                                                if head_dim == 128 and num_heads == 16 and num_kv_heads == 8:
-                                                    print(f"    Debug {comp_name}: ✓ Matches Qwen3-0.6B config!")
-                    
+                             
                     # Fallback: try _full key (complete tensor, extract at position)
                     if meg_val is None and meg_key_full in megatron_tensors:
                         meg_tensor = megatron_tensors[meg_key_full]
