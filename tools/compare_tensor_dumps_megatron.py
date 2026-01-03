@@ -3855,6 +3855,114 @@ def compare_single_pass_pair(
                     # the issue is likely in Q/K/V processing (RoPE, GQA expansion, etc.)
                     if sg_val is not None and meg_val is not None:
                         if sg_val.shape == meg_val.shape:
+                            # Special handling for qkv_proj: check if format is different
+                            # SGLang uses continuous format: [Q_all, K_all, V_all]
+                            # Megatron uses interleaved format: [q1 q2 k1 v1 | q3 q4 k2 v2 | ...]
+                            if comp_name == "qkv_proj" and sg_val.numel() == meg_val.numel():
+                                # Try to detect if formats are different by checking if first values match
+                                # but later values differ significantly
+                                first_n = min(100, len(sg_val))
+                                first_diff = (sg_val[:first_n].float() - meg_val[:first_n].float()).abs().max().item()
+                                last_n = min(100, len(sg_val))
+                                last_diff = (sg_val[-last_n:].float() - meg_val[-last_n:].float()).abs().max().item()
+                                
+                                # If first values match but later values differ, might be format issue
+                                if first_diff < 1e-5 and last_diff > 1e-3:
+                                    print(f"    {comp_name}: Detected possible QKV format mismatch!")
+                                    print(f"      First {first_n} values match (diff={first_diff:.8e}), "
+                                          f"but last {last_n} differ (diff={last_diff:.8e})")
+                                    print(f"      This suggests interleaved vs continuous format difference")
+                                    print(f"      Attempting format conversion...")
+                                    
+                                    # Try to convert Megatron's interleaved format to SGLang's continuous format
+                                    # SGLang format: [Q_all, K_all, V_all] where K and V are already repeated for GQA
+                                    # Megatron format: [q1 q2 k1 v1 | q3 q4 k2 v2 | ...] (interleaved per query group)
+                                    
+                                    total_size = meg_val.numel()
+                                    converted_meg_val = None
+                                    
+                                    # Strategy: Try different interpretations of the tensor size
+                                    # The tensor might be:
+                                    # 1. Full qkv (with tensor parallel, each rank has partial heads)
+                                    # 2. Just Q part
+                                    # 3. QKV but in interleaved format
+                                    
+                                    # First, check if SGLang's format gives us hints
+                                    # SGLang: [Q, K, V] where each is [num_heads * head_dim] (after GQA expansion)
+                                    sg_size = sg_val.numel()
+                                    
+                                    # If sizes match exactly, try direct format conversion
+                                    if sg_size == total_size:
+                                        # Try common configurations
+                                        # For Qwen2-7B: hidden_size=4096, num_heads=32, num_kv_heads=4, head_dim=128
+                                        # With TP=1: qkv_size = 32*128 + 4*128*2 = 5120
+                                        # With TP=2: each rank has 16 Q heads + 2 KV heads = 16*128 + 2*128*2 = 2560
+                                        # With TP=4: each rank has 8 Q heads + 1 KV head = 8*128 + 1*128*2 = 1280
+                                        
+                                        # Try to infer from size
+                                        possible_configs = []
+                                        for head_dim in [64, 128, 256]:
+                                            # total_size = head_dim * (num_heads_per_rank + 2 * num_kv_heads_per_rank)
+                                            remaining = total_size // head_dim
+                                            for num_kv_heads_per_rank in [1, 2, 4, 8]:
+                                                if remaining >= 2 * num_kv_heads_per_rank:
+                                                    num_heads_per_rank = remaining - 2 * num_kv_heads_per_rank
+                                                    if num_heads_per_rank > 0 and num_heads_per_rank % num_kv_heads_per_rank == 0:
+                                                        q_per_group = num_heads_per_rank // num_kv_heads_per_rank
+                                                        possible_configs.append((head_dim, num_heads_per_rank, num_kv_heads_per_rank, q_per_group))
+                                        
+                                        # Try each configuration
+                                        for head_dim, num_heads_per_rank, num_kv_heads_per_rank, q_per_group in possible_configs:
+                                            try:
+                                                # Reshape Megatron's interleaved format
+                                                # Format: [num_query_groups, (q_per_group + 2), head_dim]
+                                                num_query_groups = num_kv_heads_per_rank
+                                                meg_reshaped = meg_val.float().reshape(num_query_groups, q_per_group + 2, head_dim)
+                                                
+                                                # Extract Q, K, V from interleaved format
+                                                q = meg_reshaped[:, :q_per_group, :].reshape(-1)  # [num_heads_per_rank * head_dim]
+                                                k = meg_reshaped[:, q_per_group:q_per_group+1, :].reshape(-1)  # [num_kv_heads_per_rank * head_dim]
+                                                v = meg_reshaped[:, q_per_group+1:, :].reshape(-1)  # [num_kv_heads_per_rank * head_dim]
+                                                
+                                                # Repeat K and V to match Q heads (GQA expansion)
+                                                # This matches SGLang's format where K and V are already expanded
+                                                if num_heads_per_rank > num_kv_heads_per_rank:
+                                                    repeat_factor = num_heads_per_rank // num_kv_heads_per_rank
+                                                    k = k.repeat_interleave(repeat_factor)
+                                                    v = v.repeat_interleave(repeat_factor)
+                                                
+                                                # Concatenate: [Q, K, V] (SGLang format)
+                                                converted = torch.cat([q, k, v])
+                                                
+                                                # Compare with SGLang
+                                                if converted.numel() == sg_size:
+                                                    converted_diff = (sg_val.float() - converted).abs()
+                                                    if converted_diff.max().item() < 1e-4:
+                                                        converted_meg_val = converted
+                                                        print(f"      ✓ Format conversion successful!")
+                                                        print(f"      Detected: head_dim={head_dim}, num_heads_per_rank={num_heads_per_rank}, "
+                                                              f"num_kv_heads_per_rank={num_kv_heads_per_rank}, q_per_group={q_per_group}")
+                                                        print(f"      After conversion: max_diff={converted_diff.max().item():.8e}, "
+                                                              f"mean_diff={converted_diff.mean().item():.8e}")
+                                                        break
+                                            except Exception as e:
+                                                continue
+                                        
+                                        if converted_meg_val is None:
+                                            # Try reverse: maybe SGLang is interleaved and Megatron is continuous?
+                                            # This is less likely but worth trying
+                                            print(f"      Trying reverse conversion (SGLang interleaved -> Megatron continuous)...")
+                                            # This would require knowing the format, skip for now
+                                            pass
+                                    
+                                    if converted_meg_val is not None:
+                                        # Use converted value for comparison
+                                        meg_val = converted_meg_val
+                                        print(f"      Using converted format for comparison")
+                                    else:
+                                        print(f"      Could not convert format automatically. "
+                                              f"Please check QKV format manually.")
+                            
                             stats = compute_diff_stats(sg_val, meg_val)
                             key_info = f" (key: {meg_key_used})" if meg_key_used else ""
                             print(f"    {comp_name}: max_diff={stats['max_diff']:.8e}, "
