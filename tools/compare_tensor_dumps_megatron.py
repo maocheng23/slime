@@ -3484,7 +3484,7 @@ def compare_single_pass_pair(
         # =========================================================
         # Special handling for response positions 369 and 370: extract and compare layer values
         # =========================================================
-        if token_idx in [370]:
+        if token_idx in [369, 370]:
             print("\n" + "=" * 70)
             print(f"SPECIAL HANDLING: RESPONSE POSITION {resp_pos} - LAYER VALUES")
             print("=" * 70)
@@ -3545,7 +3545,7 @@ def compare_single_pass_pair(
                 print(f"  Detected {num_layers} layers")
             
             # Extract layer values for each layer
-            for layer_idx in range(num_layers):
+            for layer_idx in [0, 27]:
                 print(f"\n  Layer {layer_idx}:")
                 
                 # Extract SGLang layer values
