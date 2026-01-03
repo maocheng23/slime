@@ -188,6 +188,30 @@ class MegatronTensorDumper:
             if tensor.dim() >= 2:
                 # Save full tensor (preserve original dtype)
                 self._current_tensors[f"{name}_full"] = tensor.cpu()
+                
+                # Also save at EACH response position (like logits_pos_N)
+                # This makes it easy to extract values at specific positions
+                # Determine sequence length
+                if tensor.dim() == 2:
+                    # [seq_len, hidden]
+                    seq_len = tensor.shape[0]
+                elif tensor.dim() == 3:
+                    d0, d1, d2 = tensor.shape
+                    if d0 == 1:
+                        # [1, seq_len, hidden]
+                        seq_len = d1
+                    else:
+                        # [seq_len, 1, hidden]
+                        seq_len = d0
+                else:
+                    seq_len = 0
+                
+                # Save at each response position (similar to logits_pos_N)
+                response_len = seq_len - prompt_len
+                for i in range(response_len):
+                    pos = prompt_len + i
+                    if pos < seq_len:
+                        save_at_position(tensor, pos, f"_pos_{pos}")
 
     def set_response_start_position(self, pos: int) -> None:
         """Set the response start position (prompt_len).

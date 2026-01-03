@@ -3569,8 +3569,21 @@ def compare_single_pass_pair(
                 ]
                 
                 # Extract Megatron layer values at this position
-                # For positions beyond first response, use _full keys (complete tensor)
-                # and extract from full tensor at specific position
+                # Priority order:
+                # 1. _pos_{N} keys (position-specific, like logits_pos_N)
+                # 2. _full keys (complete tensor, extract at position)
+                # 3. _at_response_start keys (for first response position only)
+                megatron_layer_keys_pos = [
+                    f"layer_{layer_idx}_qkv_layernorm_output_pos_{megatron_layer_pos}",
+                    f"layer_{layer_idx}_qkv_proj_output_pos_{megatron_layer_pos}",
+                    f"layer_{layer_idx}_q_layernorm_output_pos_{megatron_layer_pos}",
+                    f"layer_{layer_idx}_k_layernorm_output_pos_{megatron_layer_pos}",
+                    f"layer_{layer_idx}_core_attention_output_pos_{megatron_layer_pos}",
+                    f"layer_{layer_idx}_o_proj_output_pos_{megatron_layer_pos}",
+                    f"layer_{layer_idx}_pre_mlp_layernorm_output_pos_{megatron_layer_pos}",
+                    f"layer_{layer_idx}_mlp.gate_up_proj_output_pos_{megatron_layer_pos}",
+                    f"layer_{layer_idx}_mlp_output_pos_{megatron_layer_pos}",
+                ]
                 megatron_layer_keys_full = [
                     f"layer_{layer_idx}_qkv_layernorm_output_full",
                     f"layer_{layer_idx}_qkv_proj_output_full",
@@ -3619,8 +3632,8 @@ def compare_single_pass_pair(
                     "down_proj",
                 ]
                 
-                for sg_key, meg_key_full, meg_key_base, meg_key_at_start, comp_name in zip(
-                    sglang_layer_keys, megatron_layer_keys_full,
+                for sg_key, meg_key_pos, meg_key_full, meg_key_base, meg_key_at_start, comp_name in zip(
+                    sglang_layer_keys, megatron_layer_keys_pos, megatron_layer_keys_full,
                     megatron_layer_keys_base, megatron_layer_keys_at_start, 
                     component_names
                 ):
@@ -3643,12 +3656,27 @@ def compare_single_pass_pair(
                                 sg_val = sg_tensor.flatten()
                     
                     # Extract Megatron value at position
-                    # Try _full key first (complete tensor, extract at position)
+                    # Priority: _pos_{N} > _full > base > _at_response_start
                     meg_val = None
                     meg_key_used = None
                     
-                    # First try _full key (complete tensor, extract at position)
-                    if meg_key_full in megatron_tensors:
+                    # First try _pos_{N} key (position-specific, like logits_pos_N)
+                    if meg_key_pos in megatron_tensors:
+                        meg_tensor = megatron_tensors[meg_key_pos]
+                        if isinstance(meg_tensor, torch.Tensor):
+                            # Already extracted at specific position
+                            if meg_tensor.dim() == 2:
+                                meg_val = meg_tensor[0].flatten()  # [1, hidden] -> [hidden]
+                            elif meg_tensor.dim() == 3:
+                                meg_val = meg_tensor[0, 0].flatten()  # [1, 1, hidden] -> [hidden]
+                            elif meg_tensor.dim() == 1:
+                                meg_val = meg_tensor.flatten()
+                            meg_key_used = meg_key_pos
+                            if layer_idx == 0 and comp_name == "qkv_proj":
+                                print(f"    Debug {comp_name}: Using _pos_{megatron_layer_pos} key, tensor shape: {meg_tensor.shape}")
+                    
+                    # Fallback: try _full key (complete tensor, extract at position)
+                    if meg_val is None and meg_key_full in megatron_tensors:
                         meg_tensor = megatron_tensors[meg_key_full]
                         if isinstance(meg_tensor, torch.Tensor):
                             # Debug: print tensor shape and position
