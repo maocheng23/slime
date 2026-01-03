@@ -3719,9 +3719,33 @@ def compare_single_pass_pair(
                         if isinstance(sg_tensor, (list, tuple)):
                             sg_tensor = sg_tensor[-1]
                         if isinstance(sg_tensor, torch.Tensor):
-                            # Debug: print tensor shape
+                            # Debug: print tensor shape and size info
                             if layer_idx == 0 and comp_name == "qkv_proj":
                                 print(f"    Debug {comp_name}: SGLang tensor shape: {sg_tensor.shape}")
+                                print(f"    Debug {comp_name}: SGLang tensor numel: {sg_tensor.numel()}")
+                                # Try to infer QKV dimensions
+                                total_size = sg_tensor.numel()
+                                print(f"    Debug {comp_name}: Total size: {total_size}")
+                                # For Qwen3-0.6B: hidden_size=1024, num_heads=16, num_kv_heads=8, head_dim=128
+                                # qkv_size = num_heads * head_dim + 2 * num_kv_heads * head_dim
+                                # = 16 * 128 + 2 * 8 * 128 = 2048 + 2048 = 4096
+                                # Try to infer
+                                for head_dim in [64, 128, 256]:
+                                    remaining = total_size // head_dim
+                                    for num_kv_heads in [1, 2, 4, 8]:
+                                        if remaining >= 2 * num_kv_heads:
+                                            num_heads = remaining - 2 * num_kv_heads
+                                            if num_heads > 0:
+                                                q_size = num_heads * head_dim
+                                                kv_size = num_kv_heads * head_dim
+                                                total_qkv = q_size + 2 * kv_size
+                                                print(f"    Debug {comp_name}: Possible config: head_dim={head_dim}, "
+                                                      f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
+                                                      f"q_size={q_size}, kv_size={kv_size}, "
+                                                      f"total_qkv={total_qkv}")
+                                                # Check if this matches Qwen3-0.6B config
+                                                if head_dim == 128 and num_heads == 16 and num_kv_heads == 8:
+                                                    print(f"    Debug {comp_name}: ✓ Matches Qwen3-0.6B config!")
                             # Extract single token (decode pass)
                             if sg_tensor.dim() == 2:
                                 sg_val = sg_tensor[0].flatten()  # [1, hidden] -> [hidden]
@@ -3749,6 +3773,30 @@ def compare_single_pass_pair(
                             meg_key_used = meg_key_pos
                             if layer_idx == 0 and comp_name == "qkv_proj":
                                 print(f"    Debug {comp_name}: Using _pos_{megatron_layer_pos} key, tensor shape: {meg_tensor.shape}")
+                                print(f"    Debug {comp_name}: Megatron tensor numel: {meg_tensor.numel()}")
+                                # Try to infer QKV dimensions
+                                total_size = meg_tensor.numel()
+                                print(f"    Debug {comp_name}: Total size: {total_size}")
+                                # For Qwen3-0.6B: hidden_size=1024, num_heads=16, num_kv_heads=8, head_dim=128
+                                # qkv_size = num_heads * head_dim + 2 * num_kv_heads * head_dim
+                                # = 16 * 128 + 2 * 8 * 128 = 2048 + 2048 = 4096
+                                # Try to infer
+                                for head_dim in [64, 128, 256]:
+                                    remaining = total_size // head_dim
+                                    for num_kv_heads in [1, 2, 4, 8]:
+                                        if remaining >= 2 * num_kv_heads:
+                                            num_heads = remaining - 2 * num_kv_heads
+                                            if num_heads > 0:
+                                                q_size = num_heads * head_dim
+                                                kv_size = num_kv_heads * head_dim
+                                                total_qkv = q_size + 2 * kv_size
+                                                print(f"    Debug {comp_name}: Possible config: head_dim={head_dim}, "
+                                                      f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
+                                                      f"q_size={q_size}, kv_size={kv_size}, "
+                                                      f"total_qkv={total_qkv}")
+                                                # Check if this matches Qwen3-0.6B config
+                                                if head_dim == 128 and num_heads == 16 and num_kv_heads == 8:
+                                                    print(f"    Debug {comp_name}: ✓ Matches Qwen3-0.6B config!")
                     
                     # Fallback: try _full key (complete tensor, extract at position)
                     if meg_val is None and meg_key_full in megatron_tensors:
@@ -3877,6 +3925,9 @@ def compare_single_pass_pair(
                                     # Try to convert Megatron's interleaved format to SGLang's continuous format
                                     # SGLang format: [Q_all, K_all, V_all] where K and V are already repeated for GQA
                                     # Megatron format: [q1 q2 k1 v1 | q3 q4 k2 v2 | ...] (interleaved per query group)
+                                    # For Qwen3-0.6B: num_heads=16, num_kv_heads=8, head_dim=128
+                                    # SGLang: [Q(2048), K(1024), V(1024)] = [4096]
+                                    # Megatron interleaved: [q1 q2 k1 v1 | q3 q4 k2 v2 | ...] where each group has 2 Q heads + 1 K head + 1 V head
                                     
                                     total_size = meg_val.numel()
                                     converted_meg_val = None
@@ -3890,6 +3941,11 @@ def compare_single_pass_pair(
                                     # First, check if SGLang's format gives us hints
                                     # SGLang: [Q, K, V] where each is [num_heads * head_dim] (after GQA expansion)
                                     sg_size = sg_val.numel()
+                                    
+                                    # For Qwen3-0.6B: expected sizes
+                                    # Without TP: total_qkv = 16*128 + 2*8*128 = 4096
+                                    # With TP=2: each rank has 8*128 + 2*4*128 = 2048
+                                    # With TP=4: each rank has 4*128 + 2*2*128 = 1024
                                     
                                     # If sizes match exactly, try direct format conversion
                                     if sg_size == total_size:
@@ -3916,6 +3972,8 @@ def compare_single_pass_pair(
                                             try:
                                                 # Reshape Megatron's interleaved format
                                                 # Format: [num_query_groups, (q_per_group + 2), head_dim]
+                                                # For Qwen3-0.6B without TP: num_query_groups=8, q_per_group=2, head_dim=128
+                                                # Interleaved: [8 groups, each with 2 Q heads + 1 K head + 1 V head, 128]
                                                 num_query_groups = num_kv_heads_per_rank
                                                 meg_reshaped = meg_val.float().reshape(num_query_groups, q_per_group + 2, head_dim)
                                                 
@@ -3926,6 +3984,7 @@ def compare_single_pass_pair(
                                                 
                                                 # Repeat K and V to match Q heads (GQA expansion)
                                                 # This matches SGLang's format where K and V are already expanded
+                                                # For Qwen3-0.6B: num_heads=16, num_kv_heads=8, so repeat_factor=2
                                                 if num_heads_per_rank > num_kv_heads_per_rank:
                                                     repeat_factor = num_heads_per_rank // num_kv_heads_per_rank
                                                     k = k.repeat_interleave(repeat_factor)
@@ -3972,16 +4031,64 @@ def compare_single_pass_pair(
                             print(f"      Shapes: SGLang {sg_val.shape}, Megatron {meg_val.shape}")
                             print(f"      Sizes: SGLang {sg_val.numel()}, Megatron {meg_val.numel()}")
                             
-                            # Print first 10 values for comparison
-                            sg_first10 = sg_val[:10].float().tolist()
-                            meg_first10 = meg_val[:10].float().tolist()
-                            print(f"      SGLang first 10:   {[f'{v:.6f}' for v in sg_first10]}")
-                            print(f"      Megatron first 10: {[f'{v:.6f}' for v in meg_first10]}")
-                            
-                            # Print differences for first 10 values
-                            diff_first10 = [(sg_val[i].float() - meg_val[i].float()).abs().item() 
-                                           for i in range(min(10, len(sg_val)))]
-                            print(f"      Diff first 10:    {[f'{d:.8e}' for d in diff_first10]}")
+                            # Special handling for qkv_proj: compare Q, K, V parts separately
+                            if comp_name == "qkv_proj" and sg_val.numel() == 4096 and meg_val.numel() == 4096:
+                                # For Qwen3-0.6B: Q(0-2047), K(2048-3071), V(3072-4095)
+                                print(f"      === QKV Parts Comparison (Qwen3-0.6B: Q[0-2047], K[2048-3071], V[3072-4095]) ===")
+                                
+                                # Q part: [0:2048]
+                                sg_q = sg_val[0:2048].float()
+                                meg_q = meg_val[0:2048].float()
+                                q_diff = (sg_q - meg_q).abs()
+                                q_stats = {
+                                    'max_diff': q_diff.max().item(),
+                                    'mean_diff': q_diff.mean().item(),
+                                }
+                                print(f"      Q part [0:2048]:")
+                                print(f"        max_diff={q_stats['max_diff']:.8e}, mean_diff={q_stats['mean_diff']:.8e}")
+                                print(f"        SGLang first 10:   {[f'{v:.6f}' for v in sg_q[:10].tolist()]}")
+                                print(f"        Megatron first 10: {[f'{v:.6f}' for v in meg_q[:10].tolist()]}")
+                                print(f"        Diff first 10:     {[f'{d:.8e}' for d in q_diff[:10].tolist()]}")
+                                
+                                # K part: [2048:3072]
+                                sg_k = sg_val[2048:3072].float()
+                                meg_k = meg_val[2048:3072].float()
+                                k_diff = (sg_k - meg_k).abs()
+                                k_stats = {
+                                    'max_diff': k_diff.max().item(),
+                                    'mean_diff': k_diff.mean().item(),
+                                }
+                                print(f"      K part [2048:3072]:")
+                                print(f"        max_diff={k_stats['max_diff']:.8e}, mean_diff={k_stats['mean_diff']:.8e}")
+                                print(f"        SGLang first 10:   {[f'{v:.6f}' for v in sg_k[:10].tolist()]}")
+                                print(f"        Megatron first 10: {[f'{v:.6f}' for v in meg_k[:10].tolist()]}")
+                                print(f"        Diff first 10:     {[f'{d:.8e}' for d in k_diff[:10].tolist()]}")
+                                
+                                # V part: [3072:4096]
+                                sg_v = sg_val[3072:4096].float()
+                                meg_v = meg_val[3072:4096].float()
+                                v_diff = (sg_v - meg_v).abs()
+                                v_stats = {
+                                    'max_diff': v_diff.max().item(),
+                                    'mean_diff': v_diff.mean().item(),
+                                }
+                                print(f"      V part [3072:4096]:")
+                                print(f"        max_diff={v_stats['max_diff']:.8e}, mean_diff={v_stats['mean_diff']:.8e}")
+                                print(f"        SGLang first 10:   {[f'{v:.6f}' for v in sg_v[:10].tolist()]}")
+                                print(f"        Megatron first 10: {[f'{v:.6f}' for v in meg_v[:10].tolist()]}")
+                                print(f"        Diff first 10:     {[f'{d:.8e}' for d in v_diff[:10].tolist()]}")
+                                print(f"      === End QKV Parts Comparison ===")
+                            else:
+                                # Print first 10 values for comparison (non-qkv_proj)
+                                sg_first10 = sg_val[:10].float().tolist()
+                                meg_first10 = meg_val[:10].float().tolist()
+                                print(f"      SGLang first 10:   {[f'{v:.6f}' for v in sg_first10]}")
+                                print(f"      Megatron first 10: {[f'{v:.6f}' for v in meg_first10]}")
+                                
+                                # Print differences for first 10 values
+                                diff_first10 = [(sg_val[i].float() - meg_val[i].float()).abs().item() 
+                                               for i in range(min(10, len(sg_val)))]
+                                print(f"      Diff first 10:    {[f'{d:.8e}' for d in diff_first10]}")
                             
                             # Print statistics
                             print(f"      SGLang stats: min={sg_val.float().min().item():.6f}, "
