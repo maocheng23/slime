@@ -3567,6 +3567,69 @@ def compare_single_pass_pair(
             for layer_idx in [0, 27]:
                 print(f"\n  Layer {layer_idx}:")
                 
+                # Debug: Check if qkv_proj might have format issues
+                if layer_idx == 0:
+                    print(f"\n  === DEBUG: Checking qkv_proj format for layer {layer_idx} ===")
+                    # Check SGLang qkv_proj
+                    sg_qkv_key = f"model.layers.{layer_idx}.self_attn.qkv_proj"
+                    if sg_qkv_key in sglang_layer_tensors:
+                        sg_qkv = sglang_layer_tensors[sg_qkv_key]
+                        if isinstance(sg_qkv, (list, tuple)):
+                            sg_qkv = sg_qkv[-1]
+                        if isinstance(sg_qkv, torch.Tensor):
+                            print(f"    SGLang qkv_proj shape: {sg_qkv.shape}")
+                            print(f"    SGLang qkv_proj first 5: {sg_qkv.flatten()[:5].float().tolist()}")
+                            print(f"    SGLang qkv_proj last 5: {sg_qkv.flatten()[-5:].float().tolist()}")
+                    
+                    # Check Megatron qkv_proj
+                    meg_qkv_key = f"layer_{layer_idx}_qkv_proj_output_pos_{megatron_layer_pos}"
+                    if meg_qkv_key in megatron_tensors:
+                        meg_qkv = megatron_tensors[meg_qkv_key]
+                        if isinstance(meg_qkv, torch.Tensor):
+                            print(f"    Megatron qkv_proj shape: {meg_qkv.shape}")
+                            print(f"    Megatron qkv_proj first 5: {meg_qkv.flatten()[:5].float().tolist()}")
+                            print(f"    Megatron qkv_proj last 5: {meg_qkv.flatten()[-5:].float().tolist()}")
+                    else:
+                        # Try _full key
+                        meg_qkv_full_key = f"layer_{layer_idx}_qkv_proj_output_full"
+                        if meg_qkv_full_key in megatron_tensors:
+                            meg_qkv_full = megatron_tensors[meg_qkv_full_key]
+                            print(f"    Megatron qkv_proj_full shape: {meg_qkv_full.shape}")
+                    
+                    # Check if input_layernorm matches (this should match if models are identical)
+                    sg_ln_key = f"model.layers.{layer_idx}.input_layernorm"
+                    meg_ln_key = f"layer_{layer_idx}_qkv_layernorm_output_pos_{megatron_layer_pos}"
+                    if sg_ln_key in sglang_layer_tensors and meg_ln_key in megatron_tensors:
+                        sg_ln = sglang_layer_tensors[sg_ln_key]
+                        if isinstance(sg_ln, (list, tuple)):
+                            sg_ln = sg_ln[-1]
+                        meg_ln = megatron_tensors[meg_ln_key]
+                        if isinstance(sg_ln, torch.Tensor) and isinstance(meg_ln, torch.Tensor):
+                            # Extract single token from SGLang
+                            if sg_ln.dim() == 2:
+                                sg_ln_val = sg_ln[0].flatten()
+                            elif sg_ln.dim() == 1:
+                                sg_ln_val = sg_ln.flatten()
+                            else:
+                                sg_ln_val = sg_ln.flatten()
+                            
+                            # Megatron should already be extracted
+                            if meg_ln.dim() == 2:
+                                meg_ln_val = meg_ln[0].flatten()
+                            elif meg_ln.dim() == 1:
+                                meg_ln_val = meg_ln.flatten()
+                            else:
+                                meg_ln_val = meg_ln.flatten()
+                            
+                            ln_diff = (sg_ln_val.float() - meg_ln_val.float()).abs()
+                            print(f"    Input LayerNorm max_diff: {ln_diff.max().item():.8e}")
+                            if ln_diff.max().item() < 1e-5:
+                                print(f"    ✓ Input LayerNorm MATCHES - qkv_proj input is identical")
+                                print(f"      This means qkv_proj difference is in the projection itself!")
+                            else:
+                                print(f"    ✗ Input LayerNorm DIFFERS - issue is before qkv_proj")
+                    print(f"  === END DEBUG ===\n")
+                
                 # Extract SGLang layer values
                 sglang_layer_keys = [
                     f"model.layers.{layer_idx}.input_layernorm",
@@ -3788,6 +3851,8 @@ def compare_single_pass_pair(
                         pass
                     
                     # Compare if both values exist
+                    # Additional debug: if this is core_attention and it differs,
+                    # the issue is likely in Q/K/V processing (RoPE, GQA expansion, etc.)
                     if sg_val is not None and meg_val is not None:
                         if sg_val.shape == meg_val.shape:
                             stats = compute_diff_stats(sg_val, meg_val)
