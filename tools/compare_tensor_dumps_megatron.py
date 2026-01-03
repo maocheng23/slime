@@ -3482,11 +3482,11 @@ def compare_single_pass_pair(
                         )
 
         # =========================================================
-        # Special handling for response position 369: extract and compare layer values
+        # Special handling for response positions 369 and 370: extract and compare layer values
         # =========================================================
-        if resp_pos == 369:
+        if token_idx in [370]:
             print("\n" + "=" * 70)
-            print(f"SPECIAL HANDLING: RESPONSE POSITION 369 - LAYER VALUES")
+            print(f"SPECIAL HANDLING: RESPONSE POSITION {resp_pos} - LAYER VALUES")
             print("=" * 70)
             
             # Determine Megatron position for layer extraction
