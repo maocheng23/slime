@@ -3490,13 +3490,19 @@ def compare_single_pass_pair(
             print("=" * 70)
             
             # Determine Megatron position for layer extraction
-            # For response position resp_pos, Megatron layer values are at position resp_pos - 1
-            # (same as megatron_pos used for logits)
-            # Note: token_idx has been modified (token_idx = token_idx + 368), so we use resp_pos directly
-            megatron_layer_pos = resp_pos - 1
+            # IMPORTANT: Use the SAME calculation as megatron_pos used for logits
+            # to ensure we're comparing the same position
+            # Note: token_idx has been modified (token_idx = token_idx + 368)
+            if token_idx == 0:
+                megatron_layer_pos = comparison_pos
+            else:
+                # Subsequent tokens: use previous response position (same as logits)
+                megatron_layer_pos = first_response_pos + token_idx - 1
             
             print(f"\nExtracting layer values at response position {resp_pos}")
             print(f"Megatron position for layer extraction: {megatron_layer_pos}")
+            print(f"  (Using same calculation as logits: token_idx={token_idx}, "
+                  f"first_response_pos={first_response_pos})")
             print(f"  (Note: Megatron layer values at position N are used to predict token at N+1)")
             
             # Debug: print available Megatron keys for first layer
@@ -3625,6 +3631,9 @@ def compare_single_pass_pair(
                         if isinstance(sg_tensor, (list, tuple)):
                             sg_tensor = sg_tensor[-1]
                         if isinstance(sg_tensor, torch.Tensor):
+                            # Debug: print tensor shape
+                            if layer_idx == 0 and comp_name == "qkv_proj":
+                                print(f"    Debug {comp_name}: SGLang tensor shape: {sg_tensor.shape}")
                             # Extract single token (decode pass)
                             if sg_tensor.dim() == 2:
                                 sg_val = sg_tensor[0].flatten()  # [1, hidden] -> [hidden]
@@ -3642,12 +3651,21 @@ def compare_single_pass_pair(
                     if meg_key_full in megatron_tensors:
                         meg_tensor = megatron_tensors[meg_key_full]
                         if isinstance(meg_tensor, torch.Tensor):
+                            # Debug: print tensor shape and position
+                            if layer_idx == 0 and comp_name == "qkv_proj":
+                                print(f"    Debug {comp_name}: Megatron tensor shape: {meg_tensor.shape}, "
+                                      f"extracting at position {megatron_layer_pos}")
                             # Extract at specific position
                             if meg_tensor.dim() == 2:
                                 # [seq_len, hidden]
                                 if megatron_layer_pos < meg_tensor.shape[0]:
                                     meg_val = meg_tensor[megatron_layer_pos].flatten()
                                     meg_key_used = meg_key_full
+                                    if layer_idx == 0 and comp_name == "qkv_proj":
+                                        print(f"    Debug {comp_name}: Extracted from [seq_len, hidden] at index {megatron_layer_pos}")
+                                else:
+                                    if layer_idx == 0 and comp_name == "qkv_proj":
+                                        print(f"    Debug {comp_name}: Position {megatron_layer_pos} out of range (seq_len={meg_tensor.shape[0]})")
                             elif meg_tensor.dim() == 3:
                                 # [batch, seq_len, hidden] or [seq_len, batch, hidden]
                                 d0, d1, d2 = meg_tensor.shape
@@ -3656,15 +3674,27 @@ def compare_single_pass_pair(
                                     if megatron_layer_pos < d1:
                                         meg_val = meg_tensor[0, megatron_layer_pos].flatten()
                                         meg_key_used = meg_key_full
+                                        if layer_idx == 0 and comp_name == "qkv_proj":
+                                            print(f"    Debug {comp_name}: Extracted from [1, seq_len, hidden] at index [0, {megatron_layer_pos}]")
+                                    else:
+                                        if layer_idx == 0 and comp_name == "qkv_proj":
+                                            print(f"    Debug {comp_name}: Position {megatron_layer_pos} out of range (seq_len={d1})")
                                 else:
                                     # [seq_len, 1, hidden]
                                     if megatron_layer_pos < d0:
                                         meg_val = meg_tensor[megatron_layer_pos, 0].flatten()
                                         meg_key_used = meg_key_full
+                                        if layer_idx == 0 and comp_name == "qkv_proj":
+                                            print(f"    Debug {comp_name}: Extracted from [seq_len, 1, hidden] at index [{megatron_layer_pos}, 0]")
+                                    else:
+                                        if layer_idx == 0 and comp_name == "qkv_proj":
+                                            print(f"    Debug {comp_name}: Position {megatron_layer_pos} out of range (seq_len={d0})")
                             elif meg_tensor.dim() == 1:
                                 # Already single position
                                 meg_val = meg_tensor.flatten()
                                 meg_key_used = meg_key_full
+                                if layer_idx == 0 and comp_name == "qkv_proj":
+                                    print(f"    Debug {comp_name}: Using 1D tensor (already single position)")
                     
                     # Fallback: try base key (full tensor, extract at position)
                     if meg_val is None and meg_key_base in megatron_tensors:
@@ -3725,6 +3755,10 @@ def compare_single_pass_pair(
                             print(f"    {comp_name}: max_diff={stats['max_diff']:.8e}, "
                                   f"mean_diff={stats['mean_diff']:.8e}{key_info}")
                             
+                            # Print tensor shapes and sizes for debugging
+                            print(f"      Shapes: SGLang {sg_val.shape}, Megatron {meg_val.shape}")
+                            print(f"      Sizes: SGLang {sg_val.numel()}, Megatron {meg_val.numel()}")
+                            
                             # Print first 10 values for comparison
                             sg_first10 = sg_val[:10].float().tolist()
                             meg_first10 = meg_val[:10].float().tolist()
@@ -3735,6 +3769,14 @@ def compare_single_pass_pair(
                             diff_first10 = [(sg_val[i].float() - meg_val[i].float()).abs().item() 
                                            for i in range(min(10, len(sg_val)))]
                             print(f"      Diff first 10:    {[f'{d:.8e}' for d in diff_first10]}")
+                            
+                            # Print statistics
+                            print(f"      SGLang stats: min={sg_val.float().min().item():.6f}, "
+                                  f"max={sg_val.float().max().item():.6f}, "
+                                  f"mean={sg_val.float().mean().item():.6f}")
+                            print(f"      Megatron stats: min={meg_val.float().min().item():.6f}, "
+                                  f"max={meg_val.float().max().item():.6f}, "
+                                  f"mean={meg_val.float().mean().item():.6f}")
                             
                             if stats['max_diff'] < 1e-5:
                                 print(f"      ✓ MATCH")
