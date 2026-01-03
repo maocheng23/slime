@@ -3233,7 +3233,7 @@ def compare_single_pass_pair(
     response_tokens = []
     if input_ids_key in megatron_tensors:
         input_ids = megatron_tensors[input_ids_key].flatten()
-        tokenlist = [0, 256, 300, 369, 370]
+        tokenlist = [0, 330, 368, 369, 370]
         for i in tokenlist:
             pos = first_response_pos + i
             if pos < len(input_ids):
