@@ -4128,10 +4128,15 @@ def compare_single_pass_pair(
                                 sg_q = sg_val[0:128].float()
                                 meg_q = meg_val[0:128].float()
                                 q_diff = (sg_q - meg_q).abs()
-                                q_stats = {
-                                    'max_diff 1024': q_diff.max().item(),
-                                    'mean_diff 1024': q_diff.mean().item(),
-                                }
+                                print(f"      Q part [0:128]:")
+                                print(f"        max_diff={q_diff.max().item():.8e}, mean_diff={q_diff.mean().item():.8e}")
+                                
+                                sg_q = sg_val[0:1024].float()
+                                meg_q = meg_val[0:1024].float()
+                                q_diff = (sg_q - meg_q).abs()
+                                print(f"      Q part [0:1024]:")
+                                print(f"        max_diff={q_diff.max().item():.8e}, mean_diff={q_diff.mean().item():.8e}")
+                                
                                 sg_q = sg_val[0:2048].float()
                                 meg_q = meg_val[0:2048].float()
                                 q_diff = (sg_q - meg_q).abs()
