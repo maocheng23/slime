@@ -3480,6 +3480,156 @@ def compare_single_pass_pair(
                             f"logprobs DIFFER!"
                         )
 
+        # =========================================================
+        # Special handling for response position 369: extract and compare layer values
+        # =========================================================
+        if resp_pos == 369:
+            print("\n" + "=" * 70)
+            print(f"SPECIAL HANDLING: RESPONSE POSITION 369 - LAYER VALUES")
+            print("=" * 70)
+            
+            # Determine Megatron position for layer extraction
+            if token_idx == 0:
+                megatron_layer_pos = comparison_pos
+            else:
+                megatron_layer_pos = first_response_pos + token_idx - 1
+            
+            print(f"\nExtracting layer values at response position {resp_pos}")
+            print(f"Megatron position for layer extraction: {megatron_layer_pos}")
+            
+            # Get SGLang decode pass for this position
+            sglang_decode_for_layer = find_sglang_decode_pass(sglang_dir, resp_pos)
+            sglang_layer_tensors = {}
+            if sglang_decode_for_layer is not None:
+                decode_id, decode_path = sglang_decode_for_layer
+                decode_tensors = torch.load(decode_path, map_location="cpu")
+                sglang_layer_tensors = decode_tensors
+                print(f"\nSGLang decode pass {decode_id} loaded for layer extraction")
+            else:
+                print(f"\nWarning: No SGLang decode pass found for position {resp_pos}")
+            
+            # Determine number of layers dynamically
+            num_layers = 0
+            # Try to infer from Megatron tensors
+            for key in megatron_tensors.keys():
+                match = re.match(r"^layer_(\d+)_", key)
+                if match:
+                    layer_num = int(match.group(1))
+                    num_layers = max(num_layers, layer_num + 1)
+            # Fallback: try SGLang tensors
+            if num_layers == 0:
+                for key in sglang_layer_tensors.keys():
+                    match = re.match(r"^model\.layers\.(\d+)\.", key)
+                    if match:
+                        layer_num = int(match.group(1))
+                        num_layers = max(num_layers, layer_num + 1)
+            # Default fallback
+            if num_layers == 0:
+                num_layers = 32
+                print(f"  Warning: Could not infer num_layers, using default {num_layers}")
+            else:
+                print(f"  Detected {num_layers} layers")
+            
+            # Extract layer values for each layer
+            for layer_idx in range(num_layers):
+                print(f"\n  Layer {layer_idx}:")
+                
+                # Extract SGLang layer values
+                sglang_layer_keys = [
+                    f"model.layers.{layer_idx}.input_layernorm",
+                    f"model.layers.{layer_idx}.self_attn.qkv_proj",
+                    f"model.layers.{layer_idx}.self_attn.q_norm",
+                    f"model.layers.{layer_idx}.self_attn.k_norm",
+                    f"model.layers.{layer_idx}.self_attn.attn",
+                    f"model.layers.{layer_idx}.self_attn.o_proj",
+                    f"model.layers.{layer_idx}.post_attention_layernorm",
+                    f"model.layers.{layer_idx}.mlp.gate_up_proj",
+                    f"model.layers.{layer_idx}.mlp.down_proj",
+                ]
+                
+                # Extract Megatron layer values at this position
+                megatron_layer_keys = [
+                    f"layer_{layer_idx}_qkv_layernorm_output",
+                    f"layer_{layer_idx}_qkv_proj_output",
+                    f"layer_{layer_idx}_q_layernorm_output",
+                    f"layer_{layer_idx}_k_layernorm_output",
+                    f"layer_{layer_idx}_core_attention_output",
+                    f"layer_{layer_idx}_o_proj_output",
+                    f"layer_{layer_idx}_pre_mlp_layernorm_output",
+                    f"layer_{layer_idx}_mlp.gate_up_proj_output",
+                    f"layer_{layer_idx}_mlp_output",
+                ]
+                
+                component_names = [
+                    "input_layernorm",
+                    "qkv_proj",
+                    "q_norm",
+                    "k_norm",
+                    "core_attention",
+                    "o_proj",
+                    "post_attention_layernorm",
+                    "gate_up_proj",
+                    "down_proj",
+                ]
+                
+                for sg_key, meg_key, comp_name in zip(sglang_layer_keys, megatron_layer_keys, component_names):
+                    # Extract SGLang value
+                    sg_val = None
+                    if sg_key in sglang_layer_tensors:
+                        sg_tensor = sglang_layer_tensors[sg_key]
+                        if isinstance(sg_tensor, (list, tuple)):
+                            sg_tensor = sg_tensor[-1]
+                        if isinstance(sg_tensor, torch.Tensor):
+                            # Extract single token (decode pass)
+                            if sg_tensor.dim() == 2:
+                                sg_val = sg_tensor[0].flatten()  # [1, hidden] -> [hidden]
+                            elif sg_tensor.dim() == 3:
+                                sg_val = sg_tensor[0, 0].flatten()  # [1, 1, hidden] -> [hidden]
+                            elif sg_tensor.dim() == 1:
+                                sg_val = sg_tensor.flatten()
+                    
+                    # Extract Megatron value at position
+                    meg_val = None
+                    if meg_key in megatron_tensors:
+                        meg_tensor = megatron_tensors[meg_key]
+                        if isinstance(meg_tensor, torch.Tensor):
+                            # Extract at specific position
+                            if meg_tensor.dim() == 2:
+                                # [seq_len, hidden]
+                                if megatron_layer_pos < meg_tensor.shape[0]:
+                                    meg_val = meg_tensor[megatron_layer_pos].flatten()
+                            elif meg_tensor.dim() == 3:
+                                # [batch, seq_len, hidden] or [seq_len, batch, hidden]
+                                d0, d1, d2 = meg_tensor.shape
+                                if d0 == 1:
+                                    # [1, seq_len, hidden]
+                                    if megatron_layer_pos < d1:
+                                        meg_val = meg_tensor[0, megatron_layer_pos].flatten()
+                                else:
+                                    # [seq_len, 1, hidden]
+                                    if megatron_layer_pos < d0:
+                                        meg_val = meg_tensor[megatron_layer_pos, 0].flatten()
+                    
+                    # Compare if both values exist
+                    if sg_val is not None and meg_val is not None:
+                        if sg_val.shape == meg_val.shape:
+                            stats = compute_diff_stats(sg_val, meg_val)
+                            print(f"    {comp_name}: max_diff={stats['max_diff']:.8e}, "
+                                  f"mean_diff={stats['mean_diff']:.8e}")
+                            if stats['max_diff'] < 1e-5:
+                                print(f"      ✓ MATCH")
+                            else:
+                                print(f"      ✗ DIFFER")
+                        else:
+                            print(f"    {comp_name}: Shape mismatch - "
+                                  f"SGLang {sg_val.shape} vs Megatron {meg_val.shape}")
+                    elif sg_val is None:
+                        print(f"    {comp_name}: SGLang value not found")
+                    elif meg_val is None:
+                        print(f"    {comp_name}: Megatron value not found")
+            
+            print("\n" + "=" * 70)
+
     # =========================================================================
     # SUMMARY
     # =========================================================================
@@ -3562,6 +3712,7 @@ def compare_first_response_token(
             sglang_dir=sglang_dir,
             verbose=verbose,
         )
+        break
         # Continue to next pass (removed break to process all passes)
 
     # Overall summary
