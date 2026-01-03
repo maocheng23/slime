@@ -4136,59 +4136,6 @@ def compare_single_pass_pair(
                                 else:
                                     print(f"        ✗ Sorted values differ. Data is actually different, not just reordered.")
                                 
-                                # Q part: [0:2048]
-                                sg_q = sg_val[0:128].float()
-                                meg_q = meg_val[0:128].float()
-                                q_diff = (sg_q - meg_q).abs()
-                                print(f"      Q part [0:128]:")
-                                print(f"        max_diff={q_diff.max().item():.8e}, mean_diff={q_diff.mean().item():.8e}")
-                                
-                                sg_q = sg_val[0:1024].float()
-                                meg_q = meg_val[0:1024].float()
-                                q_diff = (sg_q - meg_q).abs()
-                                print(f"      Q part [0:1024]:")
-                                print(f"        max_diff={q_diff.max().item():.8e}, mean_diff={q_diff.mean().item():.8e}")
-                                
-                                sg_q = sg_val[0:2048].float()
-                                meg_q = meg_val[0:2048].float()
-                                q_diff = (sg_q - meg_q).abs()
-                                q_stats = {
-                                    'max_diff': q_diff.max().item(),
-                                    'mean_diff': q_diff.mean().item(),
-                                }
-                                print(f"      Q part [0:2048]:")
-                                print(f"        max_diff={q_stats['max_diff']:.8e}, mean_diff={q_stats['mean_diff']:.8e}")
-                                print(f"        SGLang last 100:   {[f'{v:.6f}' for v in sg_q[-100:].tolist()]}")
-                                print(f"        Megatron last 100: {[f'{v:.6f}' for v in meg_q[-100:].tolist()]}")
-                                print(f"        Diff last 100:     {[f'{d:.8e}' for d in q_diff[-100:].tolist()]}")
-                                
-                                # K part: [2048:3072]
-                                sg_k = sg_val[2048:3072].float()
-                                meg_k = meg_val[2048:3072].float()
-                                k_diff = (sg_k - meg_k).abs()
-                                k_stats = {
-                                    'max_diff': k_diff.max().item(),
-                                    'mean_diff': k_diff.mean().item(),
-                                }
-                                print(f"      K part [2048:3072]:")
-                                print(f"        max_diff={k_stats['max_diff']:.8e}, mean_diff={k_stats['mean_diff']:.8e}")
-                                print(f"        SGLang first 10:   {[f'{v:.6f}' for v in sg_k[:10].tolist()]}")
-                                print(f"        Megatron first 10: {[f'{v:.6f}' for v in meg_k[:10].tolist()]}")
-                                print(f"        Diff first 10:     {[f'{d:.8e}' for d in k_diff[:10].tolist()]}")
-                                
-                                # V part: [3072:4096]
-                                sg_v = sg_val[3072:4096].float()
-                                meg_v = meg_val[3072:4096].float()
-                                v_diff = (sg_v - meg_v).abs()
-                                v_stats = {
-                                    'max_diff': v_diff.max().item(),
-                                    'mean_diff': v_diff.mean().item(),
-                                }
-                                print(f"      V part [3072:4096]:")
-                                print(f"        max_diff={v_stats['max_diff']:.8e}, mean_diff={v_stats['mean_diff']:.8e}")
-                                print(f"        SGLang first 10:   {[f'{v:.6f}' for v in sg_v[:10].tolist()]}")
-                                print(f"        Megatron first 10: {[f'{v:.6f}' for v in meg_v[:10].tolist()]}")
-                                print(f"        Diff first 10:     {[f'{d:.8e}' for d in v_diff[:10].tolist()]}")
                                 print(f"      === End QKV Parts Comparison ===")
                             else:
                                 # Print first 10 values for comparison (non-qkv_proj)
