@@ -3253,6 +3253,7 @@ def compare_single_pass_pair(
 
     # Process each of the first 5 response tokens
     for token_idx, (resp_pos, token_id) in enumerate(response_tokens):
+        token_idx = token_idx + 368
         print("\n" + "-" * 50)
         print(f"RESPONSE TOKEN #{token_idx+1} (position {resp_pos})")
         print(f"Actual token: {token_id}")
