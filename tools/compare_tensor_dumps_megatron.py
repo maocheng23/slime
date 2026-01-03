@@ -3233,7 +3233,8 @@ def compare_single_pass_pair(
     response_tokens = []
     if input_ids_key in megatron_tensors:
         input_ids = megatron_tensors[input_ids_key].flatten()
-        for i in [0, 369, 370]:
+        tokenlist = [0, 255, 369, 370]
+        for i in tokenlist:
             pos = first_response_pos + i
             if pos < len(input_ids):
                 token_id = input_ids[pos].item()
@@ -3252,11 +3253,8 @@ def compare_single_pass_pair(
                 )
 
     # Process each of the first 5 response tokens
-    for token_idx, (resp_pos, token_id) in enumerate(response_tokens):
-        if token_idx == 0:
-            token_idx = 0
-        else:
-            token_idx = token_idx + 368
+    for temp_token_idx, (resp_pos, token_id) in enumerate(response_tokens):
+        token_idx = tokenlist[temp_token_idx]
         print("\n" + "-" * 50)
         print(f"RESPONSE TOKEN #{token_idx+1} (position {resp_pos})")
         print(f"Actual token: {token_id}")
@@ -3487,7 +3485,7 @@ def compare_single_pass_pair(
         # =========================================================
         # Special handling for response positions 369 and 370: extract and compare layer values
         # =========================================================
-        if token_idx in [0, 369, 370]:
+        if token_idx in [0, 255, 369, 370]:
             print("\n" + "=" * 70)
             print(f"SPECIAL HANDLING: RESPONSE POSITION {resp_pos} - LAYER VALUES")
             print("=" * 70)
