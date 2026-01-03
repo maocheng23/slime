@@ -3490,20 +3490,31 @@ def compare_single_pass_pair(
             print("=" * 70)
             
             # Determine Megatron position for layer extraction
-            # IMPORTANT: Use the SAME calculation as megatron_pos used for logits
-            # to ensure we're comparing the same position
-            # Note: token_idx has been modified (token_idx = token_idx + 368)
+            # IMPORTANT: User found that layer_0_pre_mlp_layernorm_output_pos_460 aligns with SGLang 360
+            # This suggests that the _pos_{N} keys use absolute sequence position, not relative to prompt_len
+            # For SGLang decode at first_pos=resp_pos, it predicts token at resp_pos
+            # The layer values in SGLang decode pass are computed at position resp_pos
+            # For Megatron, if pos_460 corresponds to SGLang 360, then:
+            #   - If resp_pos = 360, we should use pos_460 (absolute position)
+            #   - The offset is 460 - 360 = 100, which might be prompt_len
+            # So megatron_layer_pos should be resp_pos (absolute position in sequence)
+            # But we need to verify: if resp_pos is relative to first_response_pos, we need to add it
+            # Actually, resp_pos is already absolute (from input_ids indexing)
+            # So we should use resp_pos directly
+            megatron_layer_pos = resp_pos
+            
+            # Debug: also check what megatron_pos is used for logits
             if token_idx == 0:
-                megatron_layer_pos = comparison_pos
+                megatron_pos_for_logits = comparison_pos
             else:
-                # Subsequent tokens: use previous response position (same as logits)
-                megatron_layer_pos = first_response_pos + token_idx - 1
+                megatron_pos_for_logits = first_response_pos + token_idx - 1
             
             print(f"\nExtracting layer values at response position {resp_pos}")
             print(f"Megatron position for layer extraction: {megatron_layer_pos}")
-            print(f"  (Using same calculation as logits: token_idx={token_idx}, "
-                  f"first_response_pos={first_response_pos})")
-            print(f"  (Note: Megatron layer values at position N are used to predict token at N+1)")
+            print(f"  (SGLang decode at first_pos={resp_pos} predicts token at {resp_pos})")
+            print(f"  (Megatron logits use position {megatron_pos_for_logits} for comparison)")
+            print(f"  (Using resp_pos={resp_pos} for layer extraction - absolute position in sequence)")
+            print(f"  (Will try _pos_{megatron_layer_pos} key first)")
             
             # Debug: print available Megatron keys for first layer
             print(f"\nDebug: Available Megatron keys for layer 0:")
