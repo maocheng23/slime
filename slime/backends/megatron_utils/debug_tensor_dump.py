@@ -181,6 +181,13 @@ class MegatronTensorDumper:
             # Also save at decode position (prompt_len) for reference
             if prefill_pos != decode_pos:
                 save_at_position(tensor, decode_pos, "_at_response_start")
+            
+            # Also save full tensor for extracting values at arbitrary positions
+            # This is needed for comparing positions beyond the first response token
+            # Only save if tensor has sequence dimension (2D or 3D)
+            if tensor.dim() >= 2:
+                # Save full tensor (preserve original dtype)
+                self._current_tensors[f"{name}_full"] = tensor.cpu()
 
     def set_response_start_position(self, pos: int) -> None:
         """Set the response start position (prompt_len).

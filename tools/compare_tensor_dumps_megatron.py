@@ -3563,8 +3563,20 @@ def compare_single_pass_pair(
                 ]
                 
                 # Extract Megatron layer values at this position
-                # For positions beyond first response, use base keys (without _at_response_start)
+                # For positions beyond first response, use _full keys (complete tensor)
                 # and extract from full tensor at specific position
+                megatron_layer_keys_full = [
+                    f"layer_{layer_idx}_qkv_layernorm_output_full",
+                    f"layer_{layer_idx}_qkv_proj_output_full",
+                    f"layer_{layer_idx}_q_layernorm_output_full",
+                    f"layer_{layer_idx}_k_layernorm_output_full",
+                    f"layer_{layer_idx}_core_attention_output_full",
+                    f"layer_{layer_idx}_o_proj_output_full",
+                    f"layer_{layer_idx}_pre_mlp_layernorm_output_full",
+                    f"layer_{layer_idx}_mlp.gate_up_proj_output_full",
+                    f"layer_{layer_idx}_mlp_output_full",
+                ]
+                # Fallback: base keys (without _at_response_start) for older dumps
                 megatron_layer_keys_base = [
                     f"layer_{layer_idx}_qkv_layernorm_output",
                     f"layer_{layer_idx}_qkv_proj_output",
@@ -3601,9 +3613,10 @@ def compare_single_pass_pair(
                     "down_proj",
                 ]
                 
-                for sg_key, meg_key_base, meg_key_at_start, comp_name in zip(
-                    sglang_layer_keys, megatron_layer_keys_base, 
-                    megatron_layer_keys_at_start, component_names
+                for sg_key, meg_key_full, meg_key_base, meg_key_at_start, comp_name in zip(
+                    sglang_layer_keys, megatron_layer_keys_full,
+                    megatron_layer_keys_base, megatron_layer_keys_at_start, 
+                    component_names
                 ):
                     # Extract SGLang value
                     sg_val = None
@@ -3621,12 +3634,40 @@ def compare_single_pass_pair(
                                 sg_val = sg_tensor.flatten()
                     
                     # Extract Megatron value at position
-                    # Try base key first (for positions beyond first response)
+                    # Try _full key first (complete tensor, extract at position)
                     meg_val = None
                     meg_key_used = None
                     
-                    # First try base key (full tensor, extract at position)
-                    if meg_key_base in megatron_tensors:
+                    # First try _full key (complete tensor, extract at position)
+                    if meg_key_full in megatron_tensors:
+                        meg_tensor = megatron_tensors[meg_key_full]
+                        if isinstance(meg_tensor, torch.Tensor):
+                            # Extract at specific position
+                            if meg_tensor.dim() == 2:
+                                # [seq_len, hidden]
+                                if megatron_layer_pos < meg_tensor.shape[0]:
+                                    meg_val = meg_tensor[megatron_layer_pos].flatten()
+                                    meg_key_used = meg_key_full
+                            elif meg_tensor.dim() == 3:
+                                # [batch, seq_len, hidden] or [seq_len, batch, hidden]
+                                d0, d1, d2 = meg_tensor.shape
+                                if d0 == 1:
+                                    # [1, seq_len, hidden]
+                                    if megatron_layer_pos < d1:
+                                        meg_val = meg_tensor[0, megatron_layer_pos].flatten()
+                                        meg_key_used = meg_key_full
+                                else:
+                                    # [seq_len, 1, hidden]
+                                    if megatron_layer_pos < d0:
+                                        meg_val = meg_tensor[megatron_layer_pos, 0].flatten()
+                                        meg_key_used = meg_key_full
+                            elif meg_tensor.dim() == 1:
+                                # Already single position
+                                meg_val = meg_tensor.flatten()
+                                meg_key_used = meg_key_full
+                    
+                    # Fallback: try base key (full tensor, extract at position)
+                    if meg_val is None and meg_key_base in megatron_tensors:
                         meg_tensor = megatron_tensors[meg_key_base]
                         if isinstance(meg_tensor, torch.Tensor):
                             # Extract at specific position
