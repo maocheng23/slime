@@ -3695,13 +3695,16 @@ def compare_single_pass_pair(
                                 meg_key_used = meg_key_base
                     
                     # If base key didn't work, try _at_response_start key
-                    # Note: _at_response_start is only for first response position,
-                    # so for positions 369/370 we skip this
-                    if (meg_val is None and meg_key_at_start in megatron_tensors and
-                            resp_pos == first_response_pos):
+                    # IMPORTANT: _at_response_start is ONLY for first response position (prompt_len)
+                    # For positions 369/370, we should NOT use _at_response_start because
+                    # those tensors are extracted at position prompt_len, not at resp_pos - 1
+                    # Only try _at_response_start if this is the first response position
+                    if (meg_val is None and resp_pos == first_response_pos and
+                            meg_key_at_start in megatron_tensors):
                         meg_tensor = megatron_tensors[meg_key_at_start]
                         if isinstance(meg_tensor, torch.Tensor):
-                            # _at_response_start tensors are already at response position
+                            # _at_response_start tensors are already at first response position
+                            # (position prompt_len, which is first_response_pos)
                             if meg_tensor.dim() == 2:
                                 meg_val = meg_tensor[0].flatten()  # [1, hidden] -> [hidden]
                             elif meg_tensor.dim() == 3:
@@ -3709,6 +3712,10 @@ def compare_single_pass_pair(
                             elif meg_tensor.dim() == 1:
                                 meg_val = meg_tensor.flatten()
                             meg_key_used = meg_key_at_start
+                    elif meg_val is None and resp_pos != first_response_pos:
+                        # For non-first response positions, we should not use _at_response_start
+                        # This is expected - we need _full or base keys with position extraction
+                        pass
                     
                     # Compare if both values exist
                     if sg_val is not None and meg_val is not None:
@@ -3717,6 +3724,18 @@ def compare_single_pass_pair(
                             key_info = f" (key: {meg_key_used})" if meg_key_used else ""
                             print(f"    {comp_name}: max_diff={stats['max_diff']:.8e}, "
                                   f"mean_diff={stats['mean_diff']:.8e}{key_info}")
+                            
+                            # Print first 10 values for comparison
+                            sg_first10 = sg_val[:10].float().tolist()
+                            meg_first10 = meg_val[:10].float().tolist()
+                            print(f"      SGLang first 10:   {[f'{v:.6f}' for v in sg_first10]}")
+                            print(f"      Megatron first 10: {[f'{v:.6f}' for v in meg_first10]}")
+                            
+                            # Print differences for first 10 values
+                            diff_first10 = [(sg_val[i].float() - meg_val[i].float()).abs().item() 
+                                           for i in range(min(10, len(sg_val)))]
+                            print(f"      Diff first 10:    {[f'{d:.8e}' for d in diff_first10]}")
+                            
                             if stats['max_diff'] < 1e-5:
                                 print(f"      ✓ MATCH")
                             else:
@@ -3724,13 +3743,25 @@ def compare_single_pass_pair(
                         else:
                             print(f"    {comp_name}: Shape mismatch - "
                                   f"SGLang {sg_val.shape} vs Megatron {meg_val.shape}")
+                            # Still print first 10 values even if shape mismatch
+                            if sg_val.numel() > 0:
+                                sg_first10 = sg_val[:10].float().tolist()
+                                print(f"      SGLang first 10:   {[f'{v:.6f}' for v in sg_first10]}")
+                            if meg_val.numel() > 0:
+                                meg_first10 = meg_val[:10].float().tolist()
+                                print(f"      Megatron first 10: {[f'{v:.6f}' for v in meg_first10]}")
                     elif sg_val is None:
                         print(f"    {comp_name}: SGLang value not found")
                     elif meg_val is None:
                         # Print which keys were tried
-                        tried_keys = [meg_key_base, meg_key_at_start]
+                        tried_keys = [meg_key_full, meg_key_base]
+                        if resp_pos == first_response_pos:
+                            tried_keys.append(meg_key_at_start)
                         print(f"    {comp_name}: Megatron value not found "
                               f"(tried: {tried_keys})")
+                        if resp_pos != first_response_pos:
+                            print(f"      Note: For position {resp_pos}, need _full or base "
+                                  f"keys (not _at_response_start which is for first response)")
             
             print("\n" + "=" * 70)
 
