@@ -171,7 +171,7 @@ def compute_log_probs(
         # produces slightly different numerical results due to different
         # floating-point operation ordering.
         # from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
-        # logits_bf16 = logits.bfloat16()
+        logits_bf16 = logits.bfloat16()
         # # Use SGLang's Triton kernel directly for guaranteed consistency
         # if logits_bf16.device.type == 'cuda':
         #     log_probs = sglang_log_softmax(logits_bf16, dim=-1)
