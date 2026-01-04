@@ -1266,7 +1266,9 @@ def policy_loss_function(
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
-
+        print(f"old_log_probs: {old_log_probs.mean().item()}, rollout_log_probs: {rollout_log_probs.mean().item()}")
+        reported_loss["train_rollout_mean"] = rollout_log_probs.clone().detach().mean()
+        reported_loss["old_log_probs_mean"] = old_log_probs.clone().detach().mean()
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
