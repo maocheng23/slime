@@ -190,6 +190,17 @@ def get_log_probs_and_entropy(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
     ):
+        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+            import logging
+            debug_logger = logging.getLogger(__name__)
+            debug_logger.info("=" * 80)
+            debug_logger.info("DEBUG: Megatron temperature processing")
+            debug_logger.info("=" * 80)
+            debug_logger.info(f"  logits_chunk position 0 shape: {logits_chunk[0, :].shape}, dtype: {logits_chunk[0, :].dtype}")
+            debug_logger.info(f"  logits_chunk position 0 min: {logits_chunk[0, :].min().item():.8f}")
+            debug_logger.info(f"  logits_chunk position 0 max: {logits_chunk[0, :].max().item():.8f}")
+            debug_logger.info(f"  logits_chunk position 0 sum: {logits_chunk[0, :].sum().item():.8f}")
+            debug_logger.info(f"  logits_chunk position 0 first 10: {logits_chunk[0, :10].tolist()}")
         log_prob, entropy = calculate_log_probs_and_entropy(
             logits_chunk,
             tokens_chunk,
@@ -198,268 +209,14 @@ def get_log_probs_and_entropy(
             chunk_size=args.log_probs_chunk_size,
             true_on_policy_mode=getattr(args, "true_on_policy_mode", False),
         )
+        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+            debug_logger.info(f"  log_prob first position shape: {log_prob[0, :].shape}, dtype: {log_prob[0, :].dtype}")
+            debug_logger.info(f"  log_prob first position min: {log_prob[0, :].min().item():.8f}")
+            debug_logger.info(f"  log_prob first position max: {log_prob[0, :].max().item():.8f}")
+            debug_logger.info(f"  log_prob first position sum: {log_prob[0, :].sum().item():.8f}")
+            debug_logger.info(f"  log_prob first position first 10: {log_prob[0, :10].tolist()}")
         
         # Debug: print detailed info for first sample
-        if debug_logprob and sample_idx == 0:
-            import logging
-            debug_logger = logging.getLogger(__name__)
-            # Get current pass ID if tensor dumping is enabled
-            pass_id = None
-            if os.environ.get("MEGATRON_TENSOR_DUMP_DIR", ""):
-                from slime.backends.megatron_utils.debug_tensor_dump import get_megatron_tensor_dumper
-                dumper = get_megatron_tensor_dumper()
-                if dumper is not None:
-                    pass_id = dumper._forward_pass_id
-            debug_logger.info("-" * 60)
-            debug_logger.info("DEBUG: get_log_probs_and_entropy - Sample 0 details")
-            debug_logger.info(f"  *** PASS ID: {pass_id if pass_id is not None else 'N/A'} ***")
-            debug_logger.info("  NOTE: Compare this Pass ID with the dump file you're analyzing!")
-            debug_logger.info("  If analyzing Pass00000 dump, this should show Pass 0 for exact match.")
-            debug_logger.info("-" * 60)
-            debug_logger.info(f"  logits_chunk shape: {logits_chunk.shape}, dtype: {logits_chunk.dtype}")
-            debug_logger.info(f"  tokens_chunk shape: {tokens_chunk.shape}")
-            _true_on_policy_mode=getattr(args, "true_on_policy_mode", False),
-            debug_logger.info(f"  true_on_policy_mode: {_true_on_policy_mode}")
-            debug_logger.info(f"  log_prob shape: {log_prob.shape}")
-            debug_logger.info(f"  log_prob first 10: {log_prob[:10].squeeze(-1).tolist()}")
-            debug_logger.info(f"  temperature used: {args.rollout_temperature}")
-            debug_logger.info(f"  true_on_policy_mode: {getattr(args, 'true_on_policy_mode', False)}")
-            
-            # Print logits for the first few tokens (at the positions of target tokens)
-            debug_logger.info("\n  Logits & Logprobs for first 5 response tokens:")
-            # Compute full logprobs for comparison
-            # IMPORTANT: Use SGLang's batch-invariant log_softmax for identical results!
-            # SGLang uses a custom Triton kernel that produces different numerical results
-            # than PyTorch's built-in log_softmax due to different FP operation ordering.
-            debug_logger.info(f"  logits_chunk dtype: {logits_chunk.dtype}, device: {logits_chunk.device}")
-            
-            # Detailed debugging: Check torch.log_softmax implementation
-            debug_logger.info("\n  === torch.log_softmax Implementation Details ===")
-            debug_logger.info(f"  torch.log_softmax module: {torch.log_softmax.__module__}")
-            debug_logger.info(f"  torch.log_softmax qualname: {getattr(torch.log_softmax, '__qualname__', 'N/A')}")
-            debug_logger.info(f"  torch.log_softmax file: {getattr(torch.log_softmax, '__code__', None).co_filename if hasattr(torch.log_softmax, '__code__') else 'N/A'}")
-            
-            # Check if batch_invariant_mode is enabled
-            try:
-                from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
-                    is_batch_invariant_mode_enabled,
-                )
-                sglang_mode_enabled = is_batch_invariant_mode_enabled()
-                debug_logger.info(
-                    f"  SGLang batch_invariant_mode enabled: "
-                    f"{sglang_mode_enabled}"
-                )
-            except Exception:
-                debug_logger.info(
-                    "  SGLang batch_invariant_mode check: N/A (import failed)"
-                )
-
-            try:
-                from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-                    is_batch_invariant_mode_enabled,
-                )
-                megatron_mode_enabled = is_batch_invariant_mode_enabled()
-                debug_logger.info(
-                    f"  Megatron batch_invariant_mode enabled: "
-                    f"{megatron_mode_enabled}"
-                )
-            except Exception:
-                debug_logger.info(
-                    "  Megatron batch_invariant_mode check: N/A (import failed)"
-                )
-            
-            # Status-based check (without numerical comparison)
-            debug_logger.info("\n  === Status-based Check (No Numerical Test) ===")
-            try:
-                from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
-                    is_batch_invariant_mode_enabled,
-                )
-                mode_enabled = is_batch_invariant_mode_enabled()
-                
-                debug_logger.info(
-                    f"  SGLang batch_invariant_mode enabled: {mode_enabled}"
-                )
-                
-                # Status-based inference
-                if mode_enabled:
-                    debug_logger.info(
-                        "  ✓ Status indicates: torch.log_softmax SHOULD be replaced"
-                    )
-                    debug_logger.info(
-                        "    (batch_invariant_mode is enabled)"
-                    )
-                    debug_logger.info(
-                        "    NOTE: This is a status check. For definitive"
-                    )
-                    debug_logger.info(
-                        "    confirmation, see numerical comparison below."
-                    )
-                else:
-                    debug_logger.info(
-                        "  ✗ Status indicates: torch.log_softmax is NOT replaced"
-                    )
-                    debug_logger.info(
-                        "    (batch_invariant_mode is disabled)"
-                    )
-            except Exception as e:
-                debug_logger.info(f"  Status check failed: {e}")
-            
-            # Test: Compare torch.log_softmax vs direct SGLang call
-            test_input = logits_chunk[0:1, :].clone()  # First row only
-            debug_logger.info(f"\n  === Testing torch.log_softmax vs SGLang direct call ===")
-            debug_logger.info(f"  Test input shape: {test_input.shape}, dtype: {test_input.dtype}")
-            debug_logger.info(f"  Test input first 10: {test_input[0, :10].tolist()}")
-            
-            # Call torch.log_softmax (may be overridden)
-            torch_result = torch.log_softmax(test_input, dim=-1)
-            debug_logger.info(f"  torch.log_softmax result first 10: {torch_result[0, :10].tolist()}")
-            debug_logger.info(f"  torch.log_softmax result sum: {torch_result.sum().item():.8f}")
-            debug_logger.info(f"  torch.log_softmax result dtype: {torch_result.dtype}")
-            
-            try:
-                from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
-                debug_logger.info(f"  sglang_log_softmax module: {sglang_log_softmax.__module__}")
-                debug_logger.info(f"  sglang_log_softmax file: {getattr(sglang_log_softmax, '__code__', None).co_filename if hasattr(sglang_log_softmax, '__code__') else 'N/A'}")
-                
-                if logits_chunk.device.type == 'cuda':
-                    sglang_result = sglang_log_softmax(test_input, dim=-1)
-                    debug_logger.info(f"  sglang_log_softmax (direct) result first 10: {sglang_result[0, :10].tolist()}")
-                    debug_logger.info(f"  sglang_log_softmax (direct) result sum: {sglang_result.sum().item():.8f}")
-                    debug_logger.info(f"  sglang_log_softmax (direct) result dtype: {sglang_result.dtype}")
-                    
-                    # Compare
-                    diff = (torch_result - sglang_result).abs()
-                    debug_logger.info(f"  Diff (torch.log_softmax vs sglang_log_softmax):")
-                    debug_logger.info(f"    max: {diff.max().item():.8e}, mean: {diff.mean().item():.8e}")
-                    debug_logger.info(f"    first 10 diffs: {diff[0, :10].tolist()}")
-                    
-                    # Determine if torch.log_softmax is replaced
-                    is_replaced = diff.max().item() < 1e-6
-                    if is_replaced:
-                        debug_logger.info(
-                            "  ✓✓✓ torch.log_softmax IS REPLACED with SGLang's kernel!"
-                        )
-                        debug_logger.info(
-                            "  ✓ torch.log_softmax and sglang_log_softmax produce "
-                            "IDENTICAL results!"
-                        )
-                    else:
-                        debug_logger.info(
-                            "  ✗✗✗ torch.log_softmax is NOT replaced (using PyTorch's "
-                            "native kernel)!"
-                        )
-                        debug_logger.info(
-                            "  ✗ torch.log_softmax and sglang_log_softmax produce "
-                            "DIFFERENT results!"
-                        )
-                        debug_logger.info(
-                            "  ⚠️  This means torch.log_softmax is using PyTorch's "
-                            "native CUDA kernel, not SGLang's Triton kernel!"
-                        )
-                    
-                    logprobs_full = sglang_log_softmax(logits_chunk, dim=-1)
-                    debug_logger.info("  Using SGLang's batch-invariant log_softmax (direct call, Triton kernel)")
-                else:
-                    logprobs_full = torch.log_softmax(logits_chunk, dim=-1)
-                    debug_logger.info("  Using PyTorch's log_softmax (logits not on CUDA)")
-            except (ImportError, ValueError) as e:
-                logprobs_full = torch.log_softmax(logits_chunk, dim=-1)
-                debug_logger.info(f"  Using PyTorch's log_softmax (SGLang error: {e})")
-            
-            debug_logger.info(f"  logprobs_full dtype: {logprobs_full.dtype}")
-            
-            # Final summary
-            debug_logger.info("\n  === SUMMARY: torch.log_softmax Replacement Status ===")
-            try:
-                from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
-                    is_batch_invariant_mode_enabled,
-                    log_softmax as sglang_log_softmax,
-                )
-                if logits_chunk.device.type == 'cuda':
-                    mode_enabled = is_batch_invariant_mode_enabled()
-                    test_input = logits_chunk[0:1, :].clone()
-                    torch_result = torch.log_softmax(test_input, dim=-1)
-                    sglang_result = sglang_log_softmax(test_input, dim=-1)
-                    diff = (torch_result - sglang_result).abs()
-                    is_actually_replaced = diff.max().item() < 1e-6
-                    
-                    debug_logger.info(
-                        f"  batch_invariant_mode enabled: {mode_enabled}"
-                    )
-                    debug_logger.info(
-                        f"  torch.log_softmax actually replaced: {is_actually_replaced}"
-                    )
-                    
-                    if mode_enabled and is_actually_replaced:
-                        debug_logger.info(
-                            "  ✅ STATUS: CORRECT - Mode enabled AND kernel replaced!"
-                        )
-                    elif mode_enabled and not is_actually_replaced:
-                        debug_logger.info(
-                            "  ⚠️  STATUS: WARNING - Mode enabled but kernel NOT replaced!"
-                        )
-                        debug_logger.info(
-                            "     This suggests dispatch override may have failed."
-                        )
-                    elif not mode_enabled and not is_actually_replaced:
-                        debug_logger.info(
-                            "  ℹ️  STATUS: EXPECTED - Mode disabled, using PyTorch kernel."
-                        )
-                    else:
-                        debug_logger.info(
-                            "  ❓ STATUS: UNEXPECTED - Mode disabled but kernel replaced?"
-                        )
-            except Exception as e:
-                debug_logger.info(f"  Summary check failed: {e}")
-            
-            debug_logger.info("  === End torch.log_softmax Implementation Details ===\n")
-            
-            for i in range(min(5, len(tokens_chunk))):
-                token_id = tokens_chunk[i].item()
-                # logits_chunk[i] has shape [vocab_size], get the logit for the target token
-                logit_for_token = logits_chunk[i, token_id].item()
-                logprob_for_token = logprobs_full[i, token_id].item()
-                
-                # Compare with actual log_prob from calculate_log_probs_and_entropy
-                actual_logprob = log_prob[i].item() if i < len(log_prob) else None
-                
-                # Also get top-5 logits and logprobs
-                top_logit_vals, top_logit_ids = torch.topk(logits_chunk[i], 5)
-                top_logprob_vals, top_logprob_ids = torch.topk(logprobs_full[i], 5)
-                debug_logger.info(f"      Token {i}: id={token_id}")
-                debug_logger.info(f"      Logit for token (after temp): {logit_for_token:.6f}")
-                debug_logger.info(f"      Logprob (manual log_softmax): {logprob_for_token:.8f}")
-                debug_logger.info(f"      Logprob (actual from compute_log_probs): {actual_logprob:.8f}" if actual_logprob is not None else "      Logprob (actual): N/A")
-                if actual_logprob is not None:
-                    diff = abs(logprob_for_token - actual_logprob)
-                    debug_logger.info(f"      Diff (manual vs actual): {diff:.8e}")
-                debug_logger.info(f"  logits_div_temperature max: {logits_chunk[i].max().item()}, min: {logits_chunk[i].min().item()}, mean: {logits_chunk[i].mean().item()}, std: {logits_chunk[i].std().item()}, sum: {logits_chunk[i].sum().item()}")
-                debug_logger.info(f"  logprobs_via_logsoftmax_kernel max: {logprobs_full[i].max().item()}, min: {logprobs_full[i].min().item()}, mean: {logprobs_full[i].mean().item()}, std: {logprobs_full[i].std().item()}, sum: {logprobs_full[i].sum().item()}")
-                    
-                debug_logger.info(f"      first 10 logits (after temp): {logits_chunk[i][:10].tolist()}")
-                debug_logger.info(f"      sum of logits (after temp): {logits_chunk[i].sum().item():.6f}")
-                debug_logger.info(f"      first 10 logprobs: {logprobs_full[i][:10].tolist()}")
-                debug_logger.info(f"      Top-5 logprobs: {list(zip(top_logprob_ids.tolist(), [f'{v:.6f}' for v in top_logprob_vals.tolist()]))}")
-                debug_logger.info(f"        sum of logprobs: {logprobs_full[i].sum().item():.8f}")
-                debug_logger.info(f"        logprobs_type: {logprobs_full[i].dtype}")
-                # Also print RAW logits (before temperature processing)
-                if raw_logits_for_debug is not None:
-                    # Calculate the position in the original logits tensor
-                    # For sample 0, response starts at position (total_lengths[0] - response_lengths[0])
-                    prompt_len = total_lengths[0] - response_lengths[0]
-                    raw_pos = prompt_len - 1 + i  # position that predicts token i
-                    if raw_pos < raw_logits_for_debug.shape[0]:
-                        raw_logit_for_token = raw_logits_for_debug[raw_pos, token_id].item()
-                        raw_first_10 = raw_logits_for_debug[raw_pos, :10].tolist()
-                        debug_logger.info(f"      RAW logits max: {raw_logits_for_debug[raw_pos, :].max().item():.6f}, min: {raw_logits_for_debug[raw_pos, :].min().item():.6f}, sum: {raw_logits_for_debug[raw_pos, :].sum().item():.6f}")
-                        debug_logger.info(f"      RAW logit for token (before temp): {raw_logit_for_token:.6f}")
-                        debug_logger.info(f"      RAW first 10 logits (before temp): {raw_first_10}")
-            
-            # Print raw logits statistics
-            debug_logger.info("\n  Logits stats (first position):")
-            debug_logger.info(f"    logits_chunk[0] min: {logits_chunk[0].min().item():.6f}")
-            debug_logger.info(f"    logits_chunk[0] max: {logits_chunk[0].max().item():.6f}")
-            debug_logger.info(f"    logits_chunk[0] mean: {logits_chunk[0].float().mean().item():.6f}")
         sample_idx += 1
 
         log_probs_list.append(log_prob.squeeze(-1))
