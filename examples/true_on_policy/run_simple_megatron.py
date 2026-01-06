@@ -6,8 +6,6 @@ import slime.utils.external_utils.command_utils as U
 MODEL_NAME = os.environ.get("SLIME_SCRIPT_MODEL_NAME", "Qwen3-0.6B")
 assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
 
-MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-0.6B")
-assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
 
 MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
@@ -41,7 +39,7 @@ def execute():
         f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 32} "
         f"--n-samples-per-prompt {1 if MODE == 'debug_one_sample' else 8} "
         f"--rollout-max-response-len {2 if MODE == 'debug_one_sample' else 1024} "
-        "--rollout-temperature 0.8 "
+        "--rollout-temperature 1 "
         # temp remove this to make test easier
         # "--over-sampling-batch-size 64 "
         # "--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
@@ -163,22 +161,6 @@ def execute():
         # "NCCL_ALGO": "allreduce:tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-        # Disable chunked logprobs processing to ensure bitwise identical results
-        # NOTE: In decode phase, each request processes one token, so pruned_states.shape[0] = batch_size
-        # This is usually < 2048, so chunked processing wouldn't trigger anyway.
-        # However, in prefill phase (especially with chunked prefill), multiple tokens may be processed,
-        # which could trigger chunked logprobs processing and cause numerical differences.
-        # By disabling it, we ensure consistent processing path across all phases.
-        #
-        # How it works:
-        # - In logits_processor.py, should_skip_chunking = not enable_logprobs_chunk OR ...
-        # - Setting enable_logprobs_chunk=False ensures should_skip_chunking=True
-        # - This forces all tokens to use non-chunked path (single _get_logits call)
-        # - Result: Consistent computation order → bitwise identical results
-        "SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK": "False",
-        # Set a very large chunk size as a safety measure (even if enabled, won't trigger)
-        # Default is 2048, so 999999 ensures chunking never triggers
-        "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "999999",
     }
 
     train_args = (
