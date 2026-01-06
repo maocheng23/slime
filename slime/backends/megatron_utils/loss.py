@@ -209,12 +209,6 @@ def get_log_probs_and_entropy(
             chunk_size=args.log_probs_chunk_size,
             true_on_policy_mode=getattr(args, "true_on_policy_mode", False),
         )
-        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
-            debug_logger.info(f"  log_prob first position shape: {log_prob[0, :].shape}, dtype: {log_prob[0, :].dtype}")
-            debug_logger.info(f"  log_prob first position min: {log_prob[0, :].min().item():.8f}")
-            debug_logger.info(f"  log_prob first position max: {log_prob[0, :].max().item():.8f}")
-            debug_logger.info(f"  log_prob first position sum: {log_prob[0, :].sum().item():.8f}")
-            debug_logger.info(f"  log_prob first position first 10: {log_prob[0, :10].tolist()}")
         
         # Debug: print detailed info for first sample
         sample_idx += 1
