@@ -6,6 +6,8 @@ import slime.utils.external_utils.command_utils as U
 MODEL_NAME = os.environ.get("SLIME_SCRIPT_MODEL_NAME", "Qwen3-0.6B")
 assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
 
+MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-0.6B")
+assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
 
 MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
