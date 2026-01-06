@@ -848,6 +848,8 @@ class FSDPTrainRayActor(TrainRayActor):
 
         if train_rollout_logprob_abs_diff is not None:
             reported["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff
+            reported["train_rollout_mean"] = rollout_log_probs.clone().detach().mean()
+            reported["old_log_probs_mean"] = old_log_probs.clone().detach().mean()
 
         if self.args.use_kl_loss:
             reported["kl_loss"] = kl_loss.detach()
