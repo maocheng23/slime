@@ -160,29 +160,8 @@ def compute_log_probs(
     to match SGLang's numerical path for bitwise identical results.
     """
     if true_on_policy_mode:
-        # SGLang-compatible path: use SGLang's batch-invariant log_softmax DIRECTLY
-        # IMPORTANT: SGLang uses a custom Triton kernel for log_softmax.
-        # To get bitwise identical results, we MUST use the SAME kernel implementation!
-        #
-        # SGLang's path (sampler.py + batch_invariant_ops.py):
-        #   logits.bfloat16() -> log_softmax (Triton kernel) -> bfloat16 result
-        #
-        # If we use torch.log_softmax, we get PyTorch's CUDA kernel which
-        # produces slightly different numerical results due to different
-        # floating-point operation ordering.
-        # from sglang.srt.batch_invariant_ops.batch_invariant_ops import log_softmax as sglang_log_softmax
-        logits_bf16 = logits.bfloat16()
-        # # Use SGLang's Triton kernel directly for guaranteed consistency
-        # if logits_bf16.device.type == 'cuda':
-        #     log_probs = sglang_log_softmax(logits_bf16, dim=-1)
-        # else:
-            # Fallback to PyTorch for non-CUDA tensors (should not happen in practice)
-        log_probs = torch.log_softmax(logits_bf16, dim=-1)
-        # Gather log_probs for the target tokens
+        log_probs = torch.log_softmax(logits, dim=-1)
         gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
-        # Convert to float32 to match SGLang's serialization format
-        # SGLang's sampler computes in bfloat16, but serializes to float32 via protobuf
-        # This ensures bitwise identical comparison between rollout and train logprobs
         return gathered.float()
     else:
         # Original path: use fused_vocab_parallel_cross_entropy for TP support
