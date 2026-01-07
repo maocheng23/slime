@@ -27,7 +27,7 @@ def prepare():
 def execute():
     ckpt_args = (
         f"--hf-checkpoint /root/models/{MODEL_NAME} "
-        f"--load /root/models/{MODEL_NAME}_torch_dist "
+        f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
     )
 
 
