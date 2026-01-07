@@ -55,10 +55,9 @@ def execute():
 
     grpo_args = (
         "--advantage-estimator grpo "
-        # "--use-kl-loss "
+        "--use-kl-loss "
         "--kl-loss-coef 0.00 "
         "--kl-loss-type low_var_kl "
-        "--kl-coef 0.00 "
         "--entropy-coef 0.00 "
         "--eps-clip 0.2 "
         "--eps-clip-high 0.28 "
@@ -89,7 +88,13 @@ def execute():
     )
 
     misc_args = "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " "--colocate " "--train-backend megatron " "--megatron-to-hf-mode bridge "
-
+    
+    misc_args = +(
+        # default dropout in megatron is 0.1
+        "--attention-dropout 0.0 "
+        "--hidden-dropout 0.0 "
+    )
+    
     if MODEL_NAME == "Qwen3-4B":
         misc_args += (
             "--use-dynamic-batch-size "
