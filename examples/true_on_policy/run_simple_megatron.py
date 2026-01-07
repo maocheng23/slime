@@ -130,9 +130,15 @@ def execute():
 
     misc_args = "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " "--colocate " "--train-backend megatron "
 
+    misc_args += (
+        "--recompute-granularity full "
+        "--recompute-method uniform "
+        "--recompute-num-layers 1 "
+    )
+    
     if MODEL_NAME == "Qwen3-4B":
         misc_args += (
-            "--use-dynamic-batch-size "
+            #"--use-dynamic-batch-size "
             # TODO pick a good value
             "--max-tokens-per-gpu 2048 "
         )
