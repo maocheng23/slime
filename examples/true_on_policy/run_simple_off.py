@@ -105,7 +105,6 @@ def execute():
         f"{sglang_args} "
         f"{U.get_default_wandb_args(__file__)} "
         f"{eval_args} "
-        f"{megatron_args} "
         f"{ci_args} "
         f"{misc_args} "
     )
