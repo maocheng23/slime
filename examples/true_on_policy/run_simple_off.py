@@ -52,6 +52,17 @@ def execute():
             "--eval-max-response-len 1024 "
             "--eval-top-k 1 "
         )
+    perf_args = (
+        "--tensor-model-parallel-size 1 "
+        "--sequence-parallel "
+        "--pipeline-model-parallel-size 1 "
+        "--context-parallel-size 1 "
+        "--expert-model-parallel-size 1 "
+        "--expert-tensor-parallel-size 1 "
+        # "--micro-batch-size 1 "
+        "--use-dynamic-batch-size "
+        "--max-tokens-per-gpu 9216 "
+    )
 
     grpo_args = (
         "--advantage-estimator grpo "
@@ -107,6 +118,7 @@ def execute():
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
+        f"{perf_args} "
         f"{sglang_args} "
         f"{U.get_default_wandb_args(__file__)} "
         f"{eval_args} "
