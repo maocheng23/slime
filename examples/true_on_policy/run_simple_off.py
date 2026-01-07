@@ -89,7 +89,7 @@ def execute():
 
     misc_args = "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " "--colocate " "--train-backend megatron " "--megatron-to-hf-mode bridge "
     
-    misc_args = +(
+    misc_args += (
         # default dropout in megatron is 0.1
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
