@@ -1,5 +1,5 @@
 import os
-import miles.utils.external_utils.command_utils as U
+import slime.utils.external_utils.command_utils as U
 
 
 FEW_GPU = U.get_bool_env_var("MILES_TEST_FEW_GPU", "1")
@@ -11,18 +11,29 @@ os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
 MODEL_NAME = "Qwen3-0.6B"
 MODEL_TYPE = "qwen3-0.6B"
 NUM_GPUS = 2
+USE_RAW = 1
 
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
     U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/gsm8k")
+    if USE_RAW:
+        U.convert_checkpoint(
+            model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=NUM_GPUS, dir_dst="/root/models"
+        )
 
 
 def execute():
-    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
+    if USE_RAW:
+        ckpt_args = (
+            f"--hf-checkpoint /root/models/{MODEL_NAME} "
+            f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
+        )
+    else:   
+        ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
 
-    WANDB_API_KEY = "a37f4796e6205800c4212556a38e1319b5f144b7"
+    WANDB_API_KEY = "2b9b314aca4fb1f7197f0cc0c9c9c595afbf5122"
 
     wandb_args = (
         "--use-wandb "
@@ -46,7 +57,7 @@ def execute():
         "--rollout-max-response-len 1024 "
         "--rollout-temperature 1 "
         "--over-sampling-batch-size 64 "
-        "--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
+        "--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
         "--global-batch-size 256 "
     )
 
@@ -102,7 +113,12 @@ def execute():
         "--ci-metric-checker-threshold 0.55 "  # loose threshold at 250 step
     )
 
-    misc_args = (
+    if USE_RAW:
+        misc_args = "--megatron-to-hf-mode raw "
+    else:
+        misc_args = "--megatron-to-hf-mode bridge "
+    
+    misc_args += (
         # default dropout in megatron is 0.1
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
@@ -114,7 +130,6 @@ def execute():
         "--actor-num-nodes 1 "
         f"--actor-num-gpus-per-node {2 if FEW_GPU else 4} "
         "--colocate "
-        "--megatron-to-hf-mode bridge "
     )
 
     train_args = (

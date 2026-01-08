@@ -29,12 +29,21 @@ def prepare():
 def execute():
     if USE_RAW:
         ckpt_args = (
-        f"--hf-checkpoint /root/models/{MODEL_NAME} "
-        f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
-    )
-    else:
+            f"--hf-checkpoint /root/models/{MODEL_NAME} "
+            f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
+        )
+    else:   
         ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
-    
+
+    WANDB_API_KEY = "2b9b314aca4fb1f7197f0cc0c9c9c595afbf5122"
+
+    wandb_args = (
+        "--use-wandb "
+        "--wandb-project megatron-on-policy "
+        "--wandb-group qwen3-0.6B-megatron "
+        f"--wandb-key {WANDB_API_KEY} "
+        "--disable-wandb-random-suffix "
+    )
     rollout_args = (
         "--prompt-data /root/datasets/gsm8k/train.parquet "
         "--input-key messages "
@@ -65,10 +74,9 @@ def execute():
 
     grpo_args = (
         "--advantage-estimator grpo "
-        # "--use-kl-loss "
+        "--use-kl-loss "
         "--kl-loss-coef 0.00 "
         "--kl-loss-type low_var_kl "
-        "--kl-coef 0.00 "
         "--entropy-coef 0.00 "
         "--eps-clip 0.2 "
         "--eps-clip-high 0.28 "
@@ -97,23 +105,13 @@ def execute():
             dump_layers.append(last_layer)
         dump_layers_str = f"--sglang-debug-tensor-dump-layers {' '.join(map(str, dump_layers))} "
     
-    # NOTE: For true on-policy mode, CUDA graph should be disabled to ensure
-    # bitwise identical logprobs between SGLang and Megatron.
-    # CUDA graph can cause subtle numerical differences due to:
-    # - Different operation fusion patterns
-    # - Different execution order in async execution
-    # - Memory layout differences
-    disable_cuda_graph_for_true_on_policy = os.environ.get(
-        "SLIME_DISABLE_CUDA_GRAPH_FOR_TRUE_ON_POLICY", "1"
-    ) == "1"
-    
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
         f"--sglang-mem-fraction-static {0.2 if MODEL_NAME == 'Qwen3-4B' else 0.4} "
         # Disable CUDA graph for true on-policy to ensure numerical consistency
-        f"{'--sglang-disable-cuda-graph ' if (MODE == 'debug_one_sample' or disable_cuda_graph_for_true_on_policy) else ''}"
+        f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
         # Enable tensor dump for layer-by-layer comparison
         f"{'--sglang-debug-tensor-dump-output-folder ' + tensor_dump_dir + ' ' if MODE == 'debug_one_sample' else ''}"
         f"{dump_layers_str}"  # Includes last layer (28) automatically
@@ -127,17 +125,18 @@ def execute():
         "--ci-metric-checker-threshold 0.71 "  # loose threshold at 60 step
     )
 
-    misc_args = "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " "--colocate " "--train-backend megatron " 
-    
     if USE_RAW:
-        misc_args += "--megatron-to-hf-mode raw "
+        misc_args = "--megatron-to-hf-mode raw "
     else:
-        misc_args += "--megatron-to-hf-mode bridge "
+        misc_args = "--megatron-to-hf-mode bridge "
 
     misc_args += (
         # default dropout in megatron is 0.1
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
+        "--actor-num-nodes 1 "
+        f"--actor-num-gpus-per-node {NUM_GPUS} "
+        "--colocate "
     )
     
     if MODEL_NAME == "Qwen3-4B":
@@ -180,9 +179,10 @@ def execute():
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
-        f"{sglang_args} "
-        f"{U.get_default_wandb_args(__file__)} "
+        f"{wandb_args} "
+        #f"{perf_args} "
         f"{eval_args} "
+        f"{sglang_args} "
         f"{ci_args} "
         f"{misc_args} "
         f"{true_on_policy_args} "

@@ -13,16 +13,37 @@ MODE = os.environ.get("SLIME_SCRIPT_MODE", "normal")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
 NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "1"))
+USE_RAW = 1
 
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
     U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/gsm8k")
+    if USE_RAW:
+        U.convert_checkpoint(
+            model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=NUM_GPUS, dir_dst="/root/models"
+        )
 
 
 def execute():
-    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
+    if USE_RAW:
+        ckpt_args = (
+            f"--hf-checkpoint /root/models/{MODEL_NAME} "
+            f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
+        )
+    else:   
+        ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
+
+    WANDB_API_KEY = "2b9b314aca4fb1f7197f0cc0c9c9c595afbf5122"
+
+    wandb_args = (
+        "--use-wandb "
+        "--wandb-project megatron-off-policy "
+        "--wandb-group qwen3-0.6B-megatron "
+        f"--wandb-key {WANDB_API_KEY} "
+        "--disable-wandb-random-suffix "
+    )
 
 
     rollout_args = (
@@ -52,17 +73,6 @@ def execute():
             "--eval-max-response-len 1024 "
             "--eval-top-k 1 "
         )
-    perf_args = (
-        "--tensor-model-parallel-size 1 "
-        "--sequence-parallel "
-        "--pipeline-model-parallel-size 1 "
-        "--context-parallel-size 1 "
-        "--expert-model-parallel-size 1 "
-        "--expert-tensor-parallel-size 1 "
-        # "--micro-batch-size 1 "
-        "--use-dynamic-batch-size "
-        "--max-tokens-per-gpu 9216 "
-    )
 
     grpo_args = (
         "--advantage-estimator grpo "
@@ -98,12 +108,18 @@ def execute():
         "--ci-metric-checker-threshold 0.71 "  # loose threshold at 60 step
     )
 
-    misc_args = "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " "--colocate " "--train-backend megatron " "--megatron-to-hf-mode bridge "
-    
+    if USE_RAW:
+        misc_args = "--megatron-to-hf-mode raw "
+    else:
+        misc_args = "--megatron-to-hf-mode bridge "
+
     misc_args += (
         # default dropout in megatron is 0.1
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
+        "--actor-num-nodes 1 "
+        f"--actor-num-gpus-per-node {NUM_GPUS} "
+        "--colocate "
     )
     
     if MODEL_NAME == "Qwen3-4B":
@@ -118,10 +134,10 @@ def execute():
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
-        f"{perf_args} "
-        f"{sglang_args} "
-        f"{U.get_default_wandb_args(__file__)} "
+        f"{wandb_args} "
+        #f"{perf_args} "
         f"{eval_args} "
+        f"{sglang_args} "
         f"{ci_args} "
         f"{misc_args} "
     )
