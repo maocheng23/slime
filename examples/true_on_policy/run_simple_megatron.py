@@ -14,16 +14,27 @@ assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
 NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "1"))
 
+USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
     U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/gsm8k")
+    if USE_RAW:
+        U.convert_checkpoint(
+            model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=NUM_GPUS, dir_dst="/root/models"
+        )
 
 
 def execute():
-    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
-
+    if USE_RAW:
+        ckpt_args = (
+        f"--hf-checkpoint /root/models/{MODEL_NAME} "
+        f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
+    )
+    else:
+        ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
+    
     rollout_args = (
         "--prompt-data /root/datasets/gsm8k/train.parquet "
         "--input-key messages "
@@ -116,7 +127,12 @@ def execute():
         "--ci-metric-checker-threshold 0.71 "  # loose threshold at 60 step
     )
 
-    misc_args = "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " "--colocate " "--train-backend megatron " "--megatron-to-hf-mode bridge "
+    misc_args = "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " "--colocate " "--train-backend megatron " 
+    
+    if USE_RAW:
+        misc_args += "--megatron-to-hf-mode raw "
+    else:
+        misc_args += "--megatron-to-hf-mode bridge "
 
     misc_args += (
         # default dropout in megatron is 0.1
