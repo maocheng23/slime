@@ -24,23 +24,42 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
     SGLang computes: logits = matmul(hidden_states.bfloat16(), lm_head.weight.T.bfloat16())
     This layer replicates that behavior for true on-policy mode.
 
-    This wrapper is transparent to checkpointing - it delegates all state dict
-    operations to the original layer so checkpoints work correctly.
+    This wrapper is transparent to checkpointing and parameter naming:
+    - Parameters are directly registered in _parameters (not via submodule)
+    - This ensures names remain compatible (e.g., "output_layer.weight" not "output_layer.original_layer.weight")
+    - Gradients flow correctly and weights get updated during training
     """
 
     def __init__(self, original_output_layer):
         super().__init__()
-        # Store as _original_layer to avoid it being registered as a submodule
-        # We'll handle state dict manually
+        # Store original layer WITHOUT registering as submodule (avoid nested naming)
+        # Use object.__setattr__ to bypass PyTorch's submodule registration
         object.__setattr__(self, '_original_layer', original_output_layer)
+        
+        # CRITICAL FIX: Register the original layer's parameters directly in our _parameters dict
+        # This ensures:
+        # 1. Parameters are visible to model.parameters() and the optimizer
+        # 2. Parameter names remain compatible (e.g., "weight" not "original_layer.weight")
+        # 3. Gradients flow correctly because we're storing references, not copies
+        for name, param in original_output_layer._parameters.items():
+            if param is not None:
+                self._parameters[name] = param
+        
+        # Also copy over parameter attributes needed for TP (tensor parallel)
+        for name, param in self._parameters.items():
+            orig_param = original_output_layer._parameters.get(name)
+            if orig_param is not None:
+                for attr in ['tensor_model_parallel', 'partition_dim', 'partition_stride', 'parallel_mode', 'sequence_parallel']:
+                    if hasattr(orig_param, attr):
+                        setattr(param, attr, getattr(orig_param, attr))
 
     @property
     def weight(self):
-        return self._original_layer.weight
+        return self._parameters.get('weight')
 
     @property
     def bias(self):
-        return getattr(self._original_layer, 'bias', None)
+        return self._parameters.get('bias')
 
     @property
     def sequence_parallel(self):
@@ -61,8 +80,8 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
         else:
             # When weight is None, ColumnParallelLinear uses self.weight
             # We need to cast it to BF16 to match SGLang's behavior
-            if hasattr(self._original_layer, 'weight') and self._original_layer.weight is not None:
-                weight_bf16 = self._original_layer.weight.to(torch.bfloat16)
+            if self.weight is not None:
+                weight_bf16 = self.weight.to(torch.bfloat16)
             else:
                 weight_bf16 = None
         output, bias = self._original_layer(input_bf16, weight=weight_bf16, runtime_gather_output=runtime_gather_output)
@@ -71,29 +90,14 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
         output = output.to(torch.float32)
         return output, bias
 
-    # Delegate all state dict operations to the original layer for checkpoint compatibility
-    def state_dict(self, *args, **kwargs):
-        return self._original_layer.state_dict(*args, **kwargs)
-
-    def load_state_dict(self, state_dict, *args, **kwargs):
-        return self._original_layer.load_state_dict(state_dict, *args, **kwargs)
-
+    # State dict operations - use the parameter names directly from _parameters
+    # No need for special handling since parameters are already registered correctly
+    
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        # Delegate to the original layer for loading (handles TP-specific loading)
         return self._original_layer._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
-
-    def named_parameters(self, *args, **kwargs):
-        return self._original_layer.named_parameters(*args, **kwargs)
-
-    def parameters(self, *args, **kwargs):
-        return self._original_layer.parameters(*args, **kwargs)
-
-    def named_buffers(self, *args, **kwargs):
-        return self._original_layer.named_buffers(*args, **kwargs)
-
-    def buffers(self, *args, **kwargs):
-        return self._original_layer.buffers(*args, **kwargs)
 
     # Delegate sharded_state_dict for distributed checkpointing
     def sharded_state_dict(self, *args, **kwargs):
