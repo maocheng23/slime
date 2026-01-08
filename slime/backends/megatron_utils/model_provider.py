@@ -36,6 +36,11 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
         # Use object.__setattr__ to bypass PyTorch's submodule registration
         object.__setattr__(self, '_original_layer', original_output_layer)
         
+        # DEBUG: Print original layer info
+        print(f"[SGLangCompatibleOutputLayer DEBUG] original_output_layer type: {type(original_output_layer)}")
+        print(f"[SGLangCompatibleOutputLayer DEBUG] original_output_layer._parameters keys: {list(original_output_layer._parameters.keys())}")
+        print(f"[SGLangCompatibleOutputLayer DEBUG] original_output_layer._modules keys: {list(original_output_layer._modules.keys())}")
+        
         # CRITICAL FIX: Register the original layer's parameters directly in our _parameters dict
         # This ensures:
         # 1. Parameters are visible to model.parameters() and the optimizer
@@ -44,6 +49,15 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
         for name, param in original_output_layer._parameters.items():
             if param is not None:
                 self._parameters[name] = param
+                print(f"[SGLangCompatibleOutputLayer DEBUG] Registered parameter: {name}, shape: {param.shape}")
+        
+        # Check if there are nested modules with parameters
+        for module_name, module in original_output_layer._modules.items():
+            for param_name, param in module._parameters.items():
+                if param is not None:
+                    full_name = f"{module_name}.{param_name}"
+                    self._parameters[full_name] = param
+                    print(f"[SGLangCompatibleOutputLayer DEBUG] Registered nested parameter: {full_name}, shape: {param.shape}")
         
         # Also copy over parameter attributes needed for TP (tensor parallel)
         for name, param in self._parameters.items():
@@ -52,6 +66,9 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
                 for attr in ['tensor_model_parallel', 'partition_dim', 'partition_stride', 'parallel_mode', 'sequence_parallel']:
                     if hasattr(orig_param, attr):
                         setattr(param, attr, getattr(orig_param, attr))
+        
+        print(f"[SGLangCompatibleOutputLayer DEBUG] Final self._parameters keys: {list(self._parameters.keys())}")
+        print(f"[SGLangCompatibleOutputLayer DEBUG] Wrapper initialized successfully")
 
     @property
     def weight(self):
