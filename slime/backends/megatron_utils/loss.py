@@ -158,6 +158,7 @@ def get_log_probs_and_entropy(
             mpu.get_tensor_model_parallel_group(),
             with_entropy=with_entropy,
             chunk_size=args.log_probs_chunk_size,
+            true_on_policy_mode=getattr(args, "true_on_policy_mode", False),
         )
 
         log_probs_list.append(log_prob.squeeze(-1))

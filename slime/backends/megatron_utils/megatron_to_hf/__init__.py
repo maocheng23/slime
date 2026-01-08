@@ -1,3 +1,5 @@
+import re
+
 from .deepseekv3 import convert_deepseekv3_to_hf
 from .glm4 import convert_glm4_to_hf
 from .glm4moe import convert_glm4moe_to_hf
@@ -8,6 +10,35 @@ from .processors.quantizer import quantize_params
 from .qwen2 import convert_qwen2_to_hf
 from .qwen3_next import convert_qwen3_next_to_hf
 from .qwen3moe import convert_qwen3moe_to_hf
+
+
+def _normalize_sglang_param_name(name: str) -> str:
+    """
+    Normalize SGLang-style parameter names to TE-compatible format.
+
+    SGLang's SGLangLayerNormColumnParallelLinear wraps linear layers in a .linear submodule
+    and norm in a .norm submodule, creating different parameter paths:
+    - SGLang: linear_fc1.linear.weight -> TE: linear_fc1.weight
+    - SGLang: linear_fc1.norm.weight -> TE: linear_fc1.layer_norm_weight
+    - SGLang: linear_qkv.linear.weight -> TE: linear_qkv.weight
+
+    This function normalizes these names so model-specific converters work with both backends.
+    """
+    # Pattern 1: Convert ".linear.weight" / ".linear.bias" to ".weight" / ".bias"
+    # e.g., linear_fc1.linear.weight -> linear_fc1.weight
+    name = re.sub(r'\.(linear_fc1|linear_fc2|linear_qkv|linear_proj)\.linear\.(weight|bias)',
+                  r'.\1.\2', name)
+
+    # Pattern 2: Convert ".norm.weight" to ".layer_norm_weight" for fused LayerNorm+Linear modules
+    # e.g., linear_fc1.norm.weight -> linear_fc1.layer_norm_weight
+    name = re.sub(r'\.(linear_fc1|linear_qkv)\.norm\.weight',
+                  r'.\1.layer_norm_weight', name)
+
+    # Pattern 3: Convert ".norm.bias" to ".layer_norm_bias" (if LayerNorm has bias)
+    name = re.sub(r'\.(linear_fc1|linear_qkv)\.norm\.bias',
+                  r'.\1.layer_norm_bias', name)
+
+    return name
 
 
 # TODO unify w/ `convert_to_hf`
@@ -21,7 +52,13 @@ def postprocess_hf_param(args, megatron_param_name, hf_param_name, param):
 def convert_to_hf(args, model_name, name, param, quantization_config=None):
     param = remove_padding(name, param, args.vocab_size)
 
-    converted_named_tensors = _convert_to_hf_core(args, model_name, name, param)
+    # Normalize SGLang-style names to TE-compatible format only when using SGLang
+    if hasattr(args, 'use_sglang') and args.use_sglang:
+        normalized_name = _normalize_sglang_param_name(name)
+    else:
+        normalized_name = name
+
+    converted_named_tensors = _convert_to_hf_core(args, model_name, normalized_name, param)
 
     if not quantization_config:
         return converted_named_tensors

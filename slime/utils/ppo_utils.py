@@ -148,13 +148,24 @@ def compute_policy_loss(
     return pg_losses, clipfrac
 
 
-def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group: dist.ProcessGroup | None):
-    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+def compute_log_probs(
+    logits: torch.Tensor,
+    tokens: torch.Tensor,
+    process_group: dist.ProcessGroup | None,
+    true_on_policy_mode: bool = False,
+):
 
-    # convert to [seq_len, batch_size, vocab_size] as expected by fused_vocab_parallel_cross_entropy
-    logits = logits.unsqueeze(1)
-    tokens = tokens.unsqueeze(1)
-    return -fused_vocab_parallel_cross_entropy(logits, tokens, process_group)
+    if true_on_policy_mode:
+        log_probs = torch.log_softmax(logits, dim=-1)
+        gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
+        return gathered.float()
+    else:
+        from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+
+        # convert to [seq_len, batch_size, vocab_size] as expected by fused_vocab_parallel_cross_entropy
+        logits = logits.unsqueeze(1)
+        tokens = tokens.unsqueeze(1)
+        return -fused_vocab_parallel_cross_entropy(logits, tokens, process_group)
 
 
 # from https://github.com/volcengine/verl/blob/0bdf7f469854815177e73dcfe9e420836c952e6e/verl/utils/megatron/tensor_parallel.py#L99
@@ -644,7 +655,9 @@ def chunked_gae(
     return advantages, returns
 
 
-def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1):
+def calculate_log_probs_and_entropy(
+    logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1, true_on_policy_mode: bool = False
+):
     logits = logits.contiguous()
     # TODO: not sure why we need to clone the logits here.
     # Without the clone, the backward will trigger inplace edit error.
@@ -657,7 +670,9 @@ def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool
             logits_chunks = logits.chunk(num_chunks, dim=0)
             log_probs = []
             for tokens_chunk, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
-                log_prob = compute_log_probs(logits_chunk.clone(), tokens_chunk, tp_group)
+                log_prob = compute_log_probs(
+                    logits_chunk.clone(), tokens_chunk, tp_group, true_on_policy_mode=true_on_policy_mode
+                )
                 log_probs.append(log_prob)
             log_prob = torch.cat(log_probs, dim=0)
             if with_entropy:
@@ -667,7 +682,9 @@ def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool
                     entropys.append(entropy)
                 entropy = torch.cat(entropys, dim=0)
         else:
-            log_prob = compute_log_probs(logits.clone(), tokens, tp_group)
+            log_prob = compute_log_probs(
+                logits.clone(), tokens, tp_group, true_on_policy_mode=true_on_policy_mode
+            )
             if with_entropy:
                 entropy = compute_entropy_from_logits(logits.clone(), tp_group)
     else:
