@@ -19,16 +19,10 @@ def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
     U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/gsm8k")
-    U.convert_checkpoint(
-        model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=NUM_GPUS, dir_dst="/root/models"
-    )
 
 
 def execute():
-    ckpt_args = (
-        f"--hf-checkpoint /root/models/{MODEL_NAME} "
-        f"--load /root/models/{MODEL_NAME}_torch_dist "
-    )
+    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
 
     rollout_args = (
         "--prompt-data /root/datasets/gsm8k/train.parquet "
@@ -51,7 +45,7 @@ def execute():
     eval_args = ""
     if MODE == "normal":
         eval_args = (
-            "--eval-interval 20 "
+            "--eval-interval 2 "
             "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
             "--n-samples-per-eval-prompt 1 "
             "--eval-max-response-len 1024 "
@@ -114,12 +108,6 @@ def execute():
         f"{dump_layers_str}"  # Includes last layer (28) automatically
     )
 
-    fsdp_args = (
-        # Set to true for FULL_STATE_DICT mode, false for SHARDED_STATE_DICT mode (default)
-        # "--fsdp-full-params "  # Uncomment this line to enable full params mode
-        # Set the bucket size for weight update
-        "--update-weight-buffer-size 536870912 "  # 512MB
-    )
 
     ci_args = (
         "--ci-test "
@@ -128,12 +116,12 @@ def execute():
         "--ci-metric-checker-threshold 0.71 "  # loose threshold at 60 step
     )
 
-    misc_args = "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " "--colocate " "--train-backend megatron "
+    misc_args = "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " "--colocate " "--train-backend megatron " "--megatron-to-hf-mode bridge "
 
     misc_args += (
-        "--recompute-granularity full "
-        "--recompute-method uniform "
-        "--recompute-num-layers 1 "
+        # default dropout in megatron is 0.1
+        "--attention-dropout 0.0 "
+        "--hidden-dropout 0.0 "
     )
     
     if MODEL_NAME == "Qwen3-4B":
@@ -179,7 +167,6 @@ def execute():
         f"{sglang_args} "
         f"{U.get_default_wandb_args(__file__)} "
         f"{eval_args} "
-        f"{fsdp_args} "
         f"{ci_args} "
         f"{misc_args} "
         f"{true_on_policy_args} "
