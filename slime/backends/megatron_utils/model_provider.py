@@ -36,51 +36,58 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
         # Use object.__setattr__ to bypass PyTorch's submodule registration
         object.__setattr__(self, '_original_layer', original_output_layer)
         
-        # CRITICAL FIX: Megatron's ColumnParallelLinear stores weight as an attribute,
-        # not in _parameters! We need to find and register it manually.
-        #
-        # The weight might be:
-        # 1. In _parameters (standard PyTorch)
-        # 2. As a direct attribute (Megatron's approach)
-        # 3. In a nested module
+        # DEBUG: Let's see EVERYTHING in this layer
+        print(f"[SGLangCompatibleOutputLayer DEBUG] === Inspecting original_output_layer ===")
+        print(f"[SGLangCompatibleOutputLayer DEBUG] type: {type(original_output_layer)}")
+        print(f"[SGLangCompatibleOutputLayer DEBUG] _parameters: {dict(original_output_layer._parameters)}")
+        print(f"[SGLangCompatibleOutputLayer DEBUG] _modules: {dict(original_output_layer._modules)}")
+        print(f"[SGLangCompatibleOutputLayer DEBUG] hasattr 'weight': {hasattr(original_output_layer, 'weight')}")
+        if hasattr(original_output_layer, 'weight'):
+            w = original_output_layer.weight
+            print(f"[SGLangCompatibleOutputLayer DEBUG] weight type: {type(w)}")
+            print(f"[SGLangCompatibleOutputLayer DEBUG] weight is None: {w is None}")
+            if w is not None:
+                print(f"[SGLangCompatibleOutputLayer DEBUG] weight shape: {w.shape}")
+                print(f"[SGLangCompatibleOutputLayer DEBUG] weight isinstance Parameter: {isinstance(w, torch.nn.Parameter)}")
         
-        # First, try standard _parameters
-        for name, param in original_output_layer._parameters.items():
+        # Print all attributes that look like parameters
+        print(f"[SGLangCompatibleOutputLayer DEBUG] All attributes:")
+        for attr_name in dir(original_output_layer):
+            if not attr_name.startswith('_'):
+                try:
+                    attr = getattr(original_output_layer, attr_name)
+                    if isinstance(attr, (torch.Tensor, torch.nn.Parameter)):
+                        print(f"[SGLangCompatibleOutputLayer DEBUG]   {attr_name}: {type(attr).__name__}, shape={attr.shape}")
+                except:
+                    pass
+        
+        # Also check named_parameters
+        print(f"[SGLangCompatibleOutputLayer DEBUG] named_parameters():")
+        for name, param in original_output_layer.named_parameters():
+            print(f"[SGLangCompatibleOutputLayer DEBUG]   {name}: shape={param.shape}, requires_grad={param.requires_grad}")
+        
+        # CRITICAL FIX: Register ALL parameters from named_parameters()
+        # This is the most reliable way to get all parameters
+        for name, param in original_output_layer.named_parameters():
             if param is not None:
-                self._parameters[name] = param
-        
-        # Second, check for weight as direct attribute (Megatron's ColumnParallelLinear)
-        if hasattr(original_output_layer, 'weight') and original_output_layer.weight is not None:
-            weight = original_output_layer.weight
-            if isinstance(weight, torch.nn.Parameter) and 'weight' not in self._parameters:
-                self._parameters['weight'] = weight
-        
-        # Third, check nested modules
-        for module_name, module in original_output_layer._modules.items():
-            for param_name, param in module._parameters.items():
-                if param is not None:
-                    full_name = f"{module_name}.{param_name}"
-                    if full_name not in self._parameters:
-                        self._parameters[full_name] = param
+                # Use the leaf name (last part after '.')
+                leaf_name = name.split('.')[-1] if '.' in name else name
+                if leaf_name not in self._parameters:
+                    self._parameters[leaf_name] = param
+                    print(f"[SGLangCompatibleOutputLayer] Registered: {leaf_name} from {name}")
         
         # Copy over parameter attributes needed for TP (tensor parallel)
         for name, param in self._parameters.items():
-            # Try to find the original param to copy attributes from
-            orig_param = None
-            if name in original_output_layer._parameters:
-                orig_param = original_output_layer._parameters[name]
-            elif hasattr(original_output_layer, name):
-                orig_param = getattr(original_output_layer, name)
-            
-            if orig_param is not None:
-                for attr in ['tensor_model_parallel', 'partition_dim', 'partition_stride', 'parallel_mode', 'sequence_parallel']:
+            for attr in ['tensor_model_parallel', 'partition_dim', 'partition_stride', 'parallel_mode', 'sequence_parallel']:
+                if hasattr(param, attr):
+                    continue  # Already has the attribute
+                # Try to find it on the original layer's parameter
+                if hasattr(original_output_layer, 'weight') and original_output_layer.weight is param:
+                    orig_param = original_output_layer.weight
                     if hasattr(orig_param, attr):
                         setattr(param, attr, getattr(orig_param, attr))
         
-        # DEBUG output
-        print(f"[SGLangCompatibleOutputLayer] Registered parameters: {list(self._parameters.keys())}")
-        for name, param in self._parameters.items():
-            print(f"[SGLangCompatibleOutputLayer]   {name}: shape={param.shape}, requires_grad={param.requires_grad}")
+        print(f"[SGLangCompatibleOutputLayer] Final registered parameters: {list(self._parameters.keys())}")
 
     @property
     def weight(self):
@@ -303,8 +310,9 @@ def get_model_provider_func(
 
         # Wrap output_layer for true on-policy mode to match SGLang's BF16 numerical paths
         if post_process and role == "actor" and getattr(args, "true_on_policy_mode", False):
-            model.output_layer = SGLangCompatibleOutputLayer(model.output_layer)
-            print("[True On-Policy] Wrapped output_layer with SGLang-compatible BF16 layer")
+            # TEMPORARILY DISABLED: Testing if the wrapper is causing the training issue
+            # model.output_layer = SGLangCompatibleOutputLayer(model.output_layer)
+            print("[True On-Policy] WARNING: SGLangCompatibleOutputLayer wrapper is DISABLED for testing")
 
         # Register tensor dump hooks for debugging (only when env var is set)
         import os
