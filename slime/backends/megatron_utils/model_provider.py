@@ -36,39 +36,51 @@ class SGLangCompatibleOutputLayer(torch.nn.Module):
         # Use object.__setattr__ to bypass PyTorch's submodule registration
         object.__setattr__(self, '_original_layer', original_output_layer)
         
-        # DEBUG: Print original layer info
-        print(f"[SGLangCompatibleOutputLayer DEBUG] original_output_layer type: {type(original_output_layer)}")
-        print(f"[SGLangCompatibleOutputLayer DEBUG] original_output_layer._parameters keys: {list(original_output_layer._parameters.keys())}")
-        print(f"[SGLangCompatibleOutputLayer DEBUG] original_output_layer._modules keys: {list(original_output_layer._modules.keys())}")
+        # CRITICAL FIX: Megatron's ColumnParallelLinear stores weight as an attribute,
+        # not in _parameters! We need to find and register it manually.
+        #
+        # The weight might be:
+        # 1. In _parameters (standard PyTorch)
+        # 2. As a direct attribute (Megatron's approach)
+        # 3. In a nested module
         
-        # CRITICAL FIX: Register the original layer's parameters directly in our _parameters dict
-        # This ensures:
-        # 1. Parameters are visible to model.parameters() and the optimizer
-        # 2. Parameter names remain compatible (e.g., "weight" not "original_layer.weight")
-        # 3. Gradients flow correctly because we're storing references, not copies
+        # First, try standard _parameters
         for name, param in original_output_layer._parameters.items():
             if param is not None:
                 self._parameters[name] = param
-                print(f"[SGLangCompatibleOutputLayer DEBUG] Registered parameter: {name}, shape: {param.shape}")
         
-        # Check if there are nested modules with parameters
+        # Second, check for weight as direct attribute (Megatron's ColumnParallelLinear)
+        if hasattr(original_output_layer, 'weight') and original_output_layer.weight is not None:
+            weight = original_output_layer.weight
+            if isinstance(weight, torch.nn.Parameter) and 'weight' not in self._parameters:
+                self._parameters['weight'] = weight
+        
+        # Third, check nested modules
         for module_name, module in original_output_layer._modules.items():
             for param_name, param in module._parameters.items():
                 if param is not None:
                     full_name = f"{module_name}.{param_name}"
-                    self._parameters[full_name] = param
-                    print(f"[SGLangCompatibleOutputLayer DEBUG] Registered nested parameter: {full_name}, shape: {param.shape}")
+                    if full_name not in self._parameters:
+                        self._parameters[full_name] = param
         
-        # Also copy over parameter attributes needed for TP (tensor parallel)
+        # Copy over parameter attributes needed for TP (tensor parallel)
         for name, param in self._parameters.items():
-            orig_param = original_output_layer._parameters.get(name)
+            # Try to find the original param to copy attributes from
+            orig_param = None
+            if name in original_output_layer._parameters:
+                orig_param = original_output_layer._parameters[name]
+            elif hasattr(original_output_layer, name):
+                orig_param = getattr(original_output_layer, name)
+            
             if orig_param is not None:
                 for attr in ['tensor_model_parallel', 'partition_dim', 'partition_stride', 'parallel_mode', 'sequence_parallel']:
                     if hasattr(orig_param, attr):
                         setattr(param, attr, getattr(orig_param, attr))
         
-        print(f"[SGLangCompatibleOutputLayer DEBUG] Final self._parameters keys: {list(self._parameters.keys())}")
-        print(f"[SGLangCompatibleOutputLayer DEBUG] Wrapper initialized successfully")
+        # DEBUG output
+        print(f"[SGLangCompatibleOutputLayer] Registered parameters: {list(self._parameters.keys())}")
+        for name, param in self._parameters.items():
+            print(f"[SGLangCompatibleOutputLayer]   {name}: shape={param.shape}, requires_grad={param.requires_grad}")
 
     @property
     def weight(self):
