@@ -3,22 +3,23 @@ import os
 
 import slime.utils.external_utils.command_utils as U
 
-MODEL_NAME = os.environ.get("SLIME_SCRIPT_MODEL_NAME", "Qwen3-0.6B")
-assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
+MODEL_NAME = os.environ.get("SLIME_SCRIPT_MODEL_NAME", "Qwen3-30B-A3B")
+assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B", "Qwen3-30B-A3B"}
 
-MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-0.6B")
-assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
+MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-30B-A3B")
+assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B", "qwen3-30B-A3B"}
 
 MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
 NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "4"))
 
-USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
+USE_NO_PARALLELISM = os.environ.get("SLIME_USE_NO_PARALLELISM", "1") == "1"
 
-# TP configuration for verifying true on-policy with tensor parallelism
-USE_TP = os.environ.get("SLIME_USE_TP", "0") == "1"
-TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "4"))
+HARDWARE = os.environ.get("SLIME_SCRIPT_HARDWARE", "H200")
+assert HARDWARE in {"H100", "H200", "GB200", "GB300"}
+
+USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
@@ -45,7 +46,7 @@ def execute():
     wandb_args = (
         "--use-wandb "
         "--wandb-project megatron-on-policy "
-        "--wandb-group qwen3-0.6B-megatron "
+        f"--wandb-group {MODEL_NAME.lower()}-megatron "
         f"--wandb-key {WANDB_API_KEY} "
         "--disable-wandb-random-suffix "
     )
@@ -59,22 +60,23 @@ def execute():
         f"--num-rollout {2 if MODE == 'debug_one_sample' else 3000} "
         f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 32} "
         f"--n-samples-per-prompt {1 if MODE == 'debug_one_sample' else 8} "
-        f"--rollout-max-response-len {2 if MODE == 'debug_one_sample' else 1024} "
+        f"--rollout-max-response-len {2 if MODE == 'debug_one_sample' else 8192} "
         "--rollout-temperature 1 "
         # temp remove this to make test easier
         # "--over-sampling-batch-size 64 "
         # "--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
         f"--global-batch-size {1 if MODE == 'debug_one_sample' else 256} "
+        "--balance-data "
     )
 
     eval_args = ""
     if MODE == "normal":
         eval_args = (
-            "--eval-interval 2 "
+            "--eval-interval 20 "
             "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
-            "--n-samples-per-eval-prompt 1 "
-            "--eval-max-response-len 1024 "
-            "--eval-top-k 1 "
+            "--n-samples-per-eval-prompt 16 "
+            "--eval-max-response-len 16384 "
+            "--eval-top-p 1 "
         )
 
     grpo_args = (
@@ -96,24 +98,80 @@ def execute():
         "--adam-beta2 0.98 "
     )
 
+    perf_args = (
+        "--recompute-granularity full "
+        "--recompute-method uniform "
+        "--recompute-num-layers 1 "
+        "--use-dynamic-batch-size "
+        "--max-tokens-per-gpu 32768 "
+    )
     
-    # TP configuration
-    if USE_TP:
-        tp_args = (
-            f"--tensor-model-parallel-size {TP_SIZE} "
-            "--sequence-parallel "  # Required for TP with MoE/attention
-            "--pipeline-model-parallel-size 1 "
-        )
-        sglang_args = (
-            f"--rollout-num-gpus-per-engine {TP_SIZE} "
-            "--sglang-decode-log-interval 1000 "
-            "--sglang-enable-metrics "
-            f"--sglang-mem-fraction-static {0.2 if MODEL_NAME == 'Qwen3-4B' else 0.5} "
-            # Disable CUDA graph for true on-policy to ensure numerical consistency
-            f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
-        )
+    # MoE parallel configuration based on hardware
+    if MODEL_NAME == "Qwen3-30B-A3B":
+        # Check if user wants no parallelism (simple MoE)
+        
+        
+        if USE_NO_PARALLELISM:
+            # Simple MoE with no parallelism - all parallel sizes = 1
+            # This requires NUM_GPUS = 1 for data_parallel_size = 1
+            perf_args += (
+                "--tensor-model-parallel-size 1 "
+                "--pipeline-model-parallel-size 1 "
+                "--context-parallel-size 1 "
+                "--expert-model-parallel-size 1 "
+                "--expert-tensor-parallel-size 1 "
+            )
+            sglang_args = (
+                "--rollout-num-gpus-per-engine 1 "
+                "--sglang-decode-log-interval 1000 "
+                "--sglang-enable-metrics "
+                "--sglang-mem-fraction-static 0.7 "
+                # Disable CUDA graph for true on-policy to ensure numerical consistency
+                f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else '--sglang-cuda-graph-max-bs 512 '}"
+            )
+        else:
+            match (HARDWARE, int(os.environ.get("SLIME_SCRIPT_NUM_NODES", "1"))):
+                case ("H100", 1) | ("H200", 1):
+                    # For 4 GPUs: tensor_parallel=4, so data_parallel=1
+                    # expert_model_parallel_size must be <= 4 (number of GPUs)
+                    # Using 1 to keep it simple for 4 GPU setup
+                    perf_args += (
+                        "--tensor-model-parallel-size 4 "
+                        "--sequence-parallel "
+                        "--pipeline-model-parallel-size 1 "
+                        "--context-parallel-size 1 "
+                        "--expert-model-parallel-size 1 "
+                        "--expert-tensor-parallel-size 1 "
+                    )
+                    sglang_args = (
+                        f"--rollout-num-gpus-per-engine {NUM_GPUS} "
+                        "--sglang-decode-log-interval 1000 "
+                        "--sglang-enable-metrics "
+                        "--sglang-mem-fraction-static 0.7 "
+                        # Disable CUDA graph for true on-policy to ensure numerical consistency
+                        f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else '--sglang-cuda-graph-max-bs 512 '}"
+                    )
+            case ("GB200", 1) | ("GB300", 1) | ("GB200", 2) | ("GB300", 2) | ("GB200", 4) | ("GB300", 4):
+                perf_args += (
+                    "--tensor-model-parallel-size 4 "
+                    "--sequence-parallel "
+                    "--pipeline-model-parallel-size 1 "
+                    "--context-parallel-size 1 "
+                    "--expert-model-parallel-size 4 "
+                    "--expert-tensor-parallel-size 1 "
+                )
+                sglang_args = (
+                    "--rollout-num-gpus-per-engine 4 "
+                    "--sglang-decode-log-interval 1000 "
+                    "--sglang-enable-metrics "
+                    "--sglang-mem-fraction-static 0.7 "
+                    # Note: true_on_policy_args will set --sglang-attention-backend fa3
+                    # Disable CUDA graph for true on-policy to ensure numerical consistency
+                    f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else '--sglang-cuda-graph-max-bs 512 '}"
+                )
+            case _:
+                raise NotImplementedError(f"Hardware {HARDWARE} with current node count not supported")
     else:
-        tp_args = ""
         sglang_args = (
             "--rollout-num-gpus-per-engine 1 "
             "--sglang-decode-log-interval 1000 "
@@ -140,8 +198,10 @@ def execute():
         # default dropout in megatron is 0.1
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
-        "--actor-num-nodes 1 "
+        # should be good for model performance
+        f"--actor-num-nodes {int(os.environ.get('SLIME_SCRIPT_NUM_NODES', '1'))} "
         f"--actor-num-gpus-per-node {NUM_GPUS} "
+        f"--num-gpus-per-node {NUM_GPUS} "
         "--colocate "
     )
     
@@ -151,6 +211,14 @@ def execute():
             # TODO pick a good value
             "--max-tokens-per-gpu 2048 "
         )
+    
+    if MODEL_NAME == "Qwen3-30B-A3B":
+        # Add optimizer CPU offload for large models
+        optimizer_args += (
+            "--optimizer-cpu-offload "
+            "--overlap-cpu-optimizer-d2h-h2d "
+            "--use-precision-aware-optimizer "
+        )
 
     true_on_policy_args = (
         "--sglang-enable-deterministic-inference "
@@ -158,6 +226,7 @@ def execute():
         "--sglang-attention-backend fa3 "
         "--use-sglang "
         "--use-sglang-attention "
+        "--use-sglang-router "  # Use SGLang's fused MoE router for true on-policy
         "--deterministic-mode "
         "--true-on-policy-mode "
         "--use-cpu-initialization "
@@ -177,7 +246,7 @@ def execute():
         f"{optimizer_args} "
         f"{grpo_args} "
         f"{wandb_args} "
-        f"{tp_args} "  # TP configuration (empty if USE_TP=False)
+        f"{perf_args if MODEL_NAME == 'Qwen3-30B-A3B' else ''} "
         f"{eval_args} "
         f"{sglang_args} "
         f"{ci_args} "
