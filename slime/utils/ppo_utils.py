@@ -6,6 +6,7 @@ from argparse import Namespace
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from slime.backends.training_utils.parallel import ParallelState
 
 
 @torch.compile(dynamic=True)
@@ -226,6 +227,7 @@ def get_reinforce_plus_plus_returns(
     total_lengths: list[int],
     kl_coef: float,
     gamma: float,
+    parallel_state: ParallelState,
 ) -> list[torch.Tensor]:
     """
     Calculates discounted returns for REINFORCE++ (https://arxiv.org/pdf/2501.03262)
@@ -254,9 +256,9 @@ def get_reinforce_plus_plus_returns(
 
         if cp_size > 1:
             # Step 1,2:Gather all chunks and token_offsets from all ranks and reconstruct the full response tensor by splitting and placing each part
-            from slime.backends.megatron_utils.cp_utils import all_gather_with_cp
+            from slime.backends.training_utils.cp_utils import all_gather_with_cp
 
-            full_kl_response = all_gather_with_cp(local_kl_chunk, total_len, response_len)
+            full_kl_response = all_gather_with_cp(local_kl_chunk, total_len, response_len, parallel_state)
         else:
             full_kl_response = local_kl_chunk
 
@@ -278,7 +280,7 @@ def get_reinforce_plus_plus_returns(
         if cp_size > 1:
             from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
 
-            local_returns_chunk = slice_log_prob_with_cp(returns_for_seq, total_len, response_len)
+            local_returns_chunk = slice_log_prob_with_cp(returns_for_seq, total_len, response_len, parallel_state)
         else:
             local_returns_chunk = returns_for_seq
 
@@ -324,6 +326,7 @@ def get_advantages_and_returns(
     rewards: torch.Tensor,
     gamma: float,
     lambd: float,
+    parallel_state: ParallelState,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function that computes advantages and returns from rewards and values.
     Calculated as in the original PPO paper: https://arxiv.org/abs/1707.06347
@@ -349,10 +352,10 @@ def get_advantages_and_returns(
 
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size > 1:
-        from slime.backends.megatron_utils.cp_utils import all_gather_with_cp
+        from slime.backends.training_utils.cp_utils import all_gather_with_cp
 
-        full_rewards = all_gather_with_cp(rewards, total_len, response_len)
-        full_values = all_gather_with_cp(values, total_len, response_len)
+        full_rewards = all_gather_with_cp(rewards, total_len, response_len, parallel_state)
+        full_values = all_gather_with_cp(values, total_len, response_len, parallel_state)
     else:
         full_rewards = rewards
         full_values = values
@@ -371,8 +374,8 @@ def get_advantages_and_returns(
     if cp_size > 1:
         from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
 
-        advantages = slice_log_prob_with_cp(full_advantages, total_len, response_len)
-        returns = slice_log_prob_with_cp(full_returns, total_len, response_len)
+        advantages = slice_log_prob_with_cp(full_advantages, total_len, response_len, parallel_state)
+        returns = slice_log_prob_with_cp(full_returns, total_len, response_len, parallel_state)
     else:
         advantages = full_advantages
         returns = full_returns
@@ -387,6 +390,7 @@ def get_advantages_and_returns_batch(
     rewards_list,
     gamma,
     lambd,
+    parallel_state: ParallelState,
     chunked: bool = True,
 ):
     """
@@ -413,7 +417,7 @@ def get_advantages_and_returns_batch(
         dtype = values_list[0].dtype
 
         if cp_size > 1:
-            from slime.backends.megatron_utils.cp_utils import all_gather_with_cp
+            from slime.backends.training_utils.cp_utils import all_gather_with_cp
 
             full_values_list = []
             full_rewards_list = []
@@ -421,8 +425,8 @@ def get_advantages_and_returns_batch(
             for total_len, resp_len, v, r in zip(
                 total_lengths, response_lengths, values_list, rewards_list, strict=False
             ):
-                full_v = all_gather_with_cp(v, total_len, resp_len)
-                full_r = all_gather_with_cp(r, total_len, resp_len)
+                full_v = all_gather_with_cp(v, total_len, resp_len, parallel_state)
+                full_r = all_gather_with_cp(r, total_len, resp_len, parallel_state)
                 full_values_list.append(full_v)
                 full_rewards_list.append(full_r)
 
@@ -461,7 +465,7 @@ def get_advantages_and_returns_batch(
         returns_list = []
 
         if cp_size > 1:
-            from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
+            from slime.backends.training_utils.cp_utils import slice_log_prob_with_cp
 
             for total_len, resp_len, adv_row, ret_row in zip(
                 total_lengths,
@@ -473,8 +477,8 @@ def get_advantages_and_returns_batch(
                 adv_full = adv_row  # shape = [resp_len_i padded to max_len]
                 ret_full = ret_row
 
-                adv_sliced = slice_log_prob_with_cp(adv_full[:resp_len], total_len, resp_len)
-                ret_sliced = slice_log_prob_with_cp(ret_full[:resp_len], total_len, resp_len)
+                adv_sliced = slice_log_prob_with_cp(adv_full[:resp_len], total_len, resp_len, parallel_state)
+                ret_sliced = slice_log_prob_with_cp(ret_full[:resp_len], total_len, resp_len, parallel_state)
 
                 advantages_list.append(adv_sliced)
                 returns_list.append(ret_sliced)
@@ -693,40 +697,3 @@ def calculate_log_probs_and_entropy(
             entropy = logits.new_zeros((0,))
 
     return log_prob, entropy
-
-
-def vanilla_tis_function(
-    args,
-    *,
-    pg_loss: torch.Tensor,
-    train_log_probs: list[torch.Tensor],
-    rollout_log_probs: list[torch.Tensor],
-    loss_masks: list[torch.Tensor],
-    **kwargs,
-) -> tuple[torch.Tensor, list[torch.Tensor], dict[str, torch.Tensor]]:
-    """Apply TIS off-policy correction using importance sampling.
-
-    Parameters:
-        args: Arguments containing TIS settings.
-        pg_loss: Policy gradient loss tensor of shape [total_seq_len - 1].
-        train_log_probs: List of tensors containing training log-probabilities
-            for each sequence.
-        rollout_log_probs: List of tensors containing rollout log-probabilities
-            for each sequence.
-        loss_masks: List of tensors containing loss masks for each sequence.
-    """
-    rollout_log_probs = torch.cat(rollout_log_probs, dim=0)
-    old_log_probs = torch.cat(train_log_probs, dim=0)
-    tis = torch.exp(old_log_probs - rollout_log_probs)
-    tis_abs = (tis - 1).abs()
-    tis_clip_low = args.tis_clip_low if args.tis_clip_low is not None else 0.1
-    tis_clip_high = args.tis_clip if args.tis_clip is not None else 2.0
-    tis_weights = torch.clamp(tis, min=tis_clip_low, max=tis_clip_high)
-    tis_clipfrac = (tis_weights != tis).float()
-    metrics = {
-        "tis": tis.clone().detach(),
-        "tis_clipfrac": tis_clipfrac.clone().detach(),
-        "tis_abs": tis_abs.clone().detach(),
-    }
-    pg_loss = pg_loss * tis_weights
-    return pg_loss, loss_masks, metrics
