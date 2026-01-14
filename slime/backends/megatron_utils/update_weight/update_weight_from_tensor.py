@@ -128,7 +128,11 @@ class UpdateWeightFromTensor:
             ray.get(refs)
             del long_lived_tensors
 
+        if rank == 0:
+            print("[DEBUG update_weights] All chunks sent, entering first barrier...")
         dist.barrier(group=get_gloo_group())
+        if rank == 0:
+            print("[DEBUG update_weights] First barrier passed")
 
         # int4/fp4 post_process
         if rank == 0:
@@ -138,7 +142,13 @@ class UpdateWeightFromTensor:
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
-            dist.barrier(group=get_gloo_group())
+        # NOTE: The second barrier must be called by ALL ranks, not just rank 0!
+        # This was a bug that caused deadlock when TP > 1
+        if rank == 0:
+            print("[DEBUG update_weights] Entering second barrier...")
+        dist.barrier(group=get_gloo_group())
+        if rank == 0:
+            print("[DEBUG update_weights] Second barrier passed, update_weights complete")
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []

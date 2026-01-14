@@ -138,6 +138,28 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
         bridge.load_hf_weights(ddp_model)
 
+    # Debug: Check FC1 weights after loading
+    import os
+    if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+        import torch.distributed as dist
+        from megatron.core import mpu
+        from megatron.core.utils import unwrap_model
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        tp_rank = mpu.get_tensor_model_parallel_rank() if mpu.is_initialized() else 0
+        model = unwrap_model(ddp_model)[0]
+        for name, param in model.named_parameters():
+            if "linear_fc1" in name and "weight" in name and "layers.0." in name:
+                mid_idx = param.shape[0] // 2
+                logger.info(
+                    f"[DEBUG Megatron AFTER LOAD] {name} "
+                    f"rank={rank}, tp_rank={tp_rank}, shape={param.shape}, "
+                    f"sum={param.float().sum().item():.6f}, "
+                    f"first_row[:5]={param[0, :5].float().tolist()}, "
+                    f"mid_row[:5]={param[mid_idx, :5].float().tolist()}, "
+                    f"last_row[:5]={param[-1, :5].float().tolist()}"
+                )
+                break
+
     # Copied from Megatron-core :: load_checkpoint (with simplifications)
     if (args.fp16 or args.bf16) and optimizer is not None:
         assert not args.load_main_params_from_ckpt

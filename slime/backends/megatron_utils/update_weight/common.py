@@ -12,6 +12,24 @@ from slime.backends.megatron_utils.misc_utils import strip_param_name_prefix
 from slime.utils.types import ParamInfo
 
 
+def _is_linear_fc1_weight(name: str) -> bool:
+    """
+    Check if the parameter name corresponds to linear_fc1 weight.
+    Handles both TE naming (linear_fc1.weight) and SGLang naming (linear_fc1.linear.weight).
+    """
+    # Match "linear_fc1.weight" but not "linear_fc1.linear.weight" first,
+    # then also match "linear_fc1.linear.weight" for SGLang
+    return "linear_fc1.weight" in name or "linear_fc1.linear.weight" in name
+
+
+def _is_linear_fc2_weight(name: str) -> bool:
+    """
+    Check if the parameter name corresponds to linear_fc2 weight.
+    Handles both TE naming (linear_fc2.weight) and SGLang naming (linear_fc2.linear.weight).
+    """
+    return "linear_fc2.weight" in name or "linear_fc2.linear.weight" in name
+
+
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     """
     All-gather TP-sharded param to full tensor. expert_bias→param, non-TP/duplicated→param.data.
@@ -37,11 +55,11 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     assert param.partition_stride == 1, "partition_stride != 1 is not supported"
     # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
     # TODO: check only GLU is used.
-    if "linear_fc1.weight" in name:
+    if _is_linear_fc1_weight(name):
         param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
         param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
     # this is bug in megatron's grouped moe.
-    if "linear_fc2.weight" in name:
+    if _is_linear_fc2_weight(name):
         if partition_dim == 0:
             partition_dim = 1
     param = torch.cat(param_partitions, dim=partition_dim)
@@ -99,11 +117,11 @@ def all_gather_params_async(
             assert partition_dim is not None, "partition_stride != 1 is not supported"
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
             # TODO: check only GLU is used.
-            if "linear_fc1.weight" in info.name:
+            if _is_linear_fc1_weight(info.name):
                 param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
                 param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
             # this is bug in megatron's grouped moe.
-            if "linear_fc2.weight" in info.name:
+            if _is_linear_fc2_weight(info.name):
                 if partition_dim == 0:
                     partition_dim = 1
             param = torch.cat(param_partitions, dim=partition_dim)

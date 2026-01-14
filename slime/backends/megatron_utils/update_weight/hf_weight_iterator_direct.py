@@ -34,7 +34,11 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
 
     def _convert_to_hf_named_tensors(self, megatron_full_params: Sequence[torch.Tensor], param_infos: list[ParamInfo]):
         hf_named_tensors = []
+        rank = dist.get_rank()
         for info, param in zip(param_infos, megatron_full_params, strict=False):
+            # DEBUG: Print tensor shapes for QKV layers to verify all_gather worked
+            if rank == 0 and "linear_qkv" in info.name and "layers.0." in info.name:
+                print(f"[DEBUG HF convert] {info.name}: shape={param.shape}, expected full shape after all_gather")
             hf_named_tensors.extend(
                 convert_to_hf(self.args, self.model_name, info.name, param, self.quantization_config)
             )
@@ -146,12 +150,19 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
     param_infos = {}
     rank = dist.get_rank()
     for name, param in named_params_and_buffers(args, model):
+        tp_attr = getattr(param, "tensor_model_parallel", False)
+        # DEBUG: Print TP attributes for QKV layers
+        if rank == 0 and "linear_qkv" in name:
+            print(f"[DEBUG] {name}: tensor_model_parallel={tp_attr}, "
+                  f"partition_dim={getattr(param, 'partition_dim', -1)}, "
+                  f"partition_stride={getattr(param, 'partition_stride', 1)}, "
+                  f"shape={param.shape}")
         param_infos[name] = ParamInfo(
             name=name,
             dtype=param.dtype,
             shape=param.shape,
             attrs={
-                "tensor_model_parallel": getattr(param, "tensor_model_parallel", False),
+                "tensor_model_parallel": tp_attr,
                 "partition_dim": getattr(param, "partition_dim", -1),
                 "partition_stride": getattr(param, "partition_stride", 1),
                 "parallel_mode": getattr(param, "parallel_mode", None),

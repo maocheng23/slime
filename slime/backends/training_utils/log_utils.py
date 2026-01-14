@@ -156,6 +156,16 @@ def log_rollout_data(
                 raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
+        # DEBUG: Print raw log_probs tensors BEFORE reduction for comparison
+        if rollout_id == 0 and "log_probs" in rollout_data and "rollout_log_probs" in rollout_data:
+            megatron_lp = rollout_data["log_probs"]
+            sglang_lp = rollout_data["rollout_log_probs"]
+            if isinstance(megatron_lp, list) and len(megatron_lp) > 0:
+                megatron_cat = torch.cat(megatron_lp) if isinstance(megatron_lp[0], torch.Tensor) else megatron_lp
+                sglang_cat = torch.cat(sglang_lp) if isinstance(sglang_lp[0], torch.Tensor) else sglang_lp
+                print(f"[DEBUG RAW] Megatron log_probs (first 10): {megatron_cat[:10].tolist() if isinstance(megatron_cat, torch.Tensor) else megatron_cat[:10]}")
+                print(f"[DEBUG RAW] SGLang rollout_log_probs (first 10): {sglang_cat[:10].tolist() if isinstance(sglang_cat, torch.Tensor) else sglang_cat[:10]}")
+        
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict, parallel_state)
         if args.ci_test and reduced_log_dict is not None:
             if (
@@ -163,8 +173,17 @@ def log_rollout_data(
                 and "rollout/log_probs" in reduced_log_dict
                 and "rollout/ref_log_probs" in reduced_log_dict
             ):
-                assert reduced_log_dict["rollout/log_probs"] == reduced_log_dict["rollout/ref_log_probs"]
+                log_probs_val = reduced_log_dict["rollout/log_probs"]
+                ref_log_probs_val = reduced_log_dict["rollout/ref_log_probs"]
+                if log_probs_val != ref_log_probs_val:
+                    print(f"[DEBUG CI] log_probs={log_probs_val}, ref_log_probs={ref_log_probs_val}, diff={abs(log_probs_val - ref_log_probs_val)}")
+                assert reduced_log_dict["rollout/log_probs"] == reduced_log_dict["rollout/ref_log_probs"], \
+                    f"log_probs={log_probs_val} != ref_log_probs={ref_log_probs_val}, diff={abs(log_probs_val - ref_log_probs_val)}"
             if "rollout/log_probs" in reduced_log_dict and "rollout/rollout_log_probs" in reduced_log_dict:
+                # DEBUG: Print values before assertion
+                print(f"[DEBUG CI] Comparing: log_probs={reduced_log_dict['rollout/log_probs']:.6f}, "
+                      f"rollout_log_probs={reduced_log_dict['rollout/rollout_log_probs']:.6f}, "
+                      f"diff={abs(reduced_log_dict['rollout/log_probs'] - reduced_log_dict['rollout/rollout_log_probs']):.6f}")
                 assert isclose(
                     reduced_log_dict["rollout/log_probs"], reduced_log_dict["rollout/rollout_log_probs"], abs_tol=0.03
                 )

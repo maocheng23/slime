@@ -154,12 +154,56 @@ def compute_log_probs(
     tokens: torch.Tensor,
     process_group: dist.ProcessGroup | None,
     true_on_policy_mode: bool = False,
+    vocab_size: int | None = None,
 ):
+    # Check if we're using tensor parallelism
+    if process_group is not None:
+        tp_size = dist.get_world_size(process_group)
+    else:
+        tp_size = 1
 
     if true_on_policy_mode:
-        log_probs = torch.log_softmax(logits, dim=-1)
-        gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
-        return gathered.float()
+        if tp_size > 1:
+            # For TP > 1 in true_on_policy mode:
+            # Must gather logits first, then compute log_softmax + gather
+            # This matches SGLang inference computation exactly
+            from megatron.core.tensor_parallel import gather_from_tensor_model_parallel_region
+            
+            rank = dist.get_rank(process_group)
+            
+            # DEBUG: Each rank should have DIFFERENT logits (partitioned vocab)
+            # rank 0 has vocab [0, vocab/tp), rank 1 has vocab [vocab/tp, 2*vocab/tp), etc.
+            print(f"[DEBUG compute_log_probs] rank={rank}: logits.shape={logits.shape}, "
+                  f"sum={logits.sum().item():.4f}, first 5={logits[0, :5].tolist()}")
+            
+            # Gather logits from all TP ranks: [seq, padded_vocab/tp] -> [seq, padded_vocab]
+            full_logits = gather_from_tensor_model_parallel_region(logits.contiguous(), group=process_group)
+            
+            # DEBUG: CRITICAL - After gather, ALL ranks should have IDENTICAL full_logits
+            # If rank 0 and rank 1 have different full_logits, there's a bug!
+            print(f"[DEBUG compute_log_probs] rank={rank} AFTER gather: full_logits.shape={full_logits.shape}, "
+                  f"sum={full_logits.sum().item():.4f}, first 5={full_logits[0, :5].tolist()}")
+            
+            # Truncate to original vocab_size to remove padding tokens
+            if vocab_size is not None and full_logits.size(-1) > vocab_size:
+                full_logits = full_logits[..., :vocab_size]
+            
+            # Compute log_probs on the (truncated) full vocabulary (same as SGLang inference)
+            log_probs = torch.log_softmax(full_logits.float(), dim=-1)
+            gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
+            
+            # DEBUG: Final result
+            if rank == 0:
+                print(f"[DEBUG compute_log_probs] tokens={tokens.tolist()}, log_probs={gathered.tolist()}")
+            
+            return gathered.float()
+        else:
+            # TP=1: Simple path (may still need truncation if vocab is padded)
+            if vocab_size is not None and logits.size(-1) > vocab_size:
+                logits = logits[..., :vocab_size]
+            log_probs = torch.log_softmax(logits.float(), dim=-1)
+            gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
+            return gathered.float()
     else:
         from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 
@@ -660,7 +704,8 @@ def chunked_gae(
 
 
 def calculate_log_probs_and_entropy(
-    logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1, true_on_policy_mode: bool = False
+    logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1, 
+    true_on_policy_mode: bool = False, vocab_size: int | None = None
 ):
     logits = logits.contiguous()
     # TODO: not sure why we need to clone the logits here.
@@ -675,7 +720,8 @@ def calculate_log_probs_and_entropy(
             log_probs = []
             for tokens_chunk, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
                 log_prob = compute_log_probs(
-                    logits_chunk.clone(), tokens_chunk, tp_group, true_on_policy_mode=true_on_policy_mode
+                    logits_chunk.clone(), tokens_chunk, tp_group, 
+                    true_on_policy_mode=true_on_policy_mode, vocab_size=vocab_size
                 )
                 log_probs.append(log_prob)
             log_prob = torch.cat(log_probs, dim=0)
@@ -687,7 +733,8 @@ def calculate_log_probs_and_entropy(
                 entropy = torch.cat(entropys, dim=0)
         else:
             log_prob = compute_log_probs(
-                logits.clone(), tokens, tp_group, true_on_policy_mode=true_on_policy_mode
+                logits.clone(), tokens, tp_group, 
+                true_on_policy_mode=true_on_policy_mode, vocab_size=vocab_size
             )
             if with_entropy:
                 entropy = compute_entropy_from_logits(logits.clone(), tp_group)
