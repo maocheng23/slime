@@ -13,7 +13,7 @@ assert MODEL_TYPE in {"qwen3-30B-A3B"}
 MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
-NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "2"))
+NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "4"))
 
 USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 
@@ -56,8 +56,8 @@ def execute():
 
     wandb_args = (
         "--use-wandb "
-        "--wandb-project megatron-on-policy "
-        "--wandb-group qwen3-0.6B-megatron "
+        "--wandb-project moe-on-policy "
+        "--wandb-group qwen3-30B-A3B-megatron "
         f"--wandb-key {WANDB_API_KEY} "
         "--disable-wandb-random-suffix "
     )
