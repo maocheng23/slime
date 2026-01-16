@@ -176,9 +176,10 @@ def execute():
         "--no-rope-fusion "
     )
     true_on_policy_envs = {
-        # TODO note: "Ring" in original RL PR, "allreduce:tree" in SGLang
-        "NCCL_ALGO": "Ring",
-        # "NCCL_ALGO": "allreduce:tree",
+        # NOTE: Use "allreduce:Tree" instead of "Tree" to only affect AllReduce operations
+        # "Tree" would affect ALL NCCL operations (AllGather, ReduceScatter, etc.) and may cause errors
+        # like "no algorithm/protocol available for function AllGather with datatype ncclInt8"
+        "NCCL_ALGO": "allreduce:Tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     }
