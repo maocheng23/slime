@@ -170,7 +170,8 @@ def execute():
         "--sglang-attention-backend fa3 "
         "--use-sglang "
         "--use-sglang-attention "
-        "--use-sglang-router "  # Use SGLang's fused MoE router for true on-policy
+        "--use-sglang-router "
+        "--true-on-policy-model qwen3_moe "
         "--deterministic-mode "
         "--true-on-policy-mode "
         "--use-cpu-initialization "
@@ -206,6 +207,7 @@ def execute():
             **true_on_policy_envs,
             "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
             "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
+            "SLIME_DEBUG_ROUTER": "1" if MODE == "debug_one_sample" else "0",
         },
     )
 
