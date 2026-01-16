@@ -120,7 +120,7 @@ def execute():
             f"--rollout-num-gpus-per-engine {TP_SIZE} "
             "--sglang-decode-log-interval 1000 "
             "--sglang-enable-metrics "
-            f"--sglang-mem-fraction-static {0.2 if MODEL_NAME == 'Qwen3-4B' else 0.5} "
+            f"--sglang-mem-fraction-static {0.2 if MODEL_NAME == 'Qwen3-4B' else 0.2} "
             # Disable CUDA graph for true on-policy to ensure numerical consistency
             f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
         )
