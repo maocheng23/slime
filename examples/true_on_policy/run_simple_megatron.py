@@ -177,7 +177,7 @@ def execute():
     )
     true_on_policy_envs = {
         # TODO note: "Ring" in original RL PR, "allreduce:tree" in SGLang
-        "NCCL_ALGO": "Tree",
+        "NCCL_ALGO": "Ring",
         # "NCCL_ALGO": "allreduce:tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
