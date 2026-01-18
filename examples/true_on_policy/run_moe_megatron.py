@@ -109,33 +109,22 @@ def execute():
     )
 
     
-    # TP configuration
-    if USE_TP:
-        tp_args = (
-            f"--tensor-model-parallel-size {TP_SIZE} "
-            # "--sequence-parallel "  # Disabled: only use TP without SP for easier debugging
-            "--pipeline-model-parallel-size 1 "
-            "--expert-model-parallel-size 4 "
-            "--expert-tensor-parallel-size 1 "
-        )
-        sglang_args = (
-            f"--rollout-num-gpus-per-engine {TP_SIZE} "
-            "--sglang-decode-log-interval 1000 "
-            "--sglang-enable-metrics "
-            f"--sglang-mem-fraction-static {0.25 if MODEL_NAME == 'Qwen3-30B-A3B' else 0.2} "
-            # Disable CUDA graph for true on-policy to ensure numerical consistency
-            f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
-        )
-    else:
-        tp_args = ""
-        sglang_args = (
-            "--rollout-num-gpus-per-engine 1 "
-            "--sglang-decode-log-interval 1000 "
-            "--sglang-enable-metrics "
-            f"--sglang-mem-fraction-static {0.2 if MODEL_NAME == 'Qwen3-4B' else 0.4} "
-            # Disable CUDA graph for true on-policy to ensure numerical consistency
-            f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
-        )
+
+    tp_args = (
+        f"--tensor-model-parallel-size {TP_SIZE} "
+        # "--sequence-parallel "  # Disabled: only use TP without SP for easier debugging
+        "--pipeline-model-parallel-size 1 "
+        "--expert-model-parallel-size 4 "
+        "--expert-tensor-parallel-size 1 "
+    )
+    sglang_args = (
+        f"--rollout-num-gpus-per-engine {TP_SIZE} "
+        "--sglang-decode-log-interval 1000 "
+        "--sglang-enable-metrics "
+        f"--sglang-mem-fraction-static {0.25 if MODEL_NAME == 'Qwen3-30B-A3B' else 0.2} "
+        # Disable CUDA graph for true on-policy to ensure numerical consistency
+        f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
+    )
 
 
     ci_args = (
