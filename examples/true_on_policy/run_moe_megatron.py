@@ -115,6 +115,7 @@ def execute():
             f"--tensor-model-parallel-size {TP_SIZE} "
             # "--sequence-parallel "  # Disabled: only use TP without SP for easier debugging
             "--pipeline-model-parallel-size 1 "
+            "--expert-model-parallel-size 4 "
         )
         sglang_args = (
             f"--rollout-num-gpus-per-engine {TP_SIZE} "
