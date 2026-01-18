@@ -108,6 +108,11 @@ def execute():
         "--adam-beta2 0.98 "
     )
 
+    if MODE == "debug_one_sample":
+        optimizer_args = +(
+            "--lr-decay-iters 4 "
+        )
+
     
 
     tp_args = (
