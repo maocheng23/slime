@@ -109,7 +109,7 @@ def execute():
     )
 
     if MODE == "debug_one_sample":
-        optimizer_args = +(
+        optimizer_args += (
             "--lr-decay-iters 4 "
         )
 
