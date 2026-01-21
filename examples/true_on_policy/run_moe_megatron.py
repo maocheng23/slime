@@ -19,7 +19,7 @@ USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 
 # TP configuration for verifying true on-policy with tensor parallelism
 USE_TP = os.environ.get("SLIME_USE_TP", "0") == "1"
-TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "2"))
+TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "1"))
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
@@ -126,7 +126,7 @@ def execute():
         f"--rollout-num-gpus-per-engine {TP_SIZE} "
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
-        f"--sglang-mem-fraction-static {0.4 if MODEL_NAME == 'Qwen3-30B-A3B' else 0.2} "
+        f"--sglang-mem-fraction-static {0.5 if MODEL_NAME == 'Qwen3-30B-A3B' else 0.5} "
         # Disable CUDA graph for true on-policy to ensure numerical consistency
         f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
     )
