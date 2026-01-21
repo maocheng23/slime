@@ -69,7 +69,7 @@ def execute():
         "--rollout-shuffle "
         "--rm-type math "
         f"--num-rollout {1 if MODE == 'debug_one_sample' else 3000} "
-        f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 32} "
+        f"--rollout-batch-size {4 if MODE == 'debug_one_sample' else 32} "
         f"--n-samples-per-prompt {1 if MODE == 'debug_one_sample' else 8} "
         f"--rollout-max-response-len {1 if MODE == 'debug_one_sample' else 1024} "
         "--rollout-temperature 1 "
