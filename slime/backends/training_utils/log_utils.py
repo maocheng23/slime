@@ -109,6 +109,18 @@ def log_rollout_data(
     - Non-tensor lists are averaged elementwise.
     - Scalars are converted to Python numbers.
     """
+    # DEBUG: Print prompt/response lengths for debugging router alignment
+    import os
+    if os.environ.get("SLIME_DEBUG_ROUTER", "0") == "1" and parallel_state.dp_rank == 0:
+        total_lengths = rollout_data["total_lengths"]
+        response_lengths = rollout_data["response_lengths"]
+        for i, (total_len, resp_len) in enumerate(zip(total_lengths, response_lengths)):
+            prompt_len = total_len - resp_len
+            # Position of first generated token = prompt_len (0-indexed)
+            # In Megatron [seq, batch, hidden] format, this is at index prompt_len
+            print(f"[SLIME DEBUG] Sample {i}: total_len={total_len}, prompt_len={prompt_len}, "
+                  f"response_len={resp_len}, first_gen_token_pos={prompt_len}")
+    
     if parallel_state.tp_rank == 0 and parallel_state.is_pp_last_stage:
         cp_size = parallel_state.cp_size
         log_dict = {}
