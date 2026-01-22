@@ -1,6 +1,7 @@
 import itertools
 import logging
 import multiprocessing
+import os
 import random
 import time
 from pathlib import Path
@@ -490,6 +491,10 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
             "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+            # Deterministic NCCL settings (must match Megatron side for true on-policy)
+            "NCCL_ALGO": os.environ.get("NCCL_ALGO", ""),
+            "NVTE_ALLOW_NONDETERMINISTIC_ALGO": os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", ""),
+            "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
         }
 
         worker_type = "regular"
