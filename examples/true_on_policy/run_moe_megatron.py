@@ -13,7 +13,7 @@ assert MODEL_TYPE in {"qwen3-30B-A3B"}
 MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
-NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "4"))
+NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "2"))
 
 USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 
@@ -32,7 +32,9 @@ def prepare():
 
 
 def execute():
-    tensor_parallel_size = TP_SIZE if USE_TP else 1
+    # For MoE models, SGLang requires TP >= EP
+    # Use TP_SIZE from env var, default to NUM_GPUS (so TP=EP=NUM_GPUS, DP=1)
+    tensor_parallel_size = TP_SIZE if USE_TP else NUM_GPUS
     assert NUM_GPUS % tensor_parallel_size == 0, (
         f"NUM_GPUS ({NUM_GPUS}) must be divisible by tensor_parallel_size ({tensor_parallel_size})"
     )
@@ -70,7 +72,7 @@ def execute():
         "--rm-type math "
         f"--num-rollout {1 if MODE == 'debug_one_sample' else 3000} "
         f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 32} "
-        f"--n-samples-per-prompt {4 if MODE == 'debug_one_sample' else 8} "
+        f"--n-samples-per-prompt {1 if MODE == 'debug_one_sample' else 8} "
         f"--rollout-max-response-len {1 if MODE == 'debug_one_sample' else 1024} "
         "--rollout-temperature 1 "
         # temp remove this to make test easier
@@ -116,16 +118,16 @@ def execute():
     
 
     tp_args = (
-        f"--tensor-model-parallel-size {TP_SIZE} "
+        f"--tensor-model-parallel-size {tensor_parallel_size} "
         # "--sequence-parallel "  # Disabled: only use TP without SP for easier debugging
         "--pipeline-model-parallel-size 1 "
-        f"--expert-model-parallel-size {NUM_GPUS} "
+        f"--expert-model-parallel-size {tensor_parallel_size} "  # EP = TP (SGLang requires TP >= EP)
         "--expert-tensor-parallel-size 1 "
     )
     sglang_args = (
-        f"--rollout-num-gpus-per-engine {NUM_GPUS} "
-        "--sglang-tp-size 1 "  # Use TP=1 to match Megatron's TP=1 configuration
-        f"--sglang-ep-size {NUM_GPUS} "
+        f"--rollout-num-gpus-per-engine {tensor_parallel_size} "
+        f"--sglang-tp-size {tensor_parallel_size} "  # SGLang requires TP >= EP
+        f"--sglang-ep-size {tensor_parallel_size} "  # EP = TP
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
         f"--sglang-mem-fraction-static {0.5 if MODEL_NAME == 'Qwen3-30B-A3B' else 0.5} "
