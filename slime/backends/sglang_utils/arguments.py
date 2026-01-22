@@ -34,6 +34,12 @@ def add_sglang_arguments(parser):
     """
     parser = add_sglang_router_arguments(parser)
     parser.add_argument("--sglang-server-concurrency", type=int, default=512)
+    parser.add_argument(
+        "--sglang-tp-size",
+        type=int,
+        default=None,
+        help="SGLang tensor parallel size. If not set, uses rollout_num_gpus_per_engine.",
+    )
 
     old_add_argument = parser.add_argument
 
@@ -112,7 +118,11 @@ def add_sglang_arguments(parser):
 
 
 def validate_args(args):
-    args.sglang_tp_size = args.rollout_num_gpus_per_engine
+    # Allow explicit sglang_tp_size override, otherwise use rollout_num_gpus_per_engine
+    if hasattr(args, 'sglang_tp_size') and args.sglang_tp_size is not None:
+        pass  # Use the explicitly set value
+    else:
+        args.sglang_tp_size = args.rollout_num_gpus_per_engine
     args.sglang_dp_size = args.sglang_data_parallel_size
     args.sglang_pp_size = args.sglang_pipeline_parallel_size
     args.sglang_ep_size = args.sglang_expert_parallel_size

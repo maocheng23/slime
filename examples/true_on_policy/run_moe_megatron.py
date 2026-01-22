@@ -124,6 +124,7 @@ def execute():
     )
     sglang_args = (
         f"--rollout-num-gpus-per-engine {NUM_GPUS} "
+        "--sglang-tp-size 1 "  # Use TP=1 to match Megatron's TP=1 configuration
         f"--sglang-ep-size {NUM_GPUS} "
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
