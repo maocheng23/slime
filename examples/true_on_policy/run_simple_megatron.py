@@ -184,6 +184,9 @@ def execute():
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         # Disable NVLS (NVLink SHARP) to ensure consistent all-reduce behavior between sglang and megatron
         "NCCL_NVLS_ENABLE": "0",
+        # Use deterministic tree all-reduce (all_gather + local tree sum) instead of NCCL all_reduce
+        # This ensures SGLang and Megatron use identical all-reduce implementation for true on-policy
+        "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
     }
 
     train_args = (
