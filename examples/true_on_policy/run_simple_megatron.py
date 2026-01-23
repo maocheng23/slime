@@ -13,13 +13,13 @@ assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
 MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
-NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "2"))
+NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "4"))
 
 USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 
 # TP configuration for verifying true on-policy with tensor parallelism
-USE_TP = os.environ.get("SLIME_USE_TP", "0") == "1"
-TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "2"))
+USE_TP = os.environ.get("SLIME_USE_TP", "1") == "1"
+TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "4"))
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
@@ -206,6 +206,7 @@ def execute():
             **true_on_policy_envs,
             "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
             "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
+            "SLIME_DEBUG_ATTN": "1" if MODE == "debug_one_sample" else "0",
         },
     )
 
