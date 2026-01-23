@@ -182,6 +182,8 @@ def execute():
         "NCCL_ALGO": "allreduce:Tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        # Disable NVLS (NVLink SHARP) to ensure consistent all-reduce behavior between sglang and megatron
+        "NCCL_NVLS_ENABLE": "0",
     }
 
     train_args = (
