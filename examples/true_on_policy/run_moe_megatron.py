@@ -184,6 +184,10 @@ def execute():
         "NCCL_ALGO": "allreduce:Tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        # Disable NVLS (NVLink SHARP) to ensure consistent all-reduce behavior between sglang and megatron
+        "NCCL_NVLS_ENABLE": "0",
+        # Enable deterministic all-reduce in Megatron to match SGLang's tree_all_reduce_sum
+        "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
     }
 
     train_args = (
@@ -209,6 +213,8 @@ def execute():
             "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
             "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
             "SLIME_DEBUG_ROUTER": "1" if MODE == "debug_one_sample" else "0",
+            "SLIME_DEBUG_ATTN": "1" if MODE == "debug_one_sample" else "0",
+            "SLIME_DEBUG_LOGPROB_DIFF": "1" if MODE == "debug_one_sample" else "0",
         },
     )
 
