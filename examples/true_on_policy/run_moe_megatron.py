@@ -71,7 +71,7 @@ def execute():
         "--rollout-shuffle "
         "--rm-type math "
         f"--num-rollout {1 if MODE == 'debug_one_sample' else 3000} "
-        f"--rollout-batch-size {4 if MODE == 'debug_one_sample' else 32} "
+        f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 32} "
         f"--n-samples-per-prompt {1 if MODE == 'debug_one_sample' else 8} "
         f"--rollout-max-response-len {2 if MODE == 'debug_one_sample' else 1024} "
         "--rollout-temperature 1 "
@@ -130,7 +130,7 @@ def execute():
         f"--sglang-ep-size {tensor_parallel_size} "  # EP = TP
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
-        f"--sglang-mem-fraction-static {0.5 if MODEL_NAME == 'Qwen3-30B-A3B' else 0.5} "
+        f"--sglang-mem-fraction-static {0.35 if MODEL_NAME == 'Qwen3-30B-A3B' else 0.5} "
         # Disable CUDA graph for true on-policy to ensure numerical consistency
         f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
     )
