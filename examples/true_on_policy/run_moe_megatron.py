@@ -70,7 +70,7 @@ def execute():
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type math "
-        f"--num-rollout {1 if MODE == 'debug_one_sample' else 3000} "
+        f"--num-rollout {2 if MODE == 'debug_one_sample' else 3000} "  # Need at least 2-3 steps to observe divergence pattern
         f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 16} "
         f"--n-samples-per-prompt {1 if MODE == 'debug_one_sample' else 8} "
         f"--rollout-max-response-len {2 if MODE == 'debug_one_sample' else 1024} "
@@ -216,6 +216,8 @@ def execute():
             "SLIME_DEBUG_ATTN": "1" if MODE == "debug_one_sample" else "0",
             "SLIME_DEBUG_LOGPROB_DIFF": "1" if MODE == "debug_one_sample" else "0",
             "SLIME_DEBUG_TREE_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
+            # Debug gradient all-reduce for MoE backward pass
+            "DEBUG_GRAD_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
         },
     )
 
