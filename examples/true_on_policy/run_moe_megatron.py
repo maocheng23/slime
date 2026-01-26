@@ -10,10 +10,10 @@ assert MODEL_NAME in {"Qwen3-30B-A3B"}
 MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-30B-A3B")
 assert MODEL_TYPE in {"qwen3-30B-A3B"}
 
-MODE = os.environ.get("SLIME_SCRIPT_MODE", "debug_one_sample")
+MODE = os.environ.get("SLIME_SCRIPT_MODE", "normal")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
-NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "4"))
+NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "8"))
 
 USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 
@@ -40,7 +40,7 @@ def execute():
     )
     data_parallel_size = NUM_GPUS // tensor_parallel_size
 
-    global_batch_size = 1 if MODE == "debug_one_sample" else 256
+    global_batch_size = 1 if MODE == "debug_one_sample" else 128
     if global_batch_size % data_parallel_size != 0:
         # Megatron requires global_batch_size divisible by micro_batch_size * data_parallel_size
         global_batch_size = math.ceil(global_batch_size / data_parallel_size) * data_parallel_size
