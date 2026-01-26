@@ -84,7 +84,7 @@ def execute():
     eval_args = ""
     if MODE == "normal":
         eval_args = (
-            f"--eval-interval {2 if MODE == 'debug_one_sample' else 20} "
+            f"--eval-interval {2 if MODE == 'debug_one_sample' else 10} "
             "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
             "--n-samples-per-eval-prompt 1 "
             "--eval-max-response-len 1024 "
