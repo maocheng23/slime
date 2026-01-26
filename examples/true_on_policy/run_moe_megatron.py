@@ -82,14 +82,14 @@ def execute():
     )
 
     eval_args = ""
-    if MODE == "normal":
-        eval_args = (
-            f"--eval-interval {2 if MODE == 'debug_one_sample' else 10} "
-            "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
-            "--n-samples-per-eval-prompt 1 "
-            "--eval-max-response-len 1024 "
-            "--eval-top-k 1 "
-        )
+    # if MODE == "normal":
+    #     eval_args = (
+    #         f"--eval-interval {2 if MODE == 'debug_one_sample' else 10} "
+    #         "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
+    #         "--n-samples-per-eval-prompt 1 "
+    #         "--eval-max-response-len 1024 "
+    #         "--eval-top-k 1 "
+    #     )
 
     grpo_args = (
         "--advantage-estimator grpo "
@@ -132,7 +132,8 @@ def execute():
         "--sglang-enable-metrics "
         f"--sglang-mem-fraction-static {0.35 if MODEL_NAME == 'Qwen3-30B-A3B' else 0.5} "
         # Disable CUDA graph for true on-policy to ensure numerical consistency
-        f"{'--sglang-disable-cuda-graph ' if MODE == 'debug_one_sample' else ''}"
+        # CUDA graph can cause non-determinism in MoE routing and expert computation
+        "--sglang-disable-cuda-graph "
     )
 
 
