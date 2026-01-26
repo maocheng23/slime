@@ -215,6 +215,7 @@ def execute():
             "SLIME_DEBUG_ROUTER": "1" if MODE == "debug_one_sample" else "0",
             "SLIME_DEBUG_ATTN": "1" if MODE == "debug_one_sample" else "0",
             "SLIME_DEBUG_LOGPROB_DIFF": "1" if MODE == "debug_one_sample" else "0",
+            "SLIME_DEBUG_TREE_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
         },
     )
 
