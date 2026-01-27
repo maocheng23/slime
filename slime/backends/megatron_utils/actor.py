@@ -474,6 +474,22 @@ class MegatronTrainRayActor(TrainRayActor):
             print_memory("after update_weights")
             if dist.get_rank() == 0:
                 print("[DEBUG] update_weights completed, continuing to next phase...")
+            
+            # DEBUG: Check if weights are correctly synced to SGLang after update
+            import os
+            if os.environ.get("DEBUG_ROUTER_GRAD_SYNC", "0") == "1":
+                if dist.get_rank() == 0 and len(rollout_engines) > 0:
+                    try:
+                        print("[DEBUG] Checking weight sync with SGLang...", flush=True)
+                        # First snapshot the current SGLang weights
+                        ray.get(self.rollout_manager.check_weights.remote(action="snapshot"))
+                        # Then compare (this will raise exception if mismatch)
+                        # Note: We need to compare Megatron weights vs SGLang weights
+                        # The compare action compares current SGLang weights with snapshot
+                        # So we need a different approach - just log the weights
+                        self._debug_compare_megatron_sglang_router_weights(rollout_engines)
+                    except Exception as e:
+                        print(f"[DEBUG] Weight check error: {e}", flush=True)
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
@@ -496,6 +512,80 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train:
             destroy_process_groups()
+
+    def _debug_compare_megatron_sglang_router_weights(self, rollout_engines) -> None:
+        """DEBUG: Compare Megatron and SGLang router weights after weight sync."""
+        import re
+        import requests
+        
+        print(f"\n{'@'*60}", flush=True)
+        print(f"[DEBUG] Comparing Megatron vs SGLang router weights (layer 0)...", flush=True)
+        
+        # Get layer 0 router weight from Megatron
+        target_layer = 0
+        megatron_sum = None
+        megatron_first5 = None
+        
+        for model_module in self.model:
+            for name, param in model_module.named_parameters():
+                if "router" in name.lower() and "weight" in name.lower():
+                    match = re.search(r'layers\.(\d+)\.', name)
+                    if match and int(match.group(1)) == target_layer:
+                        data = param.data.float()
+                        megatron_sum = data.sum().item()
+                        megatron_first5 = data.flatten()[:5].tolist()
+                        print(f"[DEBUG] Megatron router weight:", flush=True)
+                        print(f"  Sum: {megatron_sum:.10e}", flush=True)
+                        print(f"  First 5: {[f'{v:.6e}' for v in megatron_first5]}", flush=True)
+                        break
+            if megatron_sum is not None:
+                break
+        
+        if megatron_sum is None:
+            print(f"[DEBUG] Megatron router weight not found!", flush=True)
+            print(f"{'@'*60}\n", flush=True)
+            return
+        
+        # Get layer 0 router weight from SGLang
+        try:
+            server_info = ray.get(rollout_engines[0].get_server_info.remote())
+            server_host = server_info["server_host"]
+            server_port = server_info["server_port"]
+            
+            hf_name = f"model.layers.{target_layer}.mlp.gate.weight"
+            response = requests.post(
+                f"http://{server_host}:{server_port}/get_weights_by_name",
+                json={"name": hf_name, "truncate_size": -1},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                import torch
+                sglang_data = response.json()
+                if sglang_data is not None:
+                    sglang_weight = torch.tensor(sglang_data, dtype=torch.float32)
+                    sglang_sum = sglang_weight.sum().item()
+                    sglang_first5 = sglang_weight.flatten()[:5].tolist()
+                    
+                    print(f"[DEBUG] SGLang router weight:", flush=True)
+                    print(f"  Sum: {sglang_sum:.10e}", flush=True)
+                    print(f"  First 5: {[f'{v:.6e}' for v in sglang_first5]}", flush=True)
+                    
+                    sum_diff = abs(megatron_sum - sglang_sum)
+                    print(f"[DEBUG] Sum diff: {sum_diff:.6e}", flush=True)
+                    
+                    if sum_diff > 1e-6:
+                        print(f"[DEBUG] *** WARNING: Router weights DIFFER! ***", flush=True)
+                    else:
+                        print(f"[DEBUG] OK: Router weights match", flush=True)
+                else:
+                    print(f"[DEBUG] SGLang returned None for {hf_name}", flush=True)
+            else:
+                print(f"[DEBUG] SGLang API error: {response.status_code}", flush=True)
+        except Exception as e:
+            print(f"[DEBUG] Error querying SGLang: {e}", flush=True)
+        
+        print(f"{'@'*60}\n", flush=True)
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
