@@ -443,6 +443,11 @@ def train_one_step(
     if valid_step:
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        
+        # DEBUG: Check router weights consistency after optimizer step
+        import os
+        if os.environ.get("DEBUG_ROUTER_GRAD_SYNC", "0") == "1":
+            _debug_check_router_weights_after_optimizer_step(model, step_id)
 
         # Update learning rate.
         assert update_successful
@@ -462,6 +467,52 @@ def train_one_step(
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
     """Block forward pre-hook for certain configurations."""
     return args.use_distributed_optimizer and args.overlap_param_gather
+
+
+def _debug_check_router_weights_after_optimizer_step(model, step_id):
+    """DEBUG: Check if router weights are identical across all ranks after optimizer step."""
+    import torch.distributed as dist
+    import re
+    
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    
+    # Only check layer 0 router weight to limit output
+    target_layer = 0
+    found = False
+    
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            if "router" in name.lower() and "weight" in name.lower():
+                match = re.search(r'layers\.(\d+)\.', name)
+                if match and int(match.group(1)) == target_layer:
+                    try:
+                        # Get weight sum on each rank
+                        local_sum = param.data.float().sum().item()
+                        local_tensor = torch.tensor([local_sum], device=param.device)
+                        
+                        # All-gather to compare across ranks
+                        all_sums = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+                        dist.all_gather(all_sums, local_tensor)
+                        sums = [s.item() for s in all_sums]
+                        
+                        max_diff = max(sums) - min(sums)
+                        
+                        if rank == 0:
+                            print(f"\n[DEBUG_ROUTER_WEIGHTS][Step {step_id}] After optimizer.step():", flush=True)
+                            print(f"  Router '{name}' weight sums across ranks: {[f'{s:.10e}' for s in sums]}", flush=True)
+                            print(f"  max_diff: {max_diff:.6e}", flush=True)
+                            if max_diff > 1e-10:
+                                print(f"  *** WARNING: Router weights DIFFER across ranks! ***", flush=True)
+                            else:
+                                print(f"  OK: Router weights identical across ranks", flush=True)
+                        found = True
+                        break
+                    except Exception as e:
+                        if rank == 0:
+                            print(f"[DEBUG_ROUTER_WEIGHTS] Error checking '{name}': {e}", flush=True)
+        if found:
+            break
 
 
 def finalize_model_grads_with_empty_cache(*args, **kwargs):
