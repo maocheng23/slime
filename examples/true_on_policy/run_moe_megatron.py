@@ -230,6 +230,8 @@ def execute():
             "DEBUG_ROUTER_GRAD_SYNC": "1",  # Enable to see per-rank gradient values before/after all-reduce
             # Debug EP broadcast during weight sync
             "DEBUG_EP_BROADCAST": "1",  # Enable to check EP broadcast logic in weight sync
+            # Debug expert weight conversion during sync
+            "DEBUG_EXPERT_SYNC": "1",  # Enable to check Megatron->HF expert weight conversion
         },
     )
 

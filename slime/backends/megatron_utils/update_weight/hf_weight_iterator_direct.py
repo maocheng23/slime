@@ -35,13 +35,31 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
     def _convert_to_hf_named_tensors(self, megatron_full_params: Sequence[torch.Tensor], param_infos: list[ParamInfo]):
         hf_named_tensors = []
         rank = dist.get_rank()
+        
+        # DEBUG: Print expert weight info
+        import os
+        debug_expert_sync = os.environ.get("DEBUG_EXPERT_SYNC", "0") == "1"
+        expert_debug_done = False
+        
         for info, param in zip(param_infos, megatron_full_params, strict=False):
             # DEBUG: Print tensor shapes for QKV layers to verify all_gather worked
             if rank == 0 and "linear_qkv" in info.name and "layers.0." in info.name:
                 print(f"[DEBUG HF convert] {info.name}: shape={param.shape}, expected full shape after all_gather")
-            hf_named_tensors.extend(
-                convert_to_hf(self.args, self.model_name, info.name, param, self.quantization_config)
-            )
+            
+            converted = convert_to_hf(self.args, self.model_name, info.name, param, self.quantization_config)
+            
+            # DEBUG: Print converted expert weight info for layer 0
+            if debug_expert_sync and rank == 0 and "layers.0." in info.name and ".experts." in info.name and not expert_debug_done:
+                for hf_name, hf_tensor in converted:
+                    print(f"[DEBUG_EXPERT_SYNC][Rank {rank}] Megatron->HF conversion:", flush=True)
+                    print(f"  Megatron name: {info.name}", flush=True)
+                    print(f"  HF name: {hf_name}", flush=True)
+                    print(f"  Shape: {hf_tensor.shape}", flush=True)
+                    print(f"  Sum: {hf_tensor.float().sum().item():.6e}", flush=True)
+                    print(f"  First 5: {hf_tensor.flatten()[:5].tolist()}", flush=True)
+                expert_debug_done = True
+            
+            hf_named_tensors.extend(converted)
         return hf_named_tensors
 
 
