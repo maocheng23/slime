@@ -83,16 +83,42 @@ def _get_megatron_full_params(
     # broadcast params across ep ranks
     if ep_size > 1:
         handles = []
+        ep_group = mpu.get_expert_model_parallel_group()
+        ep_group_ranks = dist.get_process_group_ranks(ep_group)
+        
+        # DEBUG: Print EP group info
+        import os
+        if os.environ.get("DEBUG_EP_BROADCAST", "0") == "1" and rank == 0:
+            tp_group = mpu.get_tensor_model_parallel_group()
+            tp_group_ranks = dist.get_process_group_ranks(tp_group)
+            print(f"\n[DEBUG_EP_BROADCAST][Rank {rank}] *** GROUP COMPARISON ***", flush=True)
+            print(f"  EP group ranks: {ep_group_ranks}", flush=True)
+            print(f"  TP group ranks: {tp_group_ranks}", flush=True)
+            print(f"  EP == TP: {ep_group_ranks == tp_group_ranks}", flush=True)
+            if ep_group_ranks != tp_group_ranks:
+                print(f"  *** WARNING: EP and TP groups are DIFFERENT! This may cause weight sync issues! ***", flush=True)
+        
+        debug_ep_broadcast = False
+        
         for info, param in zip(megatron_local_param_infos, params, strict=False):
             if ".experts." in info.name:
                 src_rank = (
                     info.src_rank
-                    if info.src_rank in dist.get_process_group_ranks(mpu.get_expert_model_parallel_group())
+                    if info.src_rank in ep_group_ranks
                     else rank
                 )
+                
+                # DEBUG: Print broadcast info for layer 0 expert weights
+                if os.environ.get("DEBUG_EP_BROADCAST", "0") == "1" and "layers.0." in info.name and not debug_ep_broadcast:
+                    print(f"[DEBUG_EP_BROADCAST][Rank {rank}] Expert param '{info.name}':", flush=True)
+                    print(f"  info.src_rank={info.src_rank}, ep_group_ranks={ep_group_ranks}", flush=True)
+                    print(f"  broadcast src_rank={src_rank}", flush=True)
+                    print(f"  param.shape={param.shape}, param.sum={param.float().sum().item():.6e}", flush=True)
+                    debug_ep_broadcast = True
+                
                 handles.append(
                     torch.distributed.broadcast(
-                        param, src=src_rank, group=mpu.get_expert_model_parallel_group(), async_op=True
+                        param, src=src_rank, group=ep_group, async_op=True
                     )
                 )
         for handle in handles:

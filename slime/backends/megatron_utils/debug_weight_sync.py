@@ -9,6 +9,7 @@ Usage:
 
 import re
 import logging
+import numpy as np
 import torch
 import torch.distributed as dist
 import ray
@@ -17,6 +18,16 @@ from typing import Optional, List, Dict, Tuple
 from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
+
+
+def _process_sglang_return(ret):
+    """Process return value from SGLang get_weights_by_name API."""
+    if ret is None:
+        return None
+    if isinstance(ret, list) and len(ret) >= 1:
+        # DP case: multiple returns, take the first one
+        return np.array(ret[0])
+    return np.array(ret)
 
 
 def debug_compare_all_weights(
@@ -93,6 +104,29 @@ def debug_compare_all_weights(
     return results
 
 
+def _get_sglang_weight(server_host: str, server_port: int, hf_name: str, verbose: bool = False):
+    """Get weight from SGLang via HTTP API."""
+    try:
+        # Use GET with json parameter (as shown in SGLang tests)
+        response = requests.get(
+            f"http://{server_host}:{server_port}/get_weights_by_name",
+            json={"name": hf_name, "truncate_size": -1},
+            timeout=60
+        )
+        if response.status_code == 200:
+            sglang_data = response.json()
+            processed = _process_sglang_return(sglang_data)
+            if processed is not None:
+                return torch.tensor(processed, dtype=torch.float32)
+        else:
+            if verbose:
+                print(f"[SKIP] SGLang API error {response.status_code} for {hf_name}")
+    except Exception as e:
+        if verbose:
+            print(f"[SKIP] Error getting SGLang weight {hf_name}: {e}")
+    return None
+
+
 def _compare_single_weight(
     model: List[torch.nn.Module],
     megatron_pattern: str,
@@ -119,31 +153,15 @@ def _compare_single_weight(
         return
     
     # Get SGLang weight
-    try:
-        response = requests.post(
-            f"http://{server_host}:{server_port}/get_weights_by_name",
-            json={"name": hf_name, "truncate_size": -1},
-            timeout=30
-        )
-        if response.status_code == 200:
-            sglang_data = response.json()
-            if sglang_data is not None:
-                sglang_weight = torch.tensor(sglang_data, dtype=torch.float32)
-                
-                meg_sum = megatron_weight.sum().item()
-                sgl_sum = sglang_weight.sum().item()
-                diff = abs(meg_sum - sgl_sum)
-                
-                results[hf_name] = (meg_sum, sgl_sum, diff)
-            else:
-                if verbose:
-                    print(f"[SKIP] SGLang returned None for {hf_name}")
-        else:
-            if verbose:
-                print(f"[SKIP] SGLang API error {response.status_code} for {hf_name}")
-    except Exception as e:
+    sglang_weight = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+    if sglang_weight is not None:
+        meg_sum = megatron_weight.sum().item()
+        sgl_sum = sglang_weight.sum().item()
+        diff = abs(meg_sum - sgl_sum)
+        results[hf_name] = (meg_sum, sgl_sum, diff)
+    else:
         if verbose:
-            print(f"[SKIP] Error getting SGLang weight {hf_name}: {e}")
+            print(f"[SKIP] SGLang returned None for {hf_name}")
 
 
 def _compare_expert_weights(
@@ -189,54 +207,43 @@ def _compare_expert_weights(
     # SGLang expert name pattern: model.layers.{layer}.mlp.experts.{expert_id}.gate_up_proj.weight
     for expert_id, megatron_w1 in sorted(local_experts_w1.items()):
         hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_up_proj.weight"
-        try:
-            response = requests.post(
-                f"http://{server_host}:{server_port}/get_weights_by_name",
-                json={"name": hf_name, "truncate_size": -1},
-                timeout=30
-            )
-            if response.status_code == 200:
-                sglang_data = response.json()
-                if sglang_data is not None:
-                    sglang_w1 = torch.tensor(sglang_data, dtype=torch.float32)
-                    
-                    meg_sum = megatron_w1.sum().item()
-                    sgl_sum = sglang_w1.sum().item()
-                    diff = abs(meg_sum - sgl_sum)
-                    
-                    results[hf_name] = (meg_sum, sgl_sum, diff)
-                    
-                    if diff > 1e-5 and verbose:
-                        print(f"  [MISMATCH] Expert {expert_id} fc1:")
-                        print(f"    Megatron shape: {megatron_w1.shape}, sum: {meg_sum:.10e}")
-                        print(f"    SGLang shape:   {sglang_w1.shape}, sum: {sgl_sum:.10e}")
-                        print(f"    First 5 values (Megatron): {megatron_w1.flatten()[:5].tolist()}")
-                        print(f"    First 5 values (SGLang):   {sglang_w1.flatten()[:5].tolist()}")
-        except Exception as e:
+        sglang_w1 = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+        
+        if sglang_w1 is not None:
+            meg_sum = megatron_w1.sum().item()
+            sgl_sum = sglang_w1.sum().item()
+            diff = abs(meg_sum - sgl_sum)
+            
+            results[hf_name] = (meg_sum, sgl_sum, diff)
+            
+            if diff > 1e-5 and verbose:
+                print(f"  [MISMATCH] Expert {expert_id} fc1:")
+                print(f"    Megatron shape: {megatron_w1.shape}, sum: {meg_sum:.10e}")
+                print(f"    SGLang shape:   {sglang_w1.shape}, sum: {sgl_sum:.10e}")
+                print(f"    First 5 values (Megatron): {megatron_w1.flatten()[:5].tolist()}")
+                print(f"    First 5 values (SGLang):   {sglang_w1.flatten()[:5].tolist()}")
+        else:
             if verbose:
-                print(f"  [ERROR] Cannot get SGLang expert {expert_id} fc1: {e}")
+                print(f"  [SKIP] Cannot get SGLang expert {expert_id} fc1")
     
     for expert_id, megatron_w2 in sorted(local_experts_w2.items()):
         hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight"
-        try:
-            response = requests.post(
-                f"http://{server_host}:{server_port}/get_weights_by_name",
-                json={"name": hf_name, "truncate_size": -1},
-                timeout=30
-            )
-            if response.status_code == 200:
-                sglang_data = response.json()
-                if sglang_data is not None:
-                    sglang_w2 = torch.tensor(sglang_data, dtype=torch.float32)
-                    
-                    meg_sum = megatron_w2.sum().item()
-                    sgl_sum = sglang_w2.sum().item()
-                    diff = abs(meg_sum - sgl_sum)
-                    
-                    results[hf_name] = (meg_sum, sgl_sum, diff)
-        except Exception as e:
+        sglang_w2 = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+        
+        if sglang_w2 is not None:
+            meg_sum = megatron_w2.sum().item()
+            sgl_sum = sglang_w2.sum().item()
+            diff = abs(meg_sum - sgl_sum)
+            
+            results[hf_name] = (meg_sum, sgl_sum, diff)
+            
+            if diff > 1e-5 and verbose:
+                print(f"  [MISMATCH] Expert {expert_id} fc2:")
+                print(f"    Megatron shape: {megatron_w2.shape}, sum: {meg_sum:.10e}")
+                print(f"    SGLang shape:   {sglang_w2.shape}, sum: {sgl_sum:.10e}")
+        else:
             if verbose:
-                print(f"  [ERROR] Cannot get SGLang expert {expert_id} fc2: {e}")
+                print(f"  [SKIP] Cannot get SGLang expert {expert_id} fc2")
 
 
 def debug_check_expert_weight_shapes(model: List[torch.nn.Module], layer_idx: int = 0):

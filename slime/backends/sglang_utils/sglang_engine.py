@@ -333,6 +333,14 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response.json()["weight_version"]
 
+    def get_server_info(self):
+        """Return server host and port for debugging."""
+        return {
+            "server_host": self.server_host,
+            "server_port": self.server_port,
+            "node_rank": self.node_rank,
+        }
+
     def release_memory_occupation(self):
         self.flush_cache()
         return self._make_request("release_memory_occupation")
