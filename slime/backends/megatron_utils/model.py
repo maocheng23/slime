@@ -345,6 +345,7 @@ def train_one_step(
             Output tensor(s) and the loss function, which returns
             (loss, num_elems, {"keys": list[str], "values": torch.Tensor}).
         """
+        import os  # Import here to avoid closure issues with Ray serialization
 
         # Get the batch.
         batch = get_batch(
