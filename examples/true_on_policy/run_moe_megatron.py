@@ -40,7 +40,7 @@ def execute():
     )
     data_parallel_size = NUM_GPUS // tensor_parallel_size
 
-    global_batch_size = 2 if MODE == "debug_one_sample" else 128
+    global_batch_size = 2 if MODE == "debug_one_sample" else 32
     if global_batch_size % data_parallel_size != 0:
         # Megatron requires global_batch_size divisible by micro_batch_size * data_parallel_size
         global_batch_size = math.ceil(global_batch_size / data_parallel_size) * data_parallel_size
@@ -71,8 +71,8 @@ def execute():
         "--rollout-shuffle "
         "--rm-type math "
         f"--num-rollout {3 if MODE == 'debug_one_sample' else 3000} "  # Need at least 2-3 steps to observe divergence pattern
-        f"--rollout-batch-size {2 if MODE == 'debug_one_sample' else 16} "
-        f"--n-samples-per-prompt {2 if MODE == 'debug_one_sample' else 8} "
+        f"--rollout-batch-size {2 if MODE == 'debug_one_sample' else 8} "
+        f"--n-samples-per-prompt {2 if MODE == 'debug_one_sample' else 4} "
         f"--rollout-max-response-len {1024 if MODE == 'debug_one_sample' else 1024} "
         "--rollout-temperature 1 "
         # temp remove this to make test easier
@@ -82,14 +82,14 @@ def execute():
     )
 
     eval_args = ""
-    if MODE == "normal":
-        eval_args = (
-            f"--eval-interval {2 if MODE == 'debug_one_sample' else 10} "
-            "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
-            "--n-samples-per-eval-prompt 1 "
-            "--eval-max-response-len 1024 "
-            "--eval-top-k 1 "
-        )
+    # if MODE == "normal":
+    #     eval_args = (
+    #         f"--eval-interval {2 if MODE == 'debug_one_sample' else 10} "
+    #         "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
+    #         "--n-samples-per-eval-prompt 1 "
+    #         "--eval-max-response-len 1024 "
+    #         "--eval-top-k 1 "
+    #     )
 
     grpo_args = (
         "--advantage-estimator grpo "
@@ -193,6 +193,8 @@ def execute():
         "NCCL_NVLS_ENABLE": "0",
         # Enable deterministic all-reduce in Megatron to match SGLang's tree_all_reduce_sum
         "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
+        # DEBUG: Uncomment to get accurate CUDA error location (slows down execution significantly)
+        # "CUDA_LAUNCH_BLOCKING": "1",  # ENABLED: Finding the real source of CUDA illegal memory access
     }
 
     train_args = (
@@ -225,7 +227,7 @@ def execute():
             "DEBUG_GRAD_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
             # Debug gradient sync verification - enable to check if all-reduce is working
             "DEBUG_GRAD_SYNC": "1",  # Enable to verify gradients are identical across ranks after all-reduce
-            "DEBUG_GRAD_ALLREDUCE": "1",  # Enable to see per-rank gradient values before/after all-reduce
+            "DEBUG_ROUTER_GRAD_SYNC": "1",  # Enable to see per-rank gradient values before/after all-reduce
         },
     )
 
