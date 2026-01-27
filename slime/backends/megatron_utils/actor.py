@@ -476,7 +476,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 print("[DEBUG] update_weights completed, continuing to next phase...")
             
             # Check weight sync if enabled
-            if getattr(self.args, 'check_weight_update_equal', False):
+            if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1":
                 if dist.get_rank() == 0:
                     print("[DEBUG] Running weight check after update_weights...", flush=True)
                     try:
@@ -487,6 +487,13 @@ class MegatronTrainRayActor(TrainRayActor):
                         print("[DEBUG] Weight snapshot successful", flush=True)
                     except Exception as e:
                         print(f"[DEBUG] Weight check error: {e}", flush=True)
+                
+                # DEBUG: Compare Megatron vs SGLang weights (including experts)
+                try:
+                    from .debug_weight_sync import debug_compare_all_weights
+                    debug_compare_all_weights(self.model, rollout_engines, layer_idx=0, verbose=True)
+                except Exception as e:
+                    print(f"[DEBUG] Weight comparison error: {e}", flush=True)
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
