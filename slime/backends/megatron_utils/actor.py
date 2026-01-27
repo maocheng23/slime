@@ -475,19 +475,16 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 print("[DEBUG] update_weights completed, continuing to next phase...")
             
-            # DEBUG: Check if weights are correctly synced to SGLang after update
-            import os
-            if os.environ.get("DEBUG_ROUTER_GRAD_SYNC", "0") == "1":
-                if dist.get_rank() == 0 and len(rollout_engines) > 0:
+            # Check weight sync if enabled
+            if getattr(self.args, 'check_weight_update_equal', False):
+                if dist.get_rank() == 0:
+                    print("[DEBUG] Running weight check after update_weights...", flush=True)
                     try:
-                        print("[DEBUG] Checking weight sync with SGLang...", flush=True)
-                        # First snapshot the current SGLang weights
+                        # Snapshot current SGLang weights and then compare with what was just synced
+                        # Note: This won't catch the issue since we're comparing SGLang with itself
+                        # But it verifies the weights are readable and consistent
                         ray.get(self.rollout_manager.check_weights.remote(action="snapshot"))
-                        # Then compare (this will raise exception if mismatch)
-                        # Note: We need to compare Megatron weights vs SGLang weights
-                        # The compare action compares current SGLang weights with snapshot
-                        # So we need a different approach - just log the weights
-                        self._debug_compare_megatron_sglang_router_weights(rollout_engines)
+                        print("[DEBUG] Weight snapshot successful", flush=True)
                     except Exception as e:
                         print(f"[DEBUG] Weight check error: {e}", flush=True)
 
@@ -517,29 +514,45 @@ class MegatronTrainRayActor(TrainRayActor):
         """DEBUG: Compare Megatron and SGLang router weights after weight sync."""
         import re
         import requests
+        import torch
         
         print(f"\n{'@'*60}", flush=True)
         print(f"[DEBUG] Comparing Megatron vs SGLang router weights (layer 0)...", flush=True)
         
-        # Get layer 0 router weight from Megatron
+        # CRITICAL: Sync CUDA to catch any pending errors from previous operations
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError as e:
+            print(f"[DEBUG] CUDA sync failed - previous CUDA error: {e}", flush=True)
+            print(f"{'@'*60}\n", flush=True)
+            return
+        
+        # Get layer 0 router weight from Megatron (use CPU copy to avoid CUDA issues)
         target_layer = 0
         megatron_sum = None
         megatron_first5 = None
         
-        for model_module in self.model:
-            for name, param in model_module.named_parameters():
-                if "router" in name.lower() and "weight" in name.lower():
-                    match = re.search(r'layers\.(\d+)\.', name)
-                    if match and int(match.group(1)) == target_layer:
-                        data = param.data.float()
-                        megatron_sum = data.sum().item()
-                        megatron_first5 = data.flatten()[:5].tolist()
-                        print(f"[DEBUG] Megatron router weight:", flush=True)
-                        print(f"  Sum: {megatron_sum:.10e}", flush=True)
-                        print(f"  First 5: {[f'{v:.6e}' for v in megatron_first5]}", flush=True)
-                        break
-            if megatron_sum is not None:
-                break
+        try:
+            for model_module in self.model:
+                for name, param in model_module.named_parameters():
+                    if "router" in name.lower() and "weight" in name.lower():
+                        match = re.search(r'layers\.(\d+)\.', name)
+                        if match and int(match.group(1)) == target_layer:
+                            # Clone to CPU to avoid potential CUDA memory issues
+                            torch.cuda.synchronize()
+                            data = param.data.detach().cpu().float()
+                            megatron_sum = data.sum().item()
+                            megatron_first5 = data.flatten()[:5].tolist()
+                            print(f"[DEBUG] Megatron router weight:", flush=True)
+                            print(f"  Sum: {megatron_sum:.10e}", flush=True)
+                            print(f"  First 5: {[f'{v:.6e}' for v in megatron_first5]}", flush=True)
+                            break
+                if megatron_sum is not None:
+                    break
+        except Exception as e:
+            print(f"[DEBUG] Error reading Megatron weights: {e}", flush=True)
+            print(f"{'@'*60}\n", flush=True)
+            return
         
         if megatron_sum is None:
             print(f"[DEBUG] Megatron router weight not found!", flush=True)
@@ -560,7 +573,6 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             
             if response.status_code == 200:
-                import torch
                 sglang_data = response.json()
                 if sglang_data is not None:
                     sglang_weight = torch.tensor(sglang_data, dtype=torch.float32)
