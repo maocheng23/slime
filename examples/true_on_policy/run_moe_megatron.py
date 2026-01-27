@@ -221,6 +221,7 @@ def execute():
             "DEBUG_GRAD_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
             # Debug gradient sync verification - enable to check if all-reduce is working
             "DEBUG_GRAD_SYNC": "1",  # Enable to verify gradients are identical across ranks after all-reduce
+            "DEBUG_GRAD_ALLREDUCE": "1",  # Enable to see per-rank gradient values before/after all-reduce
         },
     )
 
