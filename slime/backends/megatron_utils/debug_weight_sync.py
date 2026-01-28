@@ -15,10 +15,189 @@ import torch
 import torch.distributed as dist
 import ray
 import requests
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple, Mapping
 from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class WeightComparisonResult:
+    """Comprehensive weight comparison result."""
+    name: str
+    megatron_dtype: str
+    sglang_dtype: str
+    megatron_shape: tuple
+    sglang_shape: tuple
+    # All metrics computed in float64 for maximum precision
+    megatron_sum: float
+    sglang_sum: float
+    sum_diff: float
+    megatron_norm: float  # L2 norm
+    sglang_norm: float
+    norm_diff: float
+    abs_diff_sum: float  # sum of |meg - sgl|
+    max_abs_diff: float  # max |meg - sgl|
+    rel_diff: float  # abs_diff_sum / max(|meg_sum|, |sgl_sum|, 1e-10)
+    is_match: bool  # True if weights are essentially equal
+    
+    def __str__(self):
+        status = "OK" if self.is_match else "MISMATCH"
+        return (
+            f"[{status}] {self.name}\n"
+            f"  Megatron: dtype={self.megatron_dtype}, shape={self.megatron_shape}\n"
+            f"  SGLang:   dtype={self.sglang_dtype}, shape={self.sglang_shape}\n"
+            f"  Sum:      Meg={self.megatron_sum:.10e}, SGL={self.sglang_sum:.10e}, diff={self.sum_diff:.6e}\n"
+            f"  Norm:     Meg={self.megatron_norm:.10e}, SGL={self.sglang_norm:.10e}, diff={self.norm_diff:.6e}\n"
+            f"  AbsDiff:  sum={self.abs_diff_sum:.6e}, max={self.max_abs_diff:.6e}, rel={self.rel_diff:.6e}"
+        )
+
+
+def compare_weights_detailed(
+    name: str,
+    megatron_tensor: torch.Tensor,
+    sglang_tensor: torch.Tensor,
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
+) -> WeightComparisonResult:
+    """
+    Compare two weight tensors with comprehensive metrics.
+    
+    Both tensors are converted to float64 for comparison to avoid precision issues.
+    
+    Args:
+        name: Weight name for identification
+        megatron_tensor: Weight from Megatron (can be any dtype, any device)
+        sglang_tensor: Weight from SGLang (can be any dtype, any device)
+        rtol: Relative tolerance for determining match
+        atol: Absolute tolerance for determining match
+    
+    Returns:
+        WeightComparisonResult with all comparison metrics
+    """
+    # Record original dtypes
+    meg_dtype = str(megatron_tensor.dtype)
+    sgl_dtype = str(sglang_tensor.dtype)
+    meg_shape = tuple(megatron_tensor.shape)
+    sgl_shape = tuple(sglang_tensor.shape)
+    
+    # Convert both to float64 on CPU for maximum precision comparison
+    meg_f64 = megatron_tensor.detach().cpu().to(torch.float64)
+    sgl_f64 = sglang_tensor.detach().cpu().to(torch.float64)
+    
+    # Compute metrics
+    meg_sum = meg_f64.sum().item()
+    sgl_sum = sgl_f64.sum().item()
+    sum_diff = abs(meg_sum - sgl_sum)
+    
+    meg_norm = meg_f64.norm().item()
+    sgl_norm = sgl_f64.norm().item()
+    norm_diff = abs(meg_norm - sgl_norm)
+    
+    # Element-wise comparison (only if shapes match)
+    if meg_shape == sgl_shape:
+        diff = (meg_f64 - sgl_f64).abs()
+        abs_diff_sum = diff.sum().item()
+        max_abs_diff = diff.max().item()
+    else:
+        abs_diff_sum = float('inf')
+        max_abs_diff = float('inf')
+    
+    # Relative difference
+    scale = max(abs(meg_sum), abs(sgl_sum), 1e-10)
+    rel_diff = abs_diff_sum / (meg_f64.numel() * scale) if meg_shape == sgl_shape else float('inf')
+    
+    # Determine if match using both absolute and relative criteria
+    is_match = (
+        meg_shape == sgl_shape and
+        abs_diff_sum < atol * meg_f64.numel() + rtol * scale * meg_f64.numel()
+    )
+    
+    return WeightComparisonResult(
+        name=name,
+        megatron_dtype=meg_dtype,
+        sglang_dtype=sgl_dtype,
+        megatron_shape=meg_shape,
+        sglang_shape=sgl_shape,
+        megatron_sum=meg_sum,
+        sglang_sum=sgl_sum,
+        sum_diff=sum_diff,
+        megatron_norm=meg_norm,
+        sglang_norm=sgl_norm,
+        norm_diff=norm_diff,
+        abs_diff_sum=abs_diff_sum,
+        max_abs_diff=max_abs_diff,
+        rel_diff=rel_diff,
+        is_match=is_match,
+    )
+
+
+def print_weight_comparison(result: WeightComparisonResult, verbose: bool = True):
+    """Print weight comparison result with optional verbosity."""
+    if result.is_match:
+        if verbose:
+            print(f"  OK: {result.name}")
+            print(f"    dtype: Meg={result.megatron_dtype}, SGL={result.sglang_dtype}")
+            print(f"    shape: {result.megatron_shape}")
+            print(f"    sum_diff={result.sum_diff:.6e}, norm_diff={result.norm_diff:.6e}, "
+                  f"abs_diff_sum={result.abs_diff_sum:.6e}, max_abs_diff={result.max_abs_diff:.6e}")
+    else:
+        print(f"  MISMATCH: {result.name}")
+        print(f"    Megatron: dtype={result.megatron_dtype}, shape={result.megatron_shape}")
+        print(f"    SGLang:   dtype={result.sglang_dtype}, shape={result.sglang_shape}")
+        print(f"    Sum:      Meg={result.megatron_sum:.10e}, SGL={result.sglang_sum:.10e}, diff={result.sum_diff:.6e}")
+        print(f"    Norm:     Meg={result.megatron_norm:.10e}, SGL={result.sglang_norm:.10e}, diff={result.norm_diff:.6e}")
+        print(f"    AbsDiff:  sum={result.abs_diff_sum:.6e}, max={result.max_abs_diff:.6e}, rel={result.rel_diff:.6e}")
+
+
+def debug_compare_tensors(
+    name: str,
+    tensor_a: torch.Tensor,
+    tensor_b: torch.Tensor,
+    label_a: str = "TensorA",
+    label_b: str = "TensorB",
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
+) -> WeightComparisonResult:
+    """
+    Convenient function to compare two tensors anywhere in the code.
+    
+    Usage:
+        from slime.backends.megatron_utils.debug_weight_sync import debug_compare_tensors
+        debug_compare_tensors("my_weight", megatron_tensor, sglang_tensor)
+    
+    Args:
+        name: Name for this comparison (for logging)
+        tensor_a: First tensor (typically from Megatron)
+        tensor_b: Second tensor (typically from SGLang)
+        label_a: Label for tensor_a in output
+        label_b: Label for tensor_b in output
+        rtol: Relative tolerance
+        atol: Absolute tolerance
+    
+    Returns:
+        WeightComparisonResult with detailed comparison
+    """
+    result = compare_weights_detailed(name, tensor_a, tensor_b, rtol=rtol, atol=atol)
+    
+    # Print detailed comparison
+    status = "OK" if result.is_match else "MISMATCH"
+    print(f"\n[DEBUG TENSOR COMPARE] [{status}] {name}")
+    print(f"  {label_a}: dtype={result.megatron_dtype}, shape={result.megatron_shape}")
+    print(f"  {label_b}: dtype={result.sglang_dtype}, shape={result.sglang_shape}")
+    print(f"  Sum:      {label_a}={result.megatron_sum:.10e}, {label_b}={result.sglang_sum:.10e}, diff={result.sum_diff:.6e}")
+    print(f"  Norm:     {label_a}={result.megatron_norm:.10e}, {label_b}={result.sglang_norm:.10e}, diff={result.norm_diff:.6e}")
+    print(f"  AbsDiff:  sum={result.abs_diff_sum:.6e}, max={result.max_abs_diff:.6e}, rel={result.rel_diff:.6e}")
+    
+    # Print first few values for debugging
+    if result.megatron_shape == result.sglang_shape:
+        a_flat = tensor_a.detach().cpu().flatten()[:5].to(torch.float64).tolist()
+        b_flat = tensor_b.detach().cpu().flatten()[:5].to(torch.float64).tolist()
+        print(f"  First 5:  {label_a}={a_flat}")
+        print(f"            {label_b}={b_flat}")
+    
+    return result
 
 
 def _process_sglang_return(ret):
@@ -107,8 +286,10 @@ def debug_compare_weights_from_dict(
         print(f"  Found {len(layer_weights)} weights")
         for name, tensor in sorted(layer_weights.items()):
             try:
-                weight_sum = tensor.float().sum().item() if tensor.is_cuda else tensor.sum().item()
-                print(f"    {name}: shape={list(tensor.shape)}, sum={weight_sum:.10e}")
+                # Use float64 for maximum precision in reporting
+                weight_sum = tensor.to(torch.float64).sum().item()
+                weight_norm = tensor.to(torch.float64).norm().item()
+                print(f"    {name}: dtype={tensor.dtype}, shape={list(tensor.shape)}, sum={weight_sum:.10e}, norm={weight_norm:.10e}")
             except Exception as e:
                 print(f"    {name}: ERROR - {e}")
         
@@ -123,42 +304,50 @@ def debug_compare_weights_from_dict(
             f"module.module.decoder.layers.{layer_idx}.mlp.shared_experts.linear_fc2.weight": f"model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight",
         }
         
-        # Check regular weights
+        # Check regular weights with detailed comparison
         print("\n[Step 3] Comparing regular weights...")
         for megatron_name, hf_name in weight_mappings.items():
             if megatron_name in megatron_weights:
                 megatron_tensor = megatron_weights[megatron_name]
-                meg_sum = megatron_tensor.float().sum().item() if megatron_tensor.is_cuda else megatron_tensor.sum().item()
-                
                 sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+                
                 if sglang_tensor is not None:
-                    sgl_sum = sglang_tensor.sum().item()
-                    diff = abs(meg_sum - sgl_sum)
-                    results[hf_name] = (meg_sum, sgl_sum, diff)
-                    status = "OK" if diff < 1e-5 else "MISMATCH"
-                    print(f"  {status}: {megatron_name} -> {hf_name}")
-                    print(f"    Megatron={meg_sum:.6e}, SGLang={sgl_sum:.6e}, diff={diff:.6e}")
+                    result = compare_weights_detailed(hf_name, megatron_tensor, sglang_tensor)
+                    results[hf_name] = result
+                    print_weight_comparison(result, verbose)
                 else:
                     print(f"  SKIP: {hf_name} (SGLang returned None)")
             else:
                 if verbose:
                     print(f"  SKIP: {megatron_name} not in Megatron weights")
         
-        # Check expert weights
+        # Check expert weights with detailed comparison
         print("\n[Step 4] Comparing expert weights...")
         _compare_expert_weights_from_dict(megatron_weights, layer_idx, server_host, server_port, results, verbose)
         
-        # Summary
+        # Summary with comprehensive metrics
         print(f"\n{'='*80}")
         print(f"[SUMMARY] Weight comparison results:")
         has_error = False
-        for name, (meg_sum, sgl_sum, diff) in results.items():
-            if diff >= 1e-5:
-                has_error = True
-                print(f"  MISMATCH: {name}")
-                print(f"    Megatron sum: {meg_sum:.10e}")
-                print(f"    SGLang sum:   {sgl_sum:.10e}")
-                print(f"    Diff:         {diff:.6e}")
+        for name, result in results.items():
+            if isinstance(result, WeightComparisonResult):
+                if not result.is_match:
+                    has_error = True
+                    print(f"\n  MISMATCH: {name}")
+                    print(f"    Megatron: dtype={result.megatron_dtype}, shape={result.megatron_shape}")
+                    print(f"    SGLang:   dtype={result.sglang_dtype}, shape={result.sglang_shape}")
+                    print(f"    Sum:      Meg={result.megatron_sum:.10e}, SGL={result.sglang_sum:.10e}, diff={result.sum_diff:.6e}")
+                    print(f"    Norm:     Meg={result.megatron_norm:.10e}, SGL={result.sglang_norm:.10e}, diff={result.norm_diff:.6e}")
+                    print(f"    AbsDiff:  sum={result.abs_diff_sum:.6e}, max={result.max_abs_diff:.6e}, rel={result.rel_diff:.6e}")
+            else:
+                # Legacy format (tuple)
+                meg_sum, sgl_sum, diff = result
+                if diff >= 1e-5:
+                    has_error = True
+                    print(f"  MISMATCH: {name}")
+                    print(f"    Megatron sum: {meg_sum:.10e}")
+                    print(f"    SGLang sum:   {sgl_sum:.10e}")
+                    print(f"    Diff:         {diff:.6e}")
         
         if has_error:
             print(f"\n*** WARNING: Weight mismatch detected! ***")
@@ -182,12 +371,12 @@ def _compare_expert_weights_from_dict(
     results: Dict,
     verbose: bool,
 ):
-    """Compare expert weights from CPU dict.
+    """Compare expert weights from CPU dict with comprehensive metrics.
     
     Megatron format: module.module.decoder.layers.{layer}.mlp.experts.linear_fc1.weight{expert_id}
     HF format:       model.layers.{layer}.mlp.experts.{expert_id}.gate_up_proj.weight
     
-    Note: Megatron's linear_fc1 shape is [intermediate_size, hidden_size] which combines gate+up
+    Note: Megatron's linear_fc1 shape is [2*intermediate_size, hidden_size] which combines gate+up
           HF's gate_up_proj shape is [2*intermediate_size, hidden_size]
     """
     # Find expert weights in megatron_weights
@@ -215,48 +404,45 @@ def _compare_expert_weights_from_dict(
     print(f"  Found {len(expert_weights_fc1)} experts for fc1 (gate_up_proj)")
     print(f"  Found {len(expert_weights_fc2)} experts for fc2 (down_proj)")
     
-    # Compare fc1 (gate_up_proj)
+    # Compare fc1 (gate_up_proj) with detailed metrics
     for expert_id in sorted(expert_weights_fc1.keys()):
         megatron_name, megatron_tensor = expert_weights_fc1[expert_id]
         hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_up_proj.weight"
         
-        meg_sum = megatron_tensor.float().sum().item() if megatron_tensor.is_cuda else megatron_tensor.sum().item()
-        
+        # Try to get the fused weight first (gate_up_proj)
         sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose)
-        if sglang_tensor is not None:
-            sgl_sum = sglang_tensor.sum().item()
-            diff = abs(meg_sum - sgl_sum)
-            results[hf_name] = (meg_sum, sgl_sum, diff)
+        
+        if sglang_tensor is None:
+            # Fallback: SGLang might store as separate gate_proj and up_proj
+            gate_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight"
+            up_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight"
+            gate_tensor = _get_sglang_weight(server_host, server_port, gate_name, verbose)
+            up_tensor = _get_sglang_weight(server_host, server_port, up_name, verbose)
             
-            if diff > 1e-5:
-                print(f"  MISMATCH: Expert {expert_id} gate_up_proj (fc1)")
-                print(f"    Megatron: {megatron_name}, shape={list(megatron_tensor.shape)}, sum={meg_sum:.10e}")
-                print(f"    SGLang:   {hf_name}, shape={list(sglang_tensor.shape)}, sum={sgl_sum:.10e}")
-            elif verbose:
-                print(f"  OK: Expert {expert_id} gate_up_proj (diff={diff:.6e})")
-        else:
-            if verbose:
-                print(f"  SKIP: Expert {expert_id} gate_up_proj (SGLang returned None)")
+            if gate_tensor is not None and up_tensor is not None:
+                # Concatenate gate and up for comparison
+                sglang_tensor = torch.cat([gate_tensor, up_tensor], dim=0)
+                hf_name = f"{gate_name} + {up_name}"
+            else:
+                if verbose:
+                    print(f"  SKIP: Expert {expert_id} gate_up_proj (SGLang returned None for both formats)")
+                continue
+        
+        # Use detailed comparison
+        result = compare_weights_detailed(hf_name, megatron_tensor, sglang_tensor)
+        results[hf_name] = result
+        print_weight_comparison(result, verbose)
     
-    # Compare fc2 (down_proj)
+    # Compare fc2 (down_proj) with detailed metrics
     for expert_id in sorted(expert_weights_fc2.keys()):
         megatron_name, megatron_tensor = expert_weights_fc2[expert_id]
         hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight"
         
-        meg_sum = megatron_tensor.float().sum().item() if megatron_tensor.is_cuda else megatron_tensor.sum().item()
-        
         sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose)
         if sglang_tensor is not None:
-            sgl_sum = sglang_tensor.sum().item()
-            diff = abs(meg_sum - sgl_sum)
-            results[hf_name] = (meg_sum, sgl_sum, diff)
-            
-            if diff > 1e-5:
-                print(f"  MISMATCH: Expert {expert_id} down_proj (fc2)")
-                print(f"    Megatron: {megatron_name}, shape={list(megatron_tensor.shape)}, sum={meg_sum:.10e}")
-                print(f"    SGLang:   {hf_name}, shape={list(sglang_tensor.shape)}, sum={sgl_sum:.10e}")
-            elif verbose:
-                print(f"  OK: Expert {expert_id} down_proj (diff={diff:.6e})")
+            result = compare_weights_detailed(hf_name, megatron_tensor, sglang_tensor)
+            results[hf_name] = result
+            print_weight_comparison(result, verbose)
         else:
             if verbose:
                 print(f"  SKIP: Expert {expert_id} down_proj (SGLang returned None)")
@@ -414,8 +600,26 @@ def debug_compare_all_weights(
     return results
 
 
-def _get_sglang_weight(server_host: str, server_port: int, hf_name: str, verbose: bool = False):
-    """Get weight from SGLang via HTTP API."""
+def _get_sglang_weight(
+    server_host: str, 
+    server_port: int, 
+    hf_name: str, 
+    verbose: bool = False,
+    target_dtype: Optional[torch.dtype] = None,
+) -> Optional[torch.Tensor]:
+    """Get weight from SGLang via HTTP API.
+    
+    Args:
+        server_host: SGLang server host
+        server_port: SGLang server port
+        hf_name: HuggingFace format weight name
+        verbose: Print debug info
+        target_dtype: If provided, convert result to this dtype. 
+                     If None, use float64 for maximum precision.
+    
+    Returns:
+        Weight tensor or None if failed
+    """
     try:
         # Use GET with json parameter (as shown in SGLang tests)
         response = requests.get(
@@ -427,7 +631,9 @@ def _get_sglang_weight(server_host: str, server_port: int, hf_name: str, verbose
             sglang_data = response.json()
             processed = _process_sglang_return(sglang_data)
             if processed is not None:
-                return torch.tensor(processed, dtype=torch.float32)
+                # Use float64 by default for precision, or target_dtype if specified
+                dtype = target_dtype if target_dtype is not None else torch.float64
+                return torch.tensor(processed, dtype=dtype)
         else:
             if verbose:
                 print(f"[SKIP] SGLang API error {response.status_code} for {hf_name}")
