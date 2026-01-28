@@ -43,6 +43,7 @@ def debug_compare_weights_from_dict(
     
     Args:
         megatron_weights: Dict from weights_backuper.get("actor"), already on CPU
+                         Names are in Megatron format: module.module.decoder.layers.X.mlp.router.weight
         rollout_engines: List of SGLang engine handles
         layer_idx: Which layer to compare
         verbose: Print detailed info
@@ -83,14 +84,15 @@ def debug_compare_weights_from_dict(
             except Exception as e:
                 print(f"    {name}: ERROR - {e}")
         
-        # Weight name mappings: Megatron (HF-style from backuper) -> SGLang HF name
-        # Note: weights_backuper.get() returns HF-style names like "model.layers.X.mlp.gate.weight"
+        # Megatron internal format -> HuggingFace format mapping
+        # Megatron: module.module.decoder.layers.{layer}.mlp.router.weight
+        # HF:       model.layers.{layer}.mlp.gate.weight
         weight_mappings = {
             # Router
-            f"model.layers.{layer_idx}.mlp.gate.weight": f"model.layers.{layer_idx}.mlp.gate.weight",
-            # Shared experts
-            f"model.layers.{layer_idx}.mlp.shared_expert.gate_up_proj.weight": f"model.layers.{layer_idx}.mlp.shared_expert.gate_up_proj.weight",
-            f"model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight": f"model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight",
+            f"module.module.decoder.layers.{layer_idx}.mlp.router.weight": f"model.layers.{layer_idx}.mlp.gate.weight",
+            # Shared experts (if exists)
+            f"module.module.decoder.layers.{layer_idx}.mlp.shared_experts.linear_fc1.weight": f"model.layers.{layer_idx}.mlp.shared_expert.gate_up_proj.weight",
+            f"module.module.decoder.layers.{layer_idx}.mlp.shared_experts.linear_fc2.weight": f"model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight",
         }
         
         # Check regular weights
@@ -106,7 +108,8 @@ def debug_compare_weights_from_dict(
                     diff = abs(meg_sum - sgl_sum)
                     results[hf_name] = (meg_sum, sgl_sum, diff)
                     status = "OK" if diff < 1e-5 else "MISMATCH"
-                    print(f"  {status}: {hf_name} (Megatron={meg_sum:.6e}, SGLang={sgl_sum:.6e}, diff={diff:.6e})")
+                    print(f"  {status}: {megatron_name} -> {hf_name}")
+                    print(f"    Megatron={meg_sum:.6e}, SGLang={sgl_sum:.6e}, diff={diff:.6e}")
                 else:
                     print(f"  SKIP: {hf_name} (SGLang returned None)")
             else:
@@ -151,43 +154,84 @@ def _compare_expert_weights_from_dict(
     results: Dict,
     verbose: bool,
 ):
-    """Compare expert weights from CPU dict."""
+    """Compare expert weights from CPU dict.
+    
+    Megatron format: module.module.decoder.layers.{layer}.mlp.experts.linear_fc1.weight{expert_id}
+    HF format:       model.layers.{layer}.mlp.experts.{expert_id}.gate_up_proj.weight
+    
+    Note: Megatron's linear_fc1 shape is [intermediate_size, hidden_size] which combines gate+up
+          HF's gate_up_proj shape is [2*intermediate_size, hidden_size]
+    """
     # Find expert weights in megatron_weights
-    # Pattern: model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_up_proj.weight
-    expert_pattern = re.compile(rf"model\.layers\.{layer_idx}\.mlp\.experts\.(\d+)\.(gate_up_proj|down_proj)\.weight")
+    # Pattern: module.module.decoder.layers.{layer}.mlp.experts.linear_fc1.weight{expert_id}
+    expert_fc1_pattern = re.compile(
+        rf"module\.module\.decoder\.layers\.{layer_idx}\.mlp\.experts\.linear_fc1\.weight(\d+)"
+    )
+    expert_fc2_pattern = re.compile(
+        rf"module\.module\.decoder\.layers\.{layer_idx}\.mlp\.experts\.linear_fc2\.weight(\d+)"
+    )
     
-    expert_weights = {}
+    expert_weights_fc1 = {}
+    expert_weights_fc2 = {}
+    
     for name, tensor in megatron_weights.items():
-        match = expert_pattern.match(name)
-        if match:
-            expert_id = int(match.group(1))
-            weight_type = match.group(2)
-            if expert_id not in expert_weights:
-                expert_weights[expert_id] = {}
-            expert_weights[expert_id][weight_type] = (name, tensor)
+        match_fc1 = expert_fc1_pattern.match(name)
+        match_fc2 = expert_fc2_pattern.match(name)
+        if match_fc1:
+            expert_id = int(match_fc1.group(1))
+            expert_weights_fc1[expert_id] = (name, tensor)
+        elif match_fc2:
+            expert_id = int(match_fc2.group(1))
+            expert_weights_fc2[expert_id] = (name, tensor)
     
-    print(f"  Found {len(expert_weights)} experts in Megatron weights")
+    print(f"  Found {len(expert_weights_fc1)} experts for fc1 (gate_up_proj)")
+    print(f"  Found {len(expert_weights_fc2)} experts for fc2 (down_proj)")
     
-    for expert_id in sorted(expert_weights.keys()):
-        for weight_type, (name, megatron_tensor) in expert_weights[expert_id].items():
-            hf_name = name  # Same naming convention
-            meg_sum = megatron_tensor.float().sum().item() if megatron_tensor.is_cuda else megatron_tensor.sum().item()
+    # Compare fc1 (gate_up_proj)
+    for expert_id in sorted(expert_weights_fc1.keys()):
+        megatron_name, megatron_tensor = expert_weights_fc1[expert_id]
+        hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_up_proj.weight"
+        
+        meg_sum = megatron_tensor.float().sum().item() if megatron_tensor.is_cuda else megatron_tensor.sum().item()
+        
+        sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+        if sglang_tensor is not None:
+            sgl_sum = sglang_tensor.sum().item()
+            diff = abs(meg_sum - sgl_sum)
+            results[hf_name] = (meg_sum, sgl_sum, diff)
             
-            sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose)
-            if sglang_tensor is not None:
-                sgl_sum = sglang_tensor.sum().item()
-                diff = abs(meg_sum - sgl_sum)
-                results[hf_name] = (meg_sum, sgl_sum, diff)
-                
-                if diff > 1e-5:
-                    print(f"  MISMATCH: Expert {expert_id} {weight_type}")
-                    print(f"    Megatron sum: {meg_sum:.10e}")
-                    print(f"    SGLang sum:   {sgl_sum:.10e}")
-                elif verbose:
-                    print(f"  OK: Expert {expert_id} {weight_type} (diff={diff:.6e})")
-            else:
-                if verbose:
-                    print(f"  SKIP: Expert {expert_id} {weight_type} (SGLang returned None)")
+            if diff > 1e-5:
+                print(f"  MISMATCH: Expert {expert_id} gate_up_proj (fc1)")
+                print(f"    Megatron: {megatron_name}, shape={list(megatron_tensor.shape)}, sum={meg_sum:.10e}")
+                print(f"    SGLang:   {hf_name}, shape={list(sglang_tensor.shape)}, sum={sgl_sum:.10e}")
+            elif verbose:
+                print(f"  OK: Expert {expert_id} gate_up_proj (diff={diff:.6e})")
+        else:
+            if verbose:
+                print(f"  SKIP: Expert {expert_id} gate_up_proj (SGLang returned None)")
+    
+    # Compare fc2 (down_proj)
+    for expert_id in sorted(expert_weights_fc2.keys()):
+        megatron_name, megatron_tensor = expert_weights_fc2[expert_id]
+        hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight"
+        
+        meg_sum = megatron_tensor.float().sum().item() if megatron_tensor.is_cuda else megatron_tensor.sum().item()
+        
+        sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+        if sglang_tensor is not None:
+            sgl_sum = sglang_tensor.sum().item()
+            diff = abs(meg_sum - sgl_sum)
+            results[hf_name] = (meg_sum, sgl_sum, diff)
+            
+            if diff > 1e-5:
+                print(f"  MISMATCH: Expert {expert_id} down_proj (fc2)")
+                print(f"    Megatron: {megatron_name}, shape={list(megatron_tensor.shape)}, sum={meg_sum:.10e}")
+                print(f"    SGLang:   {hf_name}, shape={list(sglang_tensor.shape)}, sum={sgl_sum:.10e}")
+            elif verbose:
+                print(f"  OK: Expert {expert_id} down_proj (diff={diff:.6e})")
+        else:
+            if verbose:
+                print(f"  SKIP: Expert {expert_id} down_proj (SGLang returned None)")
 
 
 def debug_print_megatron_weights(

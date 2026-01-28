@@ -169,20 +169,8 @@ def compute_log_probs(
             # This matches SGLang inference computation exactly
             from megatron.core.tensor_parallel import gather_from_tensor_model_parallel_region
             
-            rank = dist.get_rank(process_group)
-            
-            # DEBUG: Each rank should have DIFFERENT logits (partitioned vocab)
-            # rank 0 has vocab [0, vocab/tp), rank 1 has vocab [vocab/tp, 2*vocab/tp), etc.
-            print(f"[DEBUG compute_log_probs] rank={rank}: logits.shape={logits.shape}, "
-                  f"sum={logits.sum().item():.4f}, first 5={logits[0, :5].tolist()}")
-            
             # Gather logits from all TP ranks: [seq, padded_vocab/tp] -> [seq, padded_vocab]
             full_logits = gather_from_tensor_model_parallel_region(logits.contiguous(), group=process_group)
-            
-            # DEBUG: CRITICAL - After gather, ALL ranks should have IDENTICAL full_logits
-            # If rank 0 and rank 1 have different full_logits, there's a bug!
-            print(f"[DEBUG compute_log_probs] rank={rank} AFTER gather: full_logits.shape={full_logits.shape}, "
-                  f"sum={full_logits.sum().item():.4f}, first 5={full_logits[0, :5].tolist()}")
             
             # Truncate to original vocab_size to remove padding tokens
             if vocab_size is not None and full_logits.size(-1) > vocab_size:
@@ -191,10 +179,6 @@ def compute_log_probs(
             # Compute log_probs on the (truncated) full vocabulary (same as SGLang inference)
             log_probs = torch.log_softmax(full_logits.float(), dim=-1)
             gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
-            
-            # DEBUG: Final result
-            if rank == 0:
-                print(f"[DEBUG compute_log_probs] tokens={tokens.tolist()}, log_probs={gathered.tolist()}")
             
             return gathered.float()
         else:

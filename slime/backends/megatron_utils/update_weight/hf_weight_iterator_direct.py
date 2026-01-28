@@ -104,20 +104,6 @@ def _get_megatron_full_params(
         ep_group = mpu.get_expert_model_parallel_group()
         ep_group_ranks = dist.get_process_group_ranks(ep_group)
         
-        # DEBUG: Print EP group info
-        import os
-        if os.environ.get("DEBUG_EP_BROADCAST", "0") == "1" and rank == 0:
-            tp_group = mpu.get_tensor_model_parallel_group()
-            tp_group_ranks = dist.get_process_group_ranks(tp_group)
-            print(f"\n[DEBUG_EP_BROADCAST][Rank {rank}] *** GROUP COMPARISON ***", flush=True)
-            print(f"  EP group ranks: {ep_group_ranks}", flush=True)
-            print(f"  TP group ranks: {tp_group_ranks}", flush=True)
-            print(f"  EP == TP: {ep_group_ranks == tp_group_ranks}", flush=True)
-            if ep_group_ranks != tp_group_ranks:
-                print(f"  *** WARNING: EP and TP groups are DIFFERENT! This may cause weight sync issues! ***", flush=True)
-        
-        debug_ep_broadcast = False
-        
         for info, param in zip(megatron_local_param_infos, params, strict=False):
             if ".experts." in info.name:
                 src_rank = (
@@ -125,14 +111,6 @@ def _get_megatron_full_params(
                     if info.src_rank in ep_group_ranks
                     else rank
                 )
-                
-                # DEBUG: Print broadcast info for layer 0 expert weights
-                if os.environ.get("DEBUG_EP_BROADCAST", "0") == "1" and "layers.0." in info.name and not debug_ep_broadcast:
-                    print(f"[DEBUG_EP_BROADCAST][Rank {rank}] Expert param '{info.name}':", flush=True)
-                    print(f"  info.src_rank={info.src_rank}, ep_group_ranks={ep_group_ranks}", flush=True)
-                    print(f"  broadcast src_rank={src_rank}", flush=True)
-                    print(f"  param.shape={param.shape}, param.sum={param.float().sum().item():.6e}", flush=True)
-                    debug_ep_broadcast = True
                 
                 handles.append(
                     torch.distributed.broadcast(
@@ -195,12 +173,6 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
     rank = dist.get_rank()
     for name, param in named_params_and_buffers(args, model):
         tp_attr = getattr(param, "tensor_model_parallel", False)
-        # DEBUG: Print TP attributes for QKV layers
-        if rank == 0 and "linear_qkv" in name:
-            print(f"[DEBUG] {name}: tensor_model_parallel={tp_attr}, "
-                  f"partition_dim={getattr(param, 'partition_dim', -1)}, "
-                  f"partition_stride={getattr(param, 'partition_stride', 1)}, "
-                  f"shape={param.shape}")
         param_infos[name] = ParamInfo(
             name=name,
             dtype=param.dtype,
