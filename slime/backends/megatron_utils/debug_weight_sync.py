@@ -259,6 +259,7 @@ def debug_compare_weights_from_dict(
     rollout_engines: List,
     layer_idx: int = 0,
     verbose: bool = True,
+    compare_rank: int = 0,
 ) -> Dict[str, Tuple[float, float, float]]:
     """
     Compare weights between Megatron (from CPU dict) and SGLang for a specific layer.
@@ -267,21 +268,26 @@ def debug_compare_weights_from_dict(
     Args:
         megatron_weights: Dict from weights_backuper.get("actor"), already on CPU
                          Names are in Megatron format: module.module.decoder.layers.X.mlp.router.weight
+                         On the comparing rank this is that rank's local weights (sharded if TP > 1).
         rollout_engines: List of SGLang engine handles
         layer_idx: Which layer to compare
         verbose: Print detailed info
+        compare_rank: Which rank runs the comparison (default 0). Only this rank runs; others return {}.
+                      Use compare_rank=1 to compare rank 1's Megatron weights vs SGLang.
+                      Note: With TP > 1, Megatron holds shards per rank while SGLang holds the full
+                      assembled weight—shapes will differ unless SGLang weight is sliced to this rank's shard.
     
     Returns:
         Dict mapping weight name to (megatron_sum, sglang_sum, diff)
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank != 0:
+    if rank != compare_rank:
         return {}
     
     results = {}
     
     print(f"\n{'='*80}")
-    print(f"[DEBUG WEIGHT SYNC] Comparing Megatron (CPU backup) vs SGLang weights for layer {layer_idx}")
+    print(f"[DEBUG WEIGHT SYNC] Comparing Megatron (rank {compare_rank}) vs SGLang weights for layer {layer_idx}")
     print(f"{'='*80}")
     
     try:
@@ -352,7 +358,7 @@ def debug_compare_weights_from_dict(
             if isinstance(result, WeightComparisonResult):
                 if not result.is_match:
                     has_error = True
-                    print(f"\n  MISMATCH: {name}")
+                    print(f"\n  (rank {compare_rank}) MISMATCH: {name}")
                     print(f"    Megatron: dtype={result.megatron_dtype}, shape={result.megatron_shape}")
                     print(f"    SGLang:   dtype={result.sglang_dtype}, shape={result.sglang_shape}")
                     print(f"    Sum:      Meg={result.megatron_sum:.10e}, SGL={result.sglang_sum:.10e}, diff={result.sum_diff:.6e}")
@@ -363,19 +369,19 @@ def debug_compare_weights_from_dict(
                 meg_sum, sgl_sum, diff = result
                 if diff >= 1e-5:
                     has_error = True
-                    print(f"  MISMATCH: {name}")
+                    print(f"  (rank {compare_rank}) MISMATCH: {name}")
                     print(f"    Megatron sum: {meg_sum:.10e}")
                     print(f"    SGLang sum:   {sgl_sum:.10e}")
                     print(f"    Diff:         {diff:.6e}")
         
         if has_error:
-            print(f"\n*** WARNING: Weight mismatch detected! ***")
+            print(f"\n*** (rank {compare_rank}) WARNING: Weight mismatch detected! ***")
         else:
             print(f"\nAll weights match!")
         print(f"{'='*80}\n")
         
     except Exception as e:
-        print(f"[DEBUG] Weight comparison error: {e}")
+        print(f"[DEBUG] (rank {compare_rank}) Weight comparison error: {e}")
         import traceback
         traceback.print_exc()
     
