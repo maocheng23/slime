@@ -291,13 +291,30 @@ def debug_compare_weights_from_dict(
     print(f"{'='*80}")
     
     try:
-        # Get server info
+        # Get EP info from Megatron
+        try:
+            ep_size = mpu.get_expert_model_parallel_world_size()
+            ep_rank = mpu.get_expert_model_parallel_rank()
+        except Exception as e:
+            print(f"[WARN] Cannot get EP info: {e}, assuming EP=1")
+            ep_size = 1
+            ep_rank = 0
+        
+        print(f"  Megatron EP info: ep_size={ep_size}, ep_rank={ep_rank}")
+        
+        # Get server info - use the SGLang engine corresponding to this EP rank
+        # For non-expert weights (like router), we can use any engine
+        # For expert weights, we'll select the correct engine in _compare_expert_weights_from_dict
         print("\n[Step 1] Getting SGLang server info...")
         try:
-            server_info = ray.get(rollout_engines[0].get_server_info.remote())
+            # Select engine based on EP rank for better accuracy
+            engine_idx = min(ep_rank, len(rollout_engines) - 1)
+            server_info = ray.get(rollout_engines[engine_idx].get_server_info.remote())
             server_host = server_info["server_host"]
             server_port = server_info["server_port"]
-            print(f"  SGLang server: {server_host}:{server_port}")
+            print(f"  Using SGLang engine {engine_idx}: {server_host}:{server_port}")
+            if ep_rank != engine_idx:
+                print(f"  [WARN] EP rank {ep_rank} but using engine {engine_idx} (not enough engines)")
         except Exception as e:
             print(f"[ERROR] Cannot get SGLang server info: {e}")
             return results
@@ -348,7 +365,10 @@ def debug_compare_weights_from_dict(
         
         # Check expert weights with detailed comparison
         print("\n[Step 4] Comparing expert weights...")
-        _compare_expert_weights_from_dict(megatron_weights, layer_idx, server_host, server_port, results, verbose)
+        _compare_expert_weights_from_dict(
+            megatron_weights, layer_idx, server_host, server_port, results, verbose,
+            rollout_engines=rollout_engines
+        )
         
         # Summary with comprehensive metrics
         print(f"\n{'='*80}")
@@ -395,15 +415,30 @@ def _compare_expert_weights_from_dict(
     server_port: int,
     results: Dict,
     verbose: bool,
+    rollout_engines: Optional[List] = None,
 ):
     """Compare expert weights from CPU dict with comprehensive metrics.
     
     Megatron format: module.module.decoder.layers.{layer}.mlp.experts.linear_fc1.weight{expert_id}
     HF format:       model.layers.{layer}.mlp.experts.{expert_id}.gate_up_proj.weight
     
-    Note: Megatron's linear_fc1 shape is [2*intermediate_size, hidden_size] which combines gate+up
-          HF's gate_up_proj shape is [2*intermediate_size, hidden_size]
+    Note: 
+    - Megatron's linear_fc1 shape is [2*intermediate_size, hidden_size] which combines gate+up
+    - HF's gate_up_proj shape is [2*intermediate_size, hidden_size]
+    - With EP (Expert Parallelism), Megatron uses GLOBAL expert IDs (e.g., rank 1 has experts 16-31)
+      while SGLang uses LOCAL expert IDs (0-15 per EP rank). We need to:
+      1. Query the SGLang server corresponding to this EP rank
+      2. Convert global expert ID to local: local_id = global_id % num_experts_per_rank
     """
+    # Get EP info from Megatron
+    try:
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        ep_rank = mpu.get_expert_model_parallel_rank()
+    except Exception as e:
+        print(f"  [WARN] Cannot get EP info: {e}, assuming EP=1")
+        ep_size = 1
+        ep_rank = 0
+    
     # Find expert weights in megatron_weights
     # Pattern: module.module.decoder.layers.{layer}.mlp.experts.linear_fc1.weight{expert_id}
     expert_fc1_pattern = re.compile(
@@ -426,51 +461,105 @@ def _compare_expert_weights_from_dict(
             expert_id = int(match_fc2.group(1))
             expert_weights_fc2[expert_id] = (name, tensor)
     
+    # Calculate number of experts per EP rank
+    if len(expert_weights_fc1) > 0:
+        all_expert_ids = sorted(expert_weights_fc1.keys())
+        num_local_experts = len(all_expert_ids)
+        # Infer total experts: local_experts * ep_size
+        total_experts = num_local_experts * ep_size
+        experts_per_rank = num_local_experts
+        min_expert_id = min(all_expert_ids)
+        max_expert_id = max(all_expert_ids)
+        print(f"  EP info: ep_size={ep_size}, ep_rank={ep_rank}")
+        print(f"  Local expert IDs (Megatron global): {min_expert_id} to {max_expert_id}")
+        print(f"  Total experts (inferred): {total_experts}, experts_per_rank={experts_per_rank}")
+    else:
+        experts_per_rank = 1
+    
     print(f"  Found {len(expert_weights_fc1)} experts for fc1 (gate_up_proj)")
     print(f"  Found {len(expert_weights_fc2)} experts for fc2 (down_proj)")
     
+    # Get the SGLang server for this EP rank
+    # With EP, different SGLang engines serve different EP shards
+    # We need to find the engine that corresponds to this EP rank
+    actual_server_host = server_host
+    actual_server_port = server_port
+    
+    if rollout_engines is not None and ep_size > 1:
+        # Try to find the SGLang engine corresponding to this EP rank
+        # Assumption: rollout_engines are ordered by EP rank (or we need to query each to find the right one)
+        # For now, we select engine based on ep_rank if we have enough engines
+        if len(rollout_engines) > ep_rank:
+            try:
+                server_info = ray.get(rollout_engines[ep_rank].get_server_info.remote())
+                actual_server_host = server_info["server_host"]
+                actual_server_port = server_info["server_port"]
+                print(f"  Using SGLang engine {ep_rank} (EP rank {ep_rank}): {actual_server_host}:{actual_server_port}")
+            except Exception as e:
+                print(f"  [WARN] Cannot get server info from engine {ep_rank}: {e}")
+                print(f"  Falling back to original server: {server_host}:{server_port}")
+        else:
+            print(f"  [WARN] Not enough rollout_engines ({len(rollout_engines)}) for ep_rank={ep_rank}")
+            print(f"  Using original server: {server_host}:{server_port}")
+    
     # Compare fc1 (gate_up_proj) with detailed metrics
-    for expert_id in sorted(expert_weights_fc1.keys()):
-        megatron_name, megatron_tensor = expert_weights_fc1[expert_id]
-        hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_up_proj.weight"
+    for global_expert_id in sorted(expert_weights_fc1.keys()):
+        megatron_name, megatron_tensor = expert_weights_fc1[global_expert_id]
+        
+        # Convert global expert ID to local expert ID for SGLang query
+        # Local ID = Global ID % experts_per_rank (or Global ID - ep_rank * experts_per_rank)
+        local_expert_id = global_expert_id % experts_per_rank
+        
+        # Use local expert ID in the HF name for SGLang query
+        hf_name_for_sglang = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.gate_up_proj.weight"
+        # For display/results, use global ID to match Megatron naming
+        hf_name_display = f"model.layers.{layer_idx}.mlp.experts.{global_expert_id}.gate_up_proj.weight"
+        
+        if verbose:
+            print(f"  Comparing Megatron expert {global_expert_id} (global) -> SGLang expert {local_expert_id} (local)")
         
         # Try to get the fused weight first (gate_up_proj)
-        sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+        sglang_tensor = _get_sglang_weight(actual_server_host, actual_server_port, hf_name_for_sglang, verbose)
         
         if sglang_tensor is None:
             # Fallback: SGLang might store as separate gate_proj and up_proj
-            gate_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight"
-            up_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight"
-            gate_tensor = _get_sglang_weight(server_host, server_port, gate_name, verbose)
-            up_tensor = _get_sglang_weight(server_host, server_port, up_name, verbose)
+            gate_name = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.gate_proj.weight"
+            up_name = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.up_proj.weight"
+            gate_tensor = _get_sglang_weight(actual_server_host, actual_server_port, gate_name, verbose)
+            up_tensor = _get_sglang_weight(actual_server_host, actual_server_port, up_name, verbose)
             
             if gate_tensor is not None and up_tensor is not None:
                 # Concatenate gate and up for comparison
                 sglang_tensor = torch.cat([gate_tensor, up_tensor], dim=0)
-                hf_name = f"{gate_name} + {up_name}"
+                hf_name_display = f"expert_{global_expert_id}_gate+up (local_{local_expert_id})"
             else:
                 if verbose:
-                    print(f"  SKIP: Expert {expert_id} gate_up_proj (SGLang returned None for both formats)")
+                    print(f"  SKIP: Expert {global_expert_id} (local {local_expert_id}) gate_up_proj (SGLang returned None for both formats)")
                 continue
         
         # Use detailed comparison
-        result = compare_weights_detailed(hf_name, megatron_tensor, sglang_tensor)
-        results[hf_name] = result
+        result = compare_weights_detailed(hf_name_display, megatron_tensor, sglang_tensor)
+        results[hf_name_display] = result
         print_weight_comparison(result, verbose)
     
     # Compare fc2 (down_proj) with detailed metrics
-    for expert_id in sorted(expert_weights_fc2.keys()):
-        megatron_name, megatron_tensor = expert_weights_fc2[expert_id]
-        hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight"
+    for global_expert_id in sorted(expert_weights_fc2.keys()):
+        megatron_name, megatron_tensor = expert_weights_fc2[global_expert_id]
         
-        sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+        # Convert global expert ID to local expert ID for SGLang query
+        local_expert_id = global_expert_id % experts_per_rank
+        
+        hf_name_for_sglang = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.down_proj.weight"
+        hf_name_display = f"model.layers.{layer_idx}.mlp.experts.{global_expert_id}.down_proj.weight"
+        
+        sglang_tensor = _get_sglang_weight(actual_server_host, actual_server_port, hf_name_for_sglang, verbose)
         if sglang_tensor is not None:
-            result = compare_weights_detailed(hf_name, megatron_tensor, sglang_tensor)
-            results[hf_name] = result
+            result = compare_weights_detailed(hf_name_display, megatron_tensor, sglang_tensor)
+            results[hf_name_display] = result
             print_weight_comparison(result, verbose)
         else:
             if verbose:
-                print(f"  SKIP: Expert {expert_id} down_proj (SGLang returned None)")
+                print(f"  SKIP: Expert {global_expert_id} (local {local_expert_id}) down_proj (SGLang returned None)")
 
 
 def debug_print_megatron_weights(
@@ -727,7 +816,13 @@ def _compare_expert_weights(
     rank: int,
     verbose: bool,
 ):
-    """Compare expert weights (handles EP distribution)."""
+    """Compare expert weights (handles EP distribution).
+    
+    Note: With EP, Megatron uses GLOBAL expert IDs (e.g., rank 1 has experts 16-31)
+    while SGLang uses LOCAL expert IDs (0-15 per EP rank). We need to:
+    1. Query the SGLang server corresponding to this EP rank
+    2. Convert global expert ID to local: local_id = global_id % num_experts_per_rank
+    """
     # Get EP info
     try:
         ep_size = mpu.get_expert_model_parallel_world_size()
@@ -751,7 +846,7 @@ def _compare_expert_weights(
     for model_module in model:
         for name, param in model_module.named_parameters():
             if f"layers.{layer_idx}.mlp.experts" in name:
-                # Extract expert ID
+                # Extract expert ID (this is GLOBAL ID in Megatron)
                 match = re.search(r'weight(\d+)$', name)
                 if match:
                     expert_id = int(match.group(1))
@@ -762,52 +857,87 @@ def _compare_expert_weights(
                         elif "linear_fc2" in name:
                             local_experts_w2[expert_id] = cpu_tensor
     
+    # Calculate number of experts per EP rank
+    if len(local_experts_w1) > 0:
+        num_local_experts = len(local_experts_w1)
+        experts_per_rank = num_local_experts
+    else:
+        experts_per_rank = 1
+    
     if verbose:
         print(f"  Found {len(local_experts_w1)} local experts for fc1")
         print(f"  Found {len(local_experts_w2)} local experts for fc2")
-        print(f"  Local expert IDs (fc1): {sorted(local_experts_w1.keys())}")
+        print(f"  Local expert IDs (Megatron global): {sorted(local_experts_w1.keys())}")
+        print(f"  experts_per_rank={experts_per_rank}")
+    
+    # Get the SGLang server for this EP rank
+    actual_server_host = server_host
+    actual_server_port = server_port
+    
+    if ep_size > 1 and len(rollout_engines) > ep_rank:
+        try:
+            server_info = ray.get(rollout_engines[ep_rank].get_server_info.remote())
+            actual_server_host = server_info["server_host"]
+            actual_server_port = server_info["server_port"]
+            print(f"  Using SGLang engine {ep_rank} (EP rank {ep_rank}): {actual_server_host}:{actual_server_port}")
+        except Exception as e:
+            print(f"  [WARN] Cannot get server info from engine {ep_rank}: {e}")
+            print(f"  Falling back to original server: {server_host}:{server_port}")
     
     # Compare with SGLang
-    # SGLang expert name pattern: model.layers.{layer}.mlp.experts.{expert_id}.gate_up_proj.weight
-    for expert_id, megatron_w1 in sorted(local_experts_w1.items()):
-        hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_up_proj.weight"
-        sglang_w1 = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+    # SGLang expert name pattern: model.layers.{layer}.mlp.experts.{local_expert_id}.gate_up_proj.weight
+    for global_expert_id, megatron_w1 in sorted(local_experts_w1.items()):
+        # Convert global expert ID to local expert ID
+        local_expert_id = global_expert_id % experts_per_rank
+        
+        hf_name_for_sglang = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.gate_up_proj.weight"
+        hf_name_display = f"model.layers.{layer_idx}.mlp.experts.{global_expert_id}.gate_up_proj.weight"
+        
+        if verbose:
+            print(f"  Comparing Megatron expert {global_expert_id} (global) -> SGLang expert {local_expert_id} (local)")
+        
+        sglang_w1 = _get_sglang_weight(actual_server_host, actual_server_port, hf_name_for_sglang, verbose)
         
         if sglang_w1 is not None:
             meg_sum = megatron_w1.sum().item()
             sgl_sum = sglang_w1.sum().item()
             diff = abs(meg_sum - sgl_sum)
             
-            results[hf_name] = (meg_sum, sgl_sum, diff)
+            results[hf_name_display] = (meg_sum, sgl_sum, diff)
             
             if diff > 1e-5 and verbose:
-                print(f"  [MISMATCH] Expert {expert_id} fc1:")
+                print(f"  [MISMATCH] Expert {global_expert_id} (local {local_expert_id}) fc1:")
                 print(f"    Megatron shape: {megatron_w1.shape}, sum: {meg_sum:.10e}")
                 print(f"    SGLang shape:   {sglang_w1.shape}, sum: {sgl_sum:.10e}")
                 print(f"    First 5 values (Megatron): {megatron_w1.flatten()[:5].tolist()}")
                 print(f"    First 5 values (SGLang):   {sglang_w1.flatten()[:5].tolist()}")
         else:
             if verbose:
-                print(f"  [SKIP] Cannot get SGLang expert {expert_id} fc1")
+                print(f"  [SKIP] Cannot get SGLang expert {global_expert_id} (local {local_expert_id}) fc1")
     
-    for expert_id, megatron_w2 in sorted(local_experts_w2.items()):
-        hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight"
-        sglang_w2 = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+    for global_expert_id, megatron_w2 in sorted(local_experts_w2.items()):
+        # Convert global expert ID to local expert ID
+        local_expert_id = global_expert_id % experts_per_rank
+        
+        hf_name_for_sglang = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.down_proj.weight"
+        hf_name_display = f"model.layers.{layer_idx}.mlp.experts.{global_expert_id}.down_proj.weight"
+        
+        sglang_w2 = _get_sglang_weight(actual_server_host, actual_server_port, hf_name_for_sglang, verbose)
         
         if sglang_w2 is not None:
             meg_sum = megatron_w2.sum().item()
             sgl_sum = sglang_w2.sum().item()
             diff = abs(meg_sum - sgl_sum)
             
-            results[hf_name] = (meg_sum, sgl_sum, diff)
+            results[hf_name_display] = (meg_sum, sgl_sum, diff)
             
             if diff > 1e-5 and verbose:
-                print(f"  [MISMATCH] Expert {expert_id} fc2:")
+                print(f"  [MISMATCH] Expert {global_expert_id} (local {local_expert_id}) fc2:")
                 print(f"    Megatron shape: {megatron_w2.shape}, sum: {meg_sum:.10e}")
                 print(f"    SGLang shape:   {sglang_w2.shape}, sum: {sgl_sum:.10e}")
         else:
             if verbose:
-                print(f"  [SKIP] Cannot get SGLang expert {expert_id} fc2")
+                print(f"  [SKIP] Cannot get SGLang expert {global_expert_id} (local {local_expert_id}) fc2")
 
 
 def debug_check_expert_weight_shapes(model: List[torch.nn.Module], layer_idx: int = 0):
@@ -939,6 +1069,11 @@ def debug_compare_weights_all_ranks(
     Compare weights from ALL ranks (not just rank 0).
     Each rank prints its own comparison results.
     
+    Note: With EP, Megatron uses GLOBAL expert IDs (e.g., rank 1 has experts 16-31)
+    while SGLang uses LOCAL expert IDs (0-15 per EP rank). We need to:
+    1. Query the SGLang server corresponding to this EP rank
+    2. Convert global expert ID to local: local_id = global_id % num_experts_per_rank
+    
     Usage:
         from .debug_weight_sync import debug_compare_weights_all_ranks
         megatron_weights = self.weights_backuper.get("actor")
@@ -947,16 +1082,27 @@ def debug_compare_weights_all_ranks(
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     
+    # Get EP info
+    try:
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        ep_rank = mpu.get_expert_model_parallel_rank()
+    except Exception as e:
+        print(f"[WARN] Cannot get EP info: {e}, assuming EP=1")
+        ep_size = 1
+        ep_rank = 0
+    
     print(f"\n[Rank {rank}/{world_size}] {'='*60}")
     print(f"[Rank {rank}/{world_size}] Checking weights for layer {layer_idx}")
+    print(f"[Rank {rank}/{world_size}] EP info: ep_size={ep_size}, ep_rank={ep_rank}")
     print(f"[Rank {rank}/{world_size}] {'='*60}")
     
     try:
-        # Get server info (need to get from appropriate engine for this rank)
-        engine_idx = rank % len(rollout_engines)
+        # Get server info - use the SGLang engine corresponding to this EP rank
+        engine_idx = min(ep_rank, len(rollout_engines) - 1)
         server_info = ray.get(rollout_engines[engine_idx].get_server_info.remote())
         server_host = server_info["server_host"]
         server_port = server_info["server_port"]
+        print(f"[Rank {rank}] Using SGLang engine {engine_idx}: {server_host}:{server_port}")
         
         # Find expert weights for this rank
         expert_fc1_pattern = re.compile(
@@ -970,25 +1116,40 @@ def debug_compare_weights_all_ranks(
                 expert_id = int(match.group(1))
                 expert_weights[expert_id] = (name, tensor)
         
+        # Calculate number of experts per EP rank
+        num_local_experts = len(expert_weights)
+        experts_per_rank = num_local_experts if num_local_experts > 0 else 1
+        
         print(f"[Rank {rank}] Found {len(expert_weights)} experts in local backup")
+        if len(expert_weights) > 0:
+            print(f"[Rank {rank}] Global expert IDs: {sorted(expert_weights.keys())}")
+            print(f"[Rank {rank}] experts_per_rank={experts_per_rank}")
         
         # Check a few experts
         checked = 0
         mismatches = 0
-        for expert_id in sorted(expert_weights.keys())[:3]:  # Check first 3 experts
-            megatron_name, megatron_tensor = expert_weights[expert_id]
-            hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_up_proj.weight"
+        for global_expert_id in sorted(expert_weights.keys())[:3]:  # Check first 3 experts
+            megatron_name, megatron_tensor = expert_weights[global_expert_id]
             
-            sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose=False)
+            # Convert global expert ID to local expert ID for SGLang query
+            local_expert_id = global_expert_id % experts_per_rank
+            
+            hf_name_for_sglang = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.gate_up_proj.weight"
+            hf_name_display = f"model.layers.{layer_idx}.mlp.experts.{global_expert_id}.gate_up_proj.weight"
+            
+            if verbose:
+                print(f"[Rank {rank}] Comparing expert {global_expert_id} (global) -> {local_expert_id} (local)")
+            
+            sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name_for_sglang, verbose=False)
             if sglang_tensor is not None:
-                result = compare_weights_detailed(hf_name, megatron_tensor, sglang_tensor)
+                result = compare_weights_detailed(hf_name_display, megatron_tensor, sglang_tensor)
                 checked += 1
                 if not result.is_match:
                     mismatches += 1
-                    print(f"[Rank {rank}] MISMATCH: Expert {expert_id}")
+                    print(f"[Rank {rank}] MISMATCH: Expert {global_expert_id} (local {local_expert_id})")
                     print(f"  abs_diff_sum={result.abs_diff_sum:.6e}, max_abs_diff={result.max_abs_diff:.6e}")
                 elif verbose:
-                    print(f"[Rank {rank}] OK: Expert {expert_id} (max_abs_diff={result.max_abs_diff:.6e})")
+                    print(f"[Rank {rank}] OK: Expert {global_expert_id} (max_abs_diff={result.max_abs_diff:.6e})")
         
         print(f"[Rank {rank}] Checked {checked} experts, {mismatches} mismatches")
         
