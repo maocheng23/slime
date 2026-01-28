@@ -481,8 +481,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 dist.barrier()
                 torch.cuda.synchronize()
                 
-                if dist.get_rank() == 0:
-                    print("[DEBUG] Running weight check after update_weights...", flush=True)
+                if True:
+                    print(f"[DEBUG][Rank {dist.get_rank()}] Running weight check after update_weights...", flush=True)
                     try:
                         # Snapshot current SGLang weights and then compare with what was just synced
                         # Note: This won't catch the issue since we're comparing SGLang with itself
@@ -500,7 +500,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         debug_compare_weights_from_dict(megatron_weights, rollout_engines, layer_idx=0, verbose=True)
                     except Exception as e:
                         import traceback
-                        print(f"[DEBUG] Weight comparison error: {e}", flush=True)
+                        print(f"[DEBUG][Rank {dist.get_rank()}] Weight comparison error: {e}", flush=True)
                         traceback.print_exc()
                 
                 # Sync all ranks again after debugging

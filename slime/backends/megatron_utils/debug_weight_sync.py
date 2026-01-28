@@ -60,6 +60,7 @@ def compare_weights_detailed(
     sglang_tensor: torch.Tensor,
     rtol: float = 1e-4,
     atol: float = 1e-5,
+    sglang_original_dtype: Optional[str] = None,
 ) -> WeightComparisonResult:
     """
     Compare two weight tensors with comprehensive metrics.
@@ -72,13 +73,23 @@ def compare_weights_detailed(
         sglang_tensor: Weight from SGLang (can be any dtype, any device)
         rtol: Relative tolerance for determining match
         atol: Absolute tolerance for determining match
+        sglang_original_dtype: Original dtype of SGLang weight (if known)
     
     Returns:
         WeightComparisonResult with all comparison metrics
     """
     # Record original dtypes
     meg_dtype = str(megatron_tensor.dtype)
-    sgl_dtype = str(sglang_tensor.dtype)
+    # SGLang tensor is from API (JSON), so dtype is float64 for precision
+    # If original dtype is provided, show that instead
+    if sglang_original_dtype:
+        sgl_dtype = sglang_original_dtype
+    else:
+        # Indicate it's from API if it's float64 (our conversion)
+        if sglang_tensor.dtype == torch.float64:
+            sgl_dtype = "via API (stored as bf16/fp16)"
+        else:
+            sgl_dtype = str(sglang_tensor.dtype)
     meg_shape = tuple(megatron_tensor.shape)
     sgl_shape = tuple(sglang_tensor.shape)
     
@@ -137,11 +148,15 @@ def print_weight_comparison(result: WeightComparisonResult, verbose: bool = True
     """Print weight comparison result with optional verbosity."""
     if result.is_match:
         if verbose:
-            print(f"  OK: {result.name}")
-            print(f"    dtype: Meg={result.megatron_dtype}, SGL={result.sglang_dtype}")
-            print(f"    shape: {result.megatron_shape}")
-            print(f"    sum_diff={result.sum_diff:.6e}, norm_diff={result.norm_diff:.6e}, "
-                  f"abs_diff_sum={result.abs_diff_sum:.6e}, max_abs_diff={result.max_abs_diff:.6e}")
+            # Check if it's an exact match (abs_diff_sum == 0)
+            if result.abs_diff_sum == 0:
+                print(f"  [Rank {rank}] OK: {result.name} [EXACT MATCH]")
+                print(f"    shape: {result.megatron_shape}, Meg dtype={result.megatron_dtype}")
+            else:
+                print(f"  [Rank {rank}] OK: {result.name}")
+                print(f"    shape: {result.megatron_shape}, Meg dtype={result.megatron_dtype}")
+                print(f"    sum_diff={result.sum_diff:.6e}, norm_diff={result.norm_diff:.6e}, "
+                      f"abs_diff_sum={result.abs_diff_sum:.6e}, max_abs_diff={result.max_abs_diff:.6e}")
     else:
         print(f"  MISMATCH: {result.name}")
         print(f"    Megatron: dtype={result.megatron_dtype}, shape={result.megatron_shape}")
@@ -318,7 +333,10 @@ def debug_compare_weights_from_dict(
                 else:
                     print(f"  SKIP: {hf_name} (SGLang returned None)")
             else:
-                if verbose:
+                # Only print skip message for optional weights (shared_experts) at lower verbosity
+                if "shared_experts" in megatron_name:
+                    print(f"  (N/A: shared_experts not used in this model config)")
+                elif verbose:
                     print(f"  SKIP: {megatron_name} not in Megatron weights")
         
         # Check expert weights with detailed comparison
@@ -513,8 +531,6 @@ def debug_compare_all_weights(
         Dict mapping weight name to (megatron_sum, sglang_sum, diff)
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank != 0:
-        return {}
     
     results = {}
     
@@ -527,12 +543,12 @@ def debug_compare_all_weights(
         torch.cuda.synchronize()
         
         # First, print Megatron weights (safe operation)
-        print("\n[Step 1] Reading Megatron weights...")
+        print(f"\n[Step 1][Rank {rank}] Reading Megatron weights...")
         megatron_weights = debug_print_megatron_weights(model, layer_idx, verbose=False)
         print(f"  Successfully read {len(megatron_weights)} weights from Megatron")
         
         # Get server info
-        print("\n[Step 2] Getting SGLang server info...")
+        print(f"\n[Step 2][Rank {rank}] Getting SGLang server info...")
         try:
             server_info = ray.get(rollout_engines[0].get_server_info.remote())
             server_host = server_info["server_host"]
@@ -553,7 +569,7 @@ def debug_compare_all_weights(
         }
         
         # Check regular weights
-        print("\n[Step 3] Comparing regular weights...")
+        print(f"\n[Step 3][Rank {rank}] Comparing regular weights...")
         for megatron_pattern, hf_name in weight_mappings.items():
             try:
                 _compare_single_weight(model, megatron_pattern, hf_name, 
@@ -562,10 +578,10 @@ def debug_compare_all_weights(
                 print(f"[ERROR] Failed to compare {megatron_pattern}: {e}")
         
         # Check expert weights (need special handling for EP)
-        print("\n[Step 4] Comparing expert weights...")
+        print(f"\n[Step 4][Rank {rank}] Comparing expert weights...")
         try:
             _compare_expert_weights(model, rollout_engines, layer_idx, 
-                                   server_host, server_port, results, verbose)
+                                   server_host, server_port, results, rank=rank, verbose=verbose)
         except Exception as e:
             print(f"[ERROR] Failed to compare expert weights: {e}")
             import traceback
@@ -573,13 +589,13 @@ def debug_compare_all_weights(
         
         # Summary
         print(f"\n{'='*80}")
-        print(f"[SUMMARY] Weight comparison results:")
+        print(f"[SUMMARY][Rank {rank}] Weight comparison results:")
         has_error = False
         for name, (meg_sum, sgl_sum, diff) in results.items():
             status = "OK" if diff < 1e-5 else "MISMATCH"
             if diff >= 1e-5:
                 has_error = True
-                print(f"  {status}: {name}")
+                print(f"  [Rank {rank}] {status}: {name}")
                 print(f"    Megatron sum: {meg_sum:.10e}")
                 print(f"    SGLang sum:   {sgl_sum:.10e}")
                 print(f"    Diff:         {diff:.6e}")
@@ -701,6 +717,7 @@ def _compare_expert_weights(
     server_host: str,
     server_port: int,
     results: Dict,
+    rank: int,
     verbose: bool,
 ):
     """Compare expert weights (handles EP distribution)."""
@@ -714,7 +731,7 @@ def _compare_expert_weights(
         ep_rank = 0
     
     if verbose:
-        print(f"\n[Expert Weights] EP size={ep_size}, EP rank={ep_rank}")
+        print(f"\n[Expert Weights][Rank {rank}] EP size={ep_size}, EP rank={ep_rank}")
     
     # Sync CUDA before accessing weights
     torch.cuda.synchronize()
@@ -836,3 +853,216 @@ def debug_compare_weights_before_after_sync(
         print(f"[Rank {rank}] Captured {len(state)} weights for layer {layer_idx}")
     
     return state
+
+
+def debug_compare_embedding_lmhead(
+    megatron_weights: Mapping[str, torch.Tensor],
+    rollout_engines: List,
+    verbose: bool = True,
+) -> Dict[str, WeightComparisonResult]:
+    """
+    Compare embedding and lm_head weights between Megatron and SGLang.
+    These are critical for logprobs calculation!
+    
+    Usage:
+        from .debug_weight_sync import debug_compare_embedding_lmhead
+        megatron_weights = self.weights_backuper.get("actor")
+        debug_compare_embedding_lmhead(megatron_weights, rollout_engines)
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank != 0:
+        return {}
+    
+    results = {}
+    
+    print(f"\n{'='*80}")
+    print(f"[DEBUG] Comparing Embedding & LM Head weights (critical for logprobs!)")
+    print(f"{'='*80}")
+    
+    try:
+        # Get server info
+        server_info = ray.get(rollout_engines[0].get_server_info.remote())
+        server_host = server_info["server_host"]
+        server_port = server_info["server_port"]
+        
+        # Weight mappings for embedding and lm_head
+        weight_mappings = {
+            "module.module.embedding.word_embeddings.weight": "model.embed_tokens.weight",
+            "module.module.output_layer.weight": "lm_head.weight",
+            "module.module.decoder.final_layernorm.weight": "model.norm.weight",
+        }
+        
+        for megatron_name, hf_name in weight_mappings.items():
+            if megatron_name in megatron_weights:
+                megatron_tensor = megatron_weights[megatron_name]
+                sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose)
+                
+                if sglang_tensor is not None:
+                    result = compare_weights_detailed(hf_name, megatron_tensor, sglang_tensor)
+                    results[hf_name] = result
+                    print_weight_comparison(result, verbose)
+                else:
+                    print(f"  SKIP: {hf_name} (SGLang returned None)")
+            else:
+                print(f"  SKIP: {megatron_name} not found in Megatron weights")
+        
+        # Summary
+        has_error = any(not r.is_match for r in results.values() if isinstance(r, WeightComparisonResult))
+        if has_error:
+            print(f"\n*** WARNING: Embedding/LM Head mismatch - this WILL cause logprobs diff! ***")
+        else:
+            print(f"\nEmbedding & LM Head weights match!")
+        print(f"{'='*80}\n")
+        
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return results
+
+
+def debug_compare_weights_all_ranks(
+    megatron_weights: Mapping[str, torch.Tensor],
+    rollout_engines: List,
+    layer_idx: int = 0,
+    verbose: bool = True,
+) -> None:
+    """
+    Compare weights from ALL ranks (not just rank 0).
+    Each rank prints its own comparison results.
+    
+    Usage:
+        from .debug_weight_sync import debug_compare_weights_all_ranks
+        megatron_weights = self.weights_backuper.get("actor")
+        debug_compare_weights_all_ranks(megatron_weights, rollout_engines, layer_idx=0)
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    
+    print(f"\n[Rank {rank}/{world_size}] {'='*60}")
+    print(f"[Rank {rank}/{world_size}] Checking weights for layer {layer_idx}")
+    print(f"[Rank {rank}/{world_size}] {'='*60}")
+    
+    try:
+        # Get server info (need to get from appropriate engine for this rank)
+        engine_idx = rank % len(rollout_engines)
+        server_info = ray.get(rollout_engines[engine_idx].get_server_info.remote())
+        server_host = server_info["server_host"]
+        server_port = server_info["server_port"]
+        
+        # Find expert weights for this rank
+        expert_fc1_pattern = re.compile(
+            rf"module\.module\.decoder\.layers\.{layer_idx}\.mlp\.experts\.linear_fc1\.weight(\d+)"
+        )
+        
+        expert_weights = {}
+        for name, tensor in megatron_weights.items():
+            match = expert_fc1_pattern.match(name)
+            if match:
+                expert_id = int(match.group(1))
+                expert_weights[expert_id] = (name, tensor)
+        
+        print(f"[Rank {rank}] Found {len(expert_weights)} experts in local backup")
+        
+        # Check a few experts
+        checked = 0
+        mismatches = 0
+        for expert_id in sorted(expert_weights.keys())[:3]:  # Check first 3 experts
+            megatron_name, megatron_tensor = expert_weights[expert_id]
+            hf_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_up_proj.weight"
+            
+            sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose=False)
+            if sglang_tensor is not None:
+                result = compare_weights_detailed(hf_name, megatron_tensor, sglang_tensor)
+                checked += 1
+                if not result.is_match:
+                    mismatches += 1
+                    print(f"[Rank {rank}] MISMATCH: Expert {expert_id}")
+                    print(f"  abs_diff_sum={result.abs_diff_sum:.6e}, max_abs_diff={result.max_abs_diff:.6e}")
+                elif verbose:
+                    print(f"[Rank {rank}] OK: Expert {expert_id} (max_abs_diff={result.max_abs_diff:.6e})")
+        
+        print(f"[Rank {rank}] Checked {checked} experts, {mismatches} mismatches")
+        
+        # Also check router
+        router_meg_name = f"module.module.decoder.layers.{layer_idx}.mlp.router.weight"
+        if router_meg_name in megatron_weights:
+            router_hf_name = f"model.layers.{layer_idx}.mlp.gate.weight"
+            sglang_tensor = _get_sglang_weight(server_host, server_port, router_hf_name, verbose=False)
+            if sglang_tensor is not None:
+                result = compare_weights_detailed(router_hf_name, megatron_weights[router_meg_name], sglang_tensor)
+                if not result.is_match:
+                    print(f"[Rank {rank}] MISMATCH: Router! abs_diff_sum={result.abs_diff_sum:.6e}")
+                else:
+                    print(f"[Rank {rank}] OK: Router (max_abs_diff={result.max_abs_diff:.6e})")
+        
+    except Exception as e:
+        print(f"[Rank {rank}] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Barrier to sync output
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def debug_check_sglang_tp_consistency(
+    rollout_engines: List,
+    layer_idx: int = 0,
+    weight_name: str = "model.layers.0.mlp.gate.weight",
+) -> None:
+    """
+    Check if SGLang's different TP workers have consistent weights.
+    This is critical because each TP worker should have the same weight 
+    after weight sync (for replicated params like router).
+    
+    Usage:
+        from .debug_weight_sync import debug_check_sglang_tp_consistency
+        debug_check_sglang_tp_consistency(rollout_engines, layer_idx=0)
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank != 0:
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"[DEBUG] Checking SGLang TP consistency for {weight_name}")
+    print(f"{'='*80}")
+    
+    weights_from_engines = []
+    
+    for i, engine in enumerate(rollout_engines):
+        try:
+            server_info = ray.get(engine.get_server_info.remote())
+            server_host = server_info["server_host"]
+            server_port = server_info["server_port"]
+            
+            tensor = _get_sglang_weight(server_host, server_port, weight_name, verbose=False)
+            if tensor is not None:
+                weight_sum = tensor.sum().item()
+                weight_norm = tensor.norm().item()
+                weights_from_engines.append((i, weight_sum, weight_norm, tensor.shape))
+                print(f"  Engine {i}: sum={weight_sum:.10e}, norm={weight_norm:.10e}, shape={tensor.shape}")
+            else:
+                print(f"  Engine {i}: FAILED to get weight")
+        except Exception as e:
+            print(f"  Engine {i}: ERROR - {e}")
+    
+    # Check consistency
+    if len(weights_from_engines) > 1:
+        ref_sum = weights_from_engines[0][1]
+        ref_norm = weights_from_engines[0][2]
+        all_match = True
+        for i, w_sum, w_norm, shape in weights_from_engines[1:]:
+            sum_diff = abs(w_sum - ref_sum)
+            norm_diff = abs(w_norm - ref_norm)
+            if sum_diff > 1e-6 or norm_diff > 1e-6:
+                all_match = False
+                print(f"  [Rank {rank}] Engine {i} differs from Engine 0: sum_diff={sum_diff:.6e}, norm_diff={norm_diff:.6e}")
+        
+        if all_match:
+            print(f"\nAll {len(weights_from_engines)} engines have consistent weights!")
+        else:
+            print(f"\n*** WARNING: TP workers have INCONSISTENT weights! ***")
+    
+    print(f"{'='*80}\n")
