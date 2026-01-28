@@ -493,9 +493,11 @@ class MegatronTrainRayActor(TrainRayActor):
                         print(f"[DEBUG] Weight check error: {e}", flush=True)
                 
                     # DEBUG: Compare Megatron vs SGLang weights (including experts)
+                    # Use weights_backuper.get() to get CPU weights (avoids offload issues)
                     try:
-                        from .debug_weight_sync import debug_compare_all_weights
-                        debug_compare_all_weights(self.model, rollout_engines, layer_idx=0, verbose=True)
+                        from .debug_weight_sync import debug_compare_weights_from_dict
+                        megatron_weights = self.weights_backuper.get("actor")
+                        debug_compare_weights_from_dict(megatron_weights, rollout_engines, layer_idx=0, verbose=True)
                     except Exception as e:
                         import traceback
                         print(f"[DEBUG] Weight comparison error: {e}", flush=True)
