@@ -286,17 +286,8 @@ def debug_compare_weights_from_dict(
     
     results = {}
     
-    # Compare Megatron rank R to SGLang engine R (same index). We must have that engine.
-    if len(rollout_engines) <= compare_rank:
-        print(
-            f"\n[DEBUG WEIGHT SYNC] Skipping: cannot compare Megatron rank {compare_rank} to SGLang "
-            f"because only {len(rollout_engines)} rollout engine(s) exist (need engine index {compare_rank}). "
-            "Use TP=1 EP=1 with one engine for single-rank comparison, or run with num_rollout_engines >= compare_rank+1."
-        )
-        return results
-    
     print(f"\n{'='*80}")
-    print(f"[DEBUG WEIGHT SYNC] Comparing Megatron rank {compare_rank} vs SGLang engine {compare_rank} for layer {layer_idx}")
+    print(f"[DEBUG WEIGHT SYNC] Comparing Megatron rank {compare_rank} vs SGLang for layer {layer_idx}")
     print(f"{'='*80}")
     
     try:
@@ -311,14 +302,30 @@ def debug_compare_weights_from_dict(
         
         print(f"  Megatron EP info: ep_size={ep_size}, ep_rank={ep_rank}")
         
-        # Use SGLang engine with the same index as compare_rank (Megatron rank R <-> SGLang engine R)
+        # Determine if we can do proper EP rank comparison
+        # With 1 rollout engine + EP>1, SGLang only serves EP rank 0's expert weights via API
+        # (Only tp_rank=0/moe_ep_rank=0 scheduler listens to tokenizer requests)
+        can_compare_experts = True
+        if len(rollout_engines) == 1 and ep_rank > 0:
+            print(f"\n  [WARNING] Single rollout engine with EP={ep_size}, but Megatron EP rank={ep_rank}")
+            print(f"  SGLang's API only returns weights from EP rank 0 (tp_rank=0 scheduler).")
+            print(f"  Expert weight comparison will be SKIPPED for this rank.")
+            print(f"  To compare rank {ep_rank}'s expert weights, you need:")
+            print(f"    - Multiple rollout engines (one per EP rank), OR")
+            print(f"    - Modify SGLang API to support ep_rank parameter")
+            can_compare_experts = False
+        
+        # Get SGLang server info - use engine 0 if only 1 engine exists
         print("\n[Step 1] Getting SGLang server info...")
         try:
-            engine_idx = compare_rank
+            engine_idx = min(ep_rank, len(rollout_engines) - 1)
             server_info = ray.get(rollout_engines[engine_idx].get_server_info.remote())
             server_host = server_info["server_host"]
             server_port = server_info["server_port"]
-            print(f"  Using SGLang engine {engine_idx} (Megatron rank {compare_rank} <-> SGLang engine {engine_idx}): {server_host}:{server_port}")
+            if len(rollout_engines) > 1:
+                print(f"  Using SGLang engine {engine_idx} for EP rank {ep_rank}: {server_host}:{server_port}")
+            else:
+                print(f"  Using SGLang engine 0 (only engine available): {server_host}:{server_port}")
         except Exception as e:
             print(f"[ERROR] Cannot get SGLang server info from engine {engine_idx}: {e}")
             return results
@@ -369,10 +376,14 @@ def debug_compare_weights_from_dict(
         
         # Check expert weights with detailed comparison
         print("\n[Step 4] Comparing expert weights...")
-        _compare_expert_weights_from_dict(
-            megatron_weights, layer_idx, server_host, server_port, results, verbose,
-            rollout_engines=rollout_engines
-        )
+        if can_compare_experts:
+            _compare_expert_weights_from_dict(
+                megatron_weights, layer_idx, server_host, server_port, results, verbose,
+                rollout_engines=rollout_engines
+            )
+        else:
+            print(f"  [SKIPPED] Expert comparison skipped - see warning above.")
+            print(f"  TIP: Use print_megatron_expert_stats() instead for manual comparison.")
         
         # Summary with comprehensive metrics
         print(f"\n{'='*80}")
@@ -419,7 +430,7 @@ def _compare_expert_weights_from_dict(
     server_port: int,
     results: Dict,
     verbose: bool,
-    rollout_engines: Optional[List] = None,
+    rollout_engines: Optional[List] = None,  # kept for backward compat, not used
 ):
     """Compare expert weights from CPU dict with comprehensive metrics.
     
@@ -430,9 +441,10 @@ def _compare_expert_weights_from_dict(
     - Megatron's linear_fc1 shape is [2*intermediate_size, hidden_size] which combines gate+up
     - HF's gate_up_proj shape is [2*intermediate_size, hidden_size]
     - With EP (Expert Parallelism), Megatron uses GLOBAL expert IDs (e.g., rank 1 has experts 16-31)
-      while SGLang uses LOCAL expert IDs (0-15 per EP rank). We need to:
-      1. Query the SGLang server corresponding to this EP rank
-      2. Convert global expert ID to local: local_id = global_id % num_experts_per_rank
+      while SGLang uses LOCAL expert IDs (0-15 per EP rank).
+    - This function converts global to local IDs when querying SGLang.
+    - Only works for rank 0 comparison (SGLang API hits EP rank 0 only).
+    - For other ranks, use print_megatron_expert_stats() for manual comparison.
     """
     # Get EP info from Megatron
     try:
@@ -483,11 +495,6 @@ def _compare_expert_weights_from_dict(
     print(f"  Found {len(expert_weights_fc1)} experts for fc1 (gate_up_proj)")
     print(f"  Found {len(expert_weights_fc2)} experts for fc2 (down_proj)")
     
-    # Use the server passed in by the caller (already the correct engine for this rank).
-    # Caller guarantees Megatron rank R is compared to SGLang engine R (rollout_engines[R]).
-    actual_server_host = server_host
-    actual_server_port = server_port
-    
     # Compare fc1 (gate_up_proj) with detailed metrics
     for global_expert_id in sorted(expert_weights_fc1.keys()):
         megatron_name, megatron_tensor = expert_weights_fc1[global_expert_id]
@@ -505,14 +512,14 @@ def _compare_expert_weights_from_dict(
             print(f"  Comparing Megatron expert {global_expert_id} (global) -> SGLang expert {local_expert_id} (local)")
         
         # Try to get the fused weight first (gate_up_proj)
-        sglang_tensor = _get_sglang_weight(actual_server_host, actual_server_port, hf_name_for_sglang, verbose)
+        sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name_for_sglang, verbose)
         
         if sglang_tensor is None:
             # Fallback: SGLang might store as separate gate_proj and up_proj
             gate_name = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.gate_proj.weight"
             up_name = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.up_proj.weight"
-            gate_tensor = _get_sglang_weight(actual_server_host, actual_server_port, gate_name, verbose)
-            up_tensor = _get_sglang_weight(actual_server_host, actual_server_port, up_name, verbose)
+            gate_tensor = _get_sglang_weight(server_host, server_port, gate_name, verbose)
+            up_tensor = _get_sglang_weight(server_host, server_port, up_name, verbose)
             
             if gate_tensor is not None and up_tensor is not None:
                 # Concatenate gate and up for comparison
@@ -538,7 +545,7 @@ def _compare_expert_weights_from_dict(
         hf_name_for_sglang = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.down_proj.weight"
         hf_name_display = f"model.layers.{layer_idx}.mlp.experts.{global_expert_id}.down_proj.weight"
         
-        sglang_tensor = _get_sglang_weight(actual_server_host, actual_server_port, hf_name_for_sglang, verbose)
+        sglang_tensor = _get_sglang_weight(server_host, server_port, hf_name_for_sglang, verbose)
         if sglang_tensor is not None:
             result = compare_weights_detailed(hf_name_display, megatron_tensor, sglang_tensor)
             results[hf_name_display] = result
@@ -856,21 +863,7 @@ def _compare_expert_weights(
         print(f"  Local expert IDs (Megatron global): {sorted(local_experts_w1.keys())}")
         print(f"  experts_per_rank={experts_per_rank}")
     
-    # Get the SGLang server for this EP rank
-    actual_server_host = server_host
-    actual_server_port = server_port
-    
-    if ep_size > 1 and len(rollout_engines) > ep_rank:
-        try:
-            server_info = ray.get(rollout_engines[ep_rank].get_server_info.remote())
-            actual_server_host = server_info["server_host"]
-            actual_server_port = server_info["server_port"]
-            print(f"  Using SGLang engine {ep_rank} (EP rank {ep_rank}): {actual_server_host}:{actual_server_port}")
-        except Exception as e:
-            print(f"  [WARN] Cannot get server info from engine {ep_rank}: {e}")
-            print(f"  Falling back to original server: {server_host}:{server_port}")
-    
-    # Compare with SGLang
+    # Compare with SGLang (uses passed server - only EP rank 0 accessible via API)
     # SGLang expert name pattern: model.layers.{layer}.mlp.experts.{local_expert_id}.gate_up_proj.weight
     for global_expert_id, megatron_w1 in sorted(local_experts_w1.items()):
         # Convert global expert ID to local expert ID
@@ -882,7 +875,7 @@ def _compare_expert_weights(
         if verbose:
             print(f"  Comparing Megatron expert {global_expert_id} (global) -> SGLang expert {local_expert_id} (local)")
         
-        sglang_w1 = _get_sglang_weight(actual_server_host, actual_server_port, hf_name_for_sglang, verbose)
+        sglang_w1 = _get_sglang_weight(server_host, server_port, hf_name_for_sglang, verbose)
         
         if sglang_w1 is not None:
             meg_sum = megatron_w1.sum().item()
@@ -908,7 +901,7 @@ def _compare_expert_weights(
         hf_name_for_sglang = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.down_proj.weight"
         hf_name_display = f"model.layers.{layer_idx}.mlp.experts.{global_expert_id}.down_proj.weight"
         
-        sglang_w2 = _get_sglang_weight(actual_server_host, actual_server_port, hf_name_for_sglang, verbose)
+        sglang_w2 = _get_sglang_weight(server_host, server_port, hf_name_for_sglang, verbose)
         
         if sglang_w2 is not None:
             meg_sum = megatron_w2.sum().item()
@@ -1220,3 +1213,193 @@ def debug_check_sglang_tp_consistency(
             print(f"\n*** WARNING: TP workers have INCONSISTENT weights! ***")
     
     print(f"{'='*80}\n")
+
+
+# =============================================================================
+# Simple "Print Stats" Approach - No API needed, just print from both sides
+# =============================================================================
+
+def print_megatron_expert_stats(
+    megatron_weights: Mapping[str, torch.Tensor],
+    layer_idx: int = 0,
+    num_experts_to_print: int = 3,
+):
+    """
+    Print weight stats for local experts from Megatron side.
+    Call this on each rank to see what experts that rank holds.
+    
+    Usage (in actor.py after weight sync):
+        from .debug_weight_sync import print_megatron_expert_stats
+        megatron_weights = self.weights_backuper.get("actor")
+        print_megatron_expert_stats(megatron_weights, layer_idx=0)
+    
+    Each rank will print its LOCAL experts. Compare output across ranks:
+    - Megatron rank 1's expert 16 (global) should match SGLang EP rank 1's expert 0 (local)
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
+    try:
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        ep_rank = mpu.get_expert_model_parallel_rank()
+    except:
+        ep_size = 1
+        ep_rank = 0
+    
+    print(f"\n{'='*80}")
+    print(f"[MEGATRON EXPERT STATS] Rank {rank}, EP rank {ep_rank}/{ep_size}, Layer {layer_idx}")
+    print(f"{'='*80}")
+    
+    # Find expert weights
+    expert_fc1_pattern = re.compile(
+        rf"module\.module\.decoder\.layers\.{layer_idx}\.mlp\.experts\.linear_fc1\.weight(\d+)"
+    )
+    expert_fc2_pattern = re.compile(
+        rf"module\.module\.decoder\.layers\.{layer_idx}\.mlp\.experts\.linear_fc2\.weight(\d+)"
+    )
+    
+    expert_weights_fc1 = {}
+    expert_weights_fc2 = {}
+    
+    for name, tensor in megatron_weights.items():
+        match_fc1 = expert_fc1_pattern.match(name)
+        match_fc2 = expert_fc2_pattern.match(name)
+        if match_fc1:
+            expert_id = int(match_fc1.group(1))
+            expert_weights_fc1[expert_id] = tensor
+        elif match_fc2:
+            expert_id = int(match_fc2.group(1))
+            expert_weights_fc2[expert_id] = tensor
+    
+    num_local_experts = len(expert_weights_fc1)
+    print(f"  Local experts: {num_local_experts}")
+    if num_local_experts > 0:
+        min_id = min(expert_weights_fc1.keys())
+        max_id = max(expert_weights_fc1.keys())
+        print(f"  Global expert IDs: {min_id} to {max_id}")
+    
+    # Print stats for first few experts
+    print(f"\n  Expert fc1 (gate_up_proj) stats:")
+    for i, global_expert_id in enumerate(sorted(expert_weights_fc1.keys())):
+        if i >= num_experts_to_print:
+            print(f"  ... and {num_local_experts - num_experts_to_print} more experts")
+            break
+        
+        tensor = expert_weights_fc1[global_expert_id]
+        local_expert_id = global_expert_id % num_local_experts if num_local_experts > 0 else global_expert_id
+        
+        t = tensor.to(torch.float64)
+        stats = {
+            'sum': t.sum().item(),
+            'mean': t.mean().item(),
+            'std': t.std().item(),
+            'min': t.min().item(),
+            'max': t.max().item(),
+            'norm': t.norm().item(),
+        }
+        print(f"    Expert {global_expert_id} (local {local_expert_id}): shape={list(tensor.shape)}, dtype={tensor.dtype}")
+        print(f"      sum={stats['sum']:.10e}, norm={stats['norm']:.10e}")
+        print(f"      mean={stats['mean']:.10e}, std={stats['std']:.10e}")
+        print(f"      min={stats['min']:.10e}, max={stats['max']:.10e}")
+    
+    # Also print router weight for reference
+    router_name = f"module.module.decoder.layers.{layer_idx}.mlp.router.weight"
+    if router_name in megatron_weights:
+        tensor = megatron_weights[router_name]
+        t = tensor.to(torch.float64)
+        print(f"\n  Router weight: shape={list(tensor.shape)}")
+        print(f"    sum={t.sum().item():.10e}, norm={t.norm().item():.10e}")
+    
+    print(f"{'='*80}\n")
+
+
+def print_sglang_expert_stats_via_api(
+    rollout_engines: List,
+    layer_idx: int = 0,
+    num_experts_to_print: int = 3,
+):
+    """
+    Print weight stats for experts from SGLang side via API.
+    This queries SGLang's API and prints stats for comparison with Megatron.
+    
+    Note: With 1 rollout engine, this only prints EP rank 0's experts (local IDs 0, 1, 2, ...).
+    
+    Usage:
+        from .debug_weight_sync import print_sglang_expert_stats_via_api
+        print_sglang_expert_stats_via_api(rollout_engines, layer_idx=0)
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank != 0:
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"[SGLANG EXPERT STATS via API] Layer {layer_idx}")
+    print(f"{'='*80}")
+    
+    try:
+        server_info = ray.get(rollout_engines[0].get_server_info.remote())
+        server_host = server_info["server_host"]
+        server_port = server_info["server_port"]
+        print(f"  Server: {server_host}:{server_port}")
+    except Exception as e:
+        print(f"  ERROR: Cannot get server info: {e}")
+        return
+    
+    print(f"\n  Expert gate_up_proj stats (LOCAL expert IDs, from EP rank 0):")
+    for local_expert_id in range(num_experts_to_print):
+        hf_name = f"model.layers.{layer_idx}.mlp.experts.{local_expert_id}.gate_up_proj.weight"
+        tensor = _get_sglang_weight(server_host, server_port, hf_name, verbose=False)
+        
+        if tensor is not None:
+            t = tensor.to(torch.float64)
+            stats = {
+                'sum': t.sum().item(),
+                'mean': t.mean().item(),
+                'std': t.std().item(),
+                'min': t.min().item(),
+                'max': t.max().item(),
+                'norm': t.norm().item(),
+            }
+            print(f"    Expert {local_expert_id} (local): shape={list(tensor.shape)}")
+            print(f"      sum={stats['sum']:.10e}, norm={stats['norm']:.10e}")
+            print(f"      mean={stats['mean']:.10e}, std={stats['std']:.10e}")
+            print(f"      min={stats['min']:.10e}, max={stats['max']:.10e}")
+        else:
+            print(f"    Expert {local_expert_id}: FAILED to retrieve")
+    
+    # Also print router for reference
+    router_name = f"model.layers.{layer_idx}.mlp.gate.weight"
+    tensor = _get_sglang_weight(server_host, server_port, router_name, verbose=False)
+    if tensor is not None:
+        t = tensor.to(torch.float64)
+        print(f"\n  Router weight: shape={list(tensor.shape)}")
+        print(f"    sum={t.sum().item():.10e}, norm={t.norm().item():.10e}")
+    
+    print(f"{'='*80}\n")
+
+
+def print_expert_stats_for_comparison(
+    megatron_weights: Mapping[str, torch.Tensor],
+    rollout_engines: List,
+    layer_idx: int = 0,
+):
+    """
+    Print expert stats from both Megatron and SGLang for manual comparison.
+    
+    Call this on all ranks. Each Megatron rank prints its local experts.
+    SGLang API is only called from rank 0 (returns EP rank 0's experts).
+    
+    To verify weight sync:
+    - Megatron rank 0's expert 0 (global=0) should match SGLang's expert 0 (local=0)
+    - Megatron rank 1's expert 16 (global=16) should match SGLang EP rank 1's expert 0
+      (but SGLang API only returns EP rank 0, so you'd need to add print on SGLang side)
+    
+    Usage:
+        from .debug_weight_sync import print_expert_stats_for_comparison
+        megatron_weights = self.weights_backuper.get("actor")
+        print_expert_stats_for_comparison(megatron_weights, rollout_engines, layer_idx=0)
+    """
+    # Print Megatron stats (all ranks print their own)
+    print_megatron_expert_stats(megatron_weights, layer_idx, num_experts_to_print=3)
+    
+    # Print SGLang stats via API (only rank 0, only EP rank 0's experts)
+    print_sglang_expert_stats_via_api(rollout_engines, layer_idx, num_experts_to_print=3)
