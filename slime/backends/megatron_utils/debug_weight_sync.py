@@ -22,13 +22,41 @@ logger = logging.getLogger(__name__)
 
 
 def _process_sglang_return(ret):
-    """Process return value from SGLang get_weights_by_name API."""
+    """Process return value from SGLang get_weights_by_name API.
+    
+    Returns:
+        np.ndarray of the weight, or None if ret is None/empty.
+        
+    Note: 
+        - For single DP worker: ret is the weight directly (nested list from tolist())
+        - For multiple DP workers: ret is [worker0_weight, worker1_weight, ...]
+        
+        We detect DP case by checking if ret[0] is also a nested list with same structure.
+        A 2D weight [[row0], [row1], ...] has ret[0] as a 1D list (single row).
+        DP multi-return [weight0, weight1, ...] has ret[0] as a 2D list (full weight).
+    """
     if ret is None:
         return None
-    if isinstance(ret, list) and len(ret) >= 1:
-        # DP case: multiple returns, take the first one
-        return np.array(ret[0])
-    return np.array(ret)
+    
+    # Convert to numpy array directly - this handles both cases correctly
+    arr = np.array(ret)
+    
+    # Check if this is DP multi-return case: shape would be (dp_size, rows, cols) for 2D weights
+    # or (dp_size, size) for 1D weights
+    # In DP case, we take the first worker's result
+    if arr.ndim >= 3:
+        # Multi-DP case for 2D+ weights: (dp_size, ...) -> take first
+        return arr[0]
+    elif arr.ndim == 2:
+        # Could be: 
+        # 1. Single DP 2D weight: shape (rows, cols) - return as is
+        # 2. Multi-DP 1D weight: shape (dp_size, size) - take first
+        # Heuristic: if first dim is small (like dp_size <= 8), might be DP case
+        # But safer to assume it's 2D weight and return as is
+        return arr
+    else:
+        # 1D or scalar
+        return arr
 
 
 def debug_compare_weights_from_dict(
