@@ -273,9 +273,9 @@ def debug_compare_weights_from_dict(
         layer_idx: Which layer to compare
         verbose: Print detailed info
         compare_rank: Which rank runs the comparison (default 0). Only this rank runs; others return {}.
-                      Use compare_rank=1 to compare rank 1's Megatron weights vs SGLang.
-                      Note: With TP > 1, Megatron holds shards per rank while SGLang holds the full
-                      assembled weight—shapes will differ unless SGLang weight is sliced to this rank's shard.
+                      We compare Megatron rank R to SGLang engine R (rollout_engines[R]). You must have
+                      at least compare_rank+1 rollout engines; otherwise comparison is skipped.
+                      Use compare_rank=1 to compare rank 1's Megatron weights to SGLang engine 1 (not engine 0).
     
     Returns:
         Dict mapping weight name to (megatron_sum, sglang_sum, diff)
@@ -286,12 +286,21 @@ def debug_compare_weights_from_dict(
     
     results = {}
     
+    # Compare Megatron rank R to SGLang engine R (same index). We must have that engine.
+    if len(rollout_engines) <= compare_rank:
+        print(
+            f"\n[DEBUG WEIGHT SYNC] Skipping: cannot compare Megatron rank {compare_rank} to SGLang "
+            f"because only {len(rollout_engines)} rollout engine(s) exist (need engine index {compare_rank}). "
+            "Use TP=1 EP=1 with one engine for single-rank comparison, or run with num_rollout_engines >= compare_rank+1."
+        )
+        return results
+    
     print(f"\n{'='*80}")
-    print(f"[DEBUG WEIGHT SYNC] Comparing Megatron (rank {compare_rank}) vs SGLang weights for layer {layer_idx}")
+    print(f"[DEBUG WEIGHT SYNC] Comparing Megatron rank {compare_rank} vs SGLang engine {compare_rank} for layer {layer_idx}")
     print(f"{'='*80}")
     
     try:
-        # Get EP info from Megatron
+        # Get EP info from Megatron (for expert-weight logic and logging)
         try:
             ep_size = mpu.get_expert_model_parallel_world_size()
             ep_rank = mpu.get_expert_model_parallel_rank()
@@ -302,21 +311,16 @@ def debug_compare_weights_from_dict(
         
         print(f"  Megatron EP info: ep_size={ep_size}, ep_rank={ep_rank}")
         
-        # Get server info - use the SGLang engine corresponding to this EP rank
-        # For non-expert weights (like router), we can use any engine
-        # For expert weights, we'll select the correct engine in _compare_expert_weights_from_dict
+        # Use SGLang engine with the same index as compare_rank (Megatron rank R <-> SGLang engine R)
         print("\n[Step 1] Getting SGLang server info...")
         try:
-            # Select engine based on EP rank for better accuracy
-            engine_idx = min(ep_rank, len(rollout_engines) - 1)
+            engine_idx = compare_rank
             server_info = ray.get(rollout_engines[engine_idx].get_server_info.remote())
             server_host = server_info["server_host"]
             server_port = server_info["server_port"]
-            print(f"  Using SGLang engine {engine_idx}: {server_host}:{server_port}")
-            if ep_rank != engine_idx:
-                print(f"  [WARN] EP rank {ep_rank} but using engine {engine_idx} (not enough engines)")
+            print(f"  Using SGLang engine {engine_idx} (Megatron rank {compare_rank} <-> SGLang engine {engine_idx}): {server_host}:{server_port}")
         except Exception as e:
-            print(f"[ERROR] Cannot get SGLang server info: {e}")
+            print(f"[ERROR] Cannot get SGLang server info from engine {engine_idx}: {e}")
             return results
         
         # Print available Megatron weight keys for this layer
@@ -479,28 +483,10 @@ def _compare_expert_weights_from_dict(
     print(f"  Found {len(expert_weights_fc1)} experts for fc1 (gate_up_proj)")
     print(f"  Found {len(expert_weights_fc2)} experts for fc2 (down_proj)")
     
-    # Get the SGLang server for this EP rank
-    # With EP, different SGLang engines serve different EP shards
-    # We need to find the engine that corresponds to this EP rank
+    # Use the server passed in by the caller (already the correct engine for this rank).
+    # Caller guarantees Megatron rank R is compared to SGLang engine R (rollout_engines[R]).
     actual_server_host = server_host
     actual_server_port = server_port
-    
-    if rollout_engines is not None and ep_size > 1:
-        # Try to find the SGLang engine corresponding to this EP rank
-        # Assumption: rollout_engines are ordered by EP rank (or we need to query each to find the right one)
-        # For now, we select engine based on ep_rank if we have enough engines
-        if len(rollout_engines) > ep_rank:
-            try:
-                server_info = ray.get(rollout_engines[ep_rank].get_server_info.remote())
-                actual_server_host = server_info["server_host"]
-                actual_server_port = server_info["server_port"]
-                print(f"  Using SGLang engine {ep_rank} (EP rank {ep_rank}): {actual_server_host}:{actual_server_port}")
-            except Exception as e:
-                print(f"  [WARN] Cannot get server info from engine {ep_rank}: {e}")
-                print(f"  Falling back to original server: {server_host}:{server_port}")
-        else:
-            print(f"  [WARN] Not enough rollout_engines ({len(rollout_engines)}) for ep_rank={ep_rank}")
-            print(f"  Using original server: {server_host}:{server_port}")
     
     # Compare fc1 (gate_up_proj) with detailed metrics
     for global_expert_id in sorted(expert_weights_fc1.keys()):
