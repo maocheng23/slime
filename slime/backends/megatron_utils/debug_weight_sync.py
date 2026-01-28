@@ -148,6 +148,7 @@ def print_weight_comparison(result: WeightComparisonResult, verbose: bool = True
     """Print weight comparison result with optional verbosity."""
     if result.is_match:
         if verbose:
+            rank = dist.get_rank() if dist.is_initialized() else 0
             # Check if it's an exact match (abs_diff_sum == 0)
             if result.abs_diff_sum == 0:
                 print(f"  [Rank {rank}] OK: {result.name} [EXACT MATCH]")
