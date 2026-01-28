@@ -86,7 +86,21 @@ def train(args):
         offload_train()
         if args.offload_rollout:
             ray.get(rollout_manager.onload_weights.remote())
+        
+        # 第一次同步：Megatron 新权重 W' → SGLang
         actor_model.update_weights()
+        
+        # 验证同步正确性（需要两次 update_weights）
+        if args.check_weight_update_equal:
+            # 1. 保存同步后的 SGLang 权重 W'（此时应该 = Megatron W'）
+            ray.get(rollout_manager.check_weights.remote(action="snapshot"))
+            # 2. 打乱 SGLang 权重
+            ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
+            # 3. 再次同步：Megatron W' → SGLang
+            actor_model.update_weights()
+            # 4. 比较：snapshot(W') vs 当前 SGLang(W') → 应该相等
+            ray.get(rollout_manager.check_weights.remote(action="compare"))
+        
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())
 

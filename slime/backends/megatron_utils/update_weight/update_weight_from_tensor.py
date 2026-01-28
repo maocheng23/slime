@@ -123,7 +123,32 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
 
+        import os
+        debug_router_sync = os.environ.get("DEBUG_ROUTER_GRAD_SYNC", "0") == "1"
+        
+        # DEBUG: Print Megatron local router weight before conversion
+        if debug_router_sync:
+            for name, tensor in megatron_local_weights.items():
+                if "mlp.router.weight" in name and "layers.0." in name:
+                    print(f"[DEBUG ROUTER SYNC][Rank {rank}] Megatron local weight:", flush=True)
+                    print(f"  Name: {name}", flush=True)
+                    print(f"  Shape: {tensor.shape}", flush=True)
+                    print(f"  Sum: {tensor.float().sum().item():.10e}", flush=True)
+                    print(f"  First 5: {tensor.flatten()[:5].tolist()}", flush=True)
+                    break
+        
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+            # DEBUG: Print router weight info being sent to SGLang
+            if debug_router_sync and rank == 0:
+                for hf_name, hf_tensor in hf_named_tensors:
+                    if "mlp.gate.weight" in hf_name and "layers.0." in hf_name:
+                        print(f"[DEBUG ROUTER SYNC][Rank {rank}] Sending to SGLang:", flush=True)
+                        print(f"  Name: {hf_name}", flush=True)
+                        print(f"  Shape: {hf_tensor.shape}", flush=True)
+                        print(f"  Sum: {hf_tensor.float().sum().item():.10e}", flush=True)
+                        print(f"  First 5: {hf_tensor.flatten()[:5].tolist()}", flush=True)
+                        break
+            
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
             del long_lived_tensors

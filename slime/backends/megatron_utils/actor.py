@@ -477,6 +477,10 @@ class MegatronTrainRayActor(TrainRayActor):
             
             # Check weight sync if enabled
             if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1":
+                # Ensure all ranks have finished update_weights before debugging
+                dist.barrier()
+                torch.cuda.synchronize()
+                
                 if dist.get_rank() == 0:
                     print("[DEBUG] Running weight check after update_weights...", flush=True)
                     try:
@@ -488,12 +492,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     except Exception as e:
                         print(f"[DEBUG] Weight check error: {e}", flush=True)
                 
-                # DEBUG: Compare Megatron vs SGLang weights (including experts)
-                try:
-                    from .debug_weight_sync import debug_compare_all_weights
-                    debug_compare_all_weights(self.model, rollout_engines, layer_idx=0, verbose=True)
-                except Exception as e:
-                    print(f"[DEBUG] Weight comparison error: {e}", flush=True)
+                    # DEBUG: Compare Megatron vs SGLang weights (including experts)
+                    try:
+                        from .debug_weight_sync import debug_compare_all_weights
+                        debug_compare_all_weights(self.model, rollout_engines, layer_idx=0, verbose=True)
+                    except Exception as e:
+                        import traceback
+                        print(f"[DEBUG] Weight comparison error: {e}", flush=True)
+                        traceback.print_exc()
+                
+                # Sync all ranks again after debugging
+                dist.barrier()
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)

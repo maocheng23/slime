@@ -30,6 +30,58 @@ def _process_sglang_return(ret):
     return np.array(ret)
 
 
+def debug_print_megatron_weights(
+    model: List[torch.nn.Module],
+    layer_idx: int = 0,
+    verbose: bool = True,
+) -> Dict[str, float]:
+    """
+    Print Megatron weight sums for debugging (no SGLang comparison).
+    This is a safe version that only reads Megatron weights.
+    
+    Returns:
+        Dict mapping weight name to sum
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank != 0:
+        return {}
+    
+    results = {}
+    
+    print(f"\n{'='*80}")
+    print(f"[DEBUG] Megatron weight sums for layer {layer_idx}")
+    print(f"{'='*80}")
+    
+    try:
+        # Sync CUDA to ensure all operations are complete
+        torch.cuda.synchronize()
+        
+        for model_module in model:
+            for name, param in model_module.named_parameters():
+                if f"layers.{layer_idx}" in name:
+                    try:
+                        # Safely copy to CPU first, then compute sum
+                        with torch.no_grad():
+                            cpu_data = param.data.detach().clone().cpu().float()
+                            weight_sum = cpu_data.sum().item()
+                        results[name] = weight_sum
+                        if verbose:
+                            print(f"  {name}: shape={list(param.shape)}, sum={weight_sum:.10e}")
+                        # Free CPU memory immediately
+                        del cpu_data
+                    except Exception as e:
+                        print(f"  {name}: ERROR - {e}")
+        
+        print(f"{'='*80}\n")
+        
+    except Exception as e:
+        print(f"[DEBUG] Megatron weight print error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return results
+
+
 def debug_compare_all_weights(
     model: List[torch.nn.Module],
     rollout_engines: List,
@@ -52,54 +104,80 @@ def debug_compare_all_weights(
     print(f"[DEBUG WEIGHT SYNC] Comparing Megatron vs SGLang weights for layer {layer_idx}")
     print(f"{'='*80}")
     
-    # Get server info
     try:
-        server_info = ray.get(rollout_engines[0].get_server_info.remote())
-        server_host = server_info["server_host"]
-        server_port = server_info["server_port"]
+        # Sync CUDA to ensure all operations are complete
+        torch.cuda.synchronize()
+        
+        # First, print Megatron weights (safe operation)
+        print("\n[Step 1] Reading Megatron weights...")
+        megatron_weights = debug_print_megatron_weights(model, layer_idx, verbose=False)
+        print(f"  Successfully read {len(megatron_weights)} weights from Megatron")
+        
+        # Get server info
+        print("\n[Step 2] Getting SGLang server info...")
+        try:
+            server_info = ray.get(rollout_engines[0].get_server_info.remote())
+            server_host = server_info["server_host"]
+            server_port = server_info["server_port"]
+            print(f"  SGLang server: {server_host}:{server_port}")
+        except Exception as e:
+            print(f"[ERROR] Cannot get SGLang server info: {e}")
+            return results
+        
+        # Weight name mappings: Megatron -> HuggingFace
+        weight_mappings = {
+            # Router
+            f"layers.{layer_idx}.mlp.router.weight": f"model.layers.{layer_idx}.mlp.gate.weight",
+            # Shared experts
+            f"layers.{layer_idx}.mlp.shared_experts.linear_fc1.weight": f"model.layers.{layer_idx}.mlp.shared_expert.gate_up_proj.weight",
+            f"layers.{layer_idx}.mlp.shared_experts.linear_fc2.weight": f"model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight",
+            # Expert weights (will be handled specially for EP)
+        }
+        
+        # Check regular weights
+        print("\n[Step 3] Comparing regular weights...")
+        for megatron_pattern, hf_name in weight_mappings.items():
+            try:
+                _compare_single_weight(model, megatron_pattern, hf_name, 
+                                      server_host, server_port, results, verbose)
+            except Exception as e:
+                print(f"[ERROR] Failed to compare {megatron_pattern}: {e}")
+        
+        # Check expert weights (need special handling for EP)
+        print("\n[Step 4] Comparing expert weights...")
+        try:
+            _compare_expert_weights(model, rollout_engines, layer_idx, 
+                                   server_host, server_port, results, verbose)
+        except Exception as e:
+            print(f"[ERROR] Failed to compare expert weights: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Summary
+        print(f"\n{'='*80}")
+        print(f"[SUMMARY] Weight comparison results:")
+        has_error = False
+        for name, (meg_sum, sgl_sum, diff) in results.items():
+            status = "OK" if diff < 1e-5 else "MISMATCH"
+            if diff >= 1e-5:
+                has_error = True
+                print(f"  {status}: {name}")
+                print(f"    Megatron sum: {meg_sum:.10e}")
+                print(f"    SGLang sum:   {sgl_sum:.10e}")
+                print(f"    Diff:         {diff:.6e}")
+            elif verbose:
+                print(f"  {status}: {name} (diff={diff:.6e})")
+        
+        if has_error:
+            print(f"\n*** WARNING: Weight mismatch detected! ***")
+        else:
+            print(f"\nAll weights match!")
+        print(f"{'='*80}\n")
+        
     except Exception as e:
-        print(f"[ERROR] Cannot get SGLang server info: {e}")
-        return results
-    
-    # Weight name mappings: Megatron -> HuggingFace
-    weight_mappings = {
-        # Router
-        f"layers.{layer_idx}.mlp.router.weight": f"model.layers.{layer_idx}.mlp.gate.weight",
-        # Shared experts
-        f"layers.{layer_idx}.mlp.shared_experts.linear_fc1.weight": f"model.layers.{layer_idx}.mlp.shared_expert.gate_up_proj.weight",
-        f"layers.{layer_idx}.mlp.shared_experts.linear_fc2.weight": f"model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight",
-        # Expert weights (will be handled specially for EP)
-    }
-    
-    # Check regular weights
-    for megatron_pattern, hf_name in weight_mappings.items():
-        _compare_single_weight(model, megatron_pattern, hf_name, 
-                              server_host, server_port, results, verbose)
-    
-    # Check expert weights (need special handling for EP)
-    _compare_expert_weights(model, rollout_engines, layer_idx, 
-                           server_host, server_port, results, verbose)
-    
-    # Summary
-    print(f"\n{'='*80}")
-    print(f"[SUMMARY] Weight comparison results:")
-    has_error = False
-    for name, (meg_sum, sgl_sum, diff) in results.items():
-        status = "OK" if diff < 1e-5 else "MISMATCH"
-        if diff >= 1e-5:
-            has_error = True
-            print(f"  {status}: {name}")
-            print(f"    Megatron sum: {meg_sum:.10e}")
-            print(f"    SGLang sum:   {sgl_sum:.10e}")
-            print(f"    Diff:         {diff:.6e}")
-        elif verbose:
-            print(f"  {status}: {name} (diff={diff:.6e})")
-    
-    if has_error:
-        print(f"\n*** WARNING: Weight mismatch detected! ***")
-    else:
-        print(f"\nAll weights match!")
-    print(f"{'='*80}\n")
+        print(f"[DEBUG] Weight comparison error: {e}")
+        import traceback
+        traceback.print_exc()
     
     return results
 
@@ -127,6 +205,20 @@ def _get_sglang_weight(server_host: str, server_port: int, hf_name: str, verbose
     return None
 
 
+def _safe_get_cpu_tensor(param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+    """Safely copy a CUDA tensor to CPU with proper synchronization."""
+    try:
+        if param.device.type == 'cuda':
+            torch.cuda.synchronize(param.device)
+        # Clone first, then detach and move to CPU
+        with torch.no_grad():
+            cpu_tensor = param.data.clone().detach().cpu().float()
+        return cpu_tensor
+    except Exception as e:
+        print(f"[ERROR] Failed to copy tensor to CPU: {e}")
+        return None
+
+
 def _compare_single_weight(
     model: List[torch.nn.Module],
     megatron_pattern: str,
@@ -142,7 +234,7 @@ def _compare_single_weight(
     for model_module in model:
         for name, param in model_module.named_parameters():
             if megatron_pattern in name:
-                megatron_weight = param.data.detach().cpu().float()
+                megatron_weight = _safe_get_cpu_tensor(param)
                 break
         if megatron_weight is not None:
             break
@@ -175,11 +267,19 @@ def _compare_expert_weights(
 ):
     """Compare expert weights (handles EP distribution)."""
     # Get EP info
-    ep_size = mpu.get_expert_model_parallel_world_size()
-    ep_rank = mpu.get_expert_model_parallel_rank()
+    try:
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        ep_rank = mpu.get_expert_model_parallel_rank()
+    except Exception as e:
+        print(f"[ERROR] Cannot get EP info: {e}")
+        ep_size = 1
+        ep_rank = 0
     
     if verbose:
         print(f"\n[Expert Weights] EP size={ep_size}, EP rank={ep_rank}")
+    
+    # Sync CUDA before accessing weights
+    torch.cuda.synchronize()
     
     # Collect local expert weights from Megatron
     # Pattern: layers.{layer_idx}.mlp.experts.linear_fc1.weight{expert_id}
@@ -193,10 +293,12 @@ def _compare_expert_weights(
                 match = re.search(r'weight(\d+)$', name)
                 if match:
                     expert_id = int(match.group(1))
-                    if "linear_fc1" in name:
-                        local_experts_w1[expert_id] = param.data.detach().cpu().float()
-                    elif "linear_fc2" in name:
-                        local_experts_w2[expert_id] = param.data.detach().cpu().float()
+                    cpu_tensor = _safe_get_cpu_tensor(param)
+                    if cpu_tensor is not None:
+                        if "linear_fc1" in name:
+                            local_experts_w1[expert_id] = cpu_tensor
+                        elif "linear_fc2" in name:
+                            local_experts_w2[expert_id] = cpu_tensor
     
     if verbose:
         print(f"  Found {len(local_experts_w1)} local experts for fc1")
