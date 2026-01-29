@@ -489,6 +489,26 @@ def train_one_step(
         if debug_weight_update:
             print(f"\n[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step():", flush=True)
             logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step(): update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}")
+            
+            # CRITICAL: Verify weights are identical across all ranks after optimizer.step()
+            # This catches divergence before weight sync to SGLang
+            if os.environ.get("DEBUG_WEIGHT_CONSISTENCY", "0") == "1":
+                world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+                for model_chunk in model:
+                    for name, param in model_chunk.named_parameters():
+                        if "layers.46." in name and ("experts" in name or "router" in name or "self_attention" in name):
+                            weight_sum = param.data.float().sum().item()
+                            local_tensor = torch.tensor([weight_sum], device=param.device)
+                            all_sums = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+                            torch.distributed.all_gather(all_sums, local_tensor)
+                            sums = [s.item() for s in all_sums]
+                            max_diff = max(sums) - min(sums)
+                            if rank == 0 and max_diff > 1e-10:
+                                print(f"[DEBUG_WEIGHT_CONSISTENCY] WARNING: {name} differs across ranks!", flush=True)
+                                print(f"  sums: {[f'{s:.10e}' for s in sums]}", flush=True)
+                                print(f"  max_diff: {max_diff:.6e}", flush=True)
+                            elif rank == 0 and "router" in name:
+                                print(f"[DEBUG_WEIGHT_CONSISTENCY] OK: {name} identical across ranks", flush=True)
             if rank == 0:
                 print(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step(): update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}", flush=True)
             logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step(): update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}")
