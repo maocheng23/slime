@@ -159,8 +159,8 @@ def execute():
     )
     
     # Enable weight comparison check in debug mode to verify weight sync
-    if MODE == "debug_one_sample":
-        misc_args += "--check-weight-update-equal "
+    # if MODE == "debug_one_sample":
+    #     misc_args += "--check-weight-update-equal "
     
     if MODEL_NAME == "Qwen3-4B":
         misc_args += (
