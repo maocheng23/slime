@@ -442,11 +442,42 @@ def train_one_step(
         check_mtp_only_grad(model, step_id)
 
     if valid_step:
+        # DEBUG: Check weights and gradients before optimizer.step()
+        import os
+        debug_weight_update = os.environ.get("DEBUG_WEIGHT_UPDATE", "0") == "1"
+        weight_snapshots_before = {}
+        if debug_weight_update:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"\n[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] Before optimizer.step():", flush=True)
+            for model_chunk in model:
+                for name, param in model_chunk.named_parameters():
+                    if "layers.47" in name and ("experts" in name or "router" in name or "gate" in name):
+                        weight_sum = param.data.float().sum().item()
+                        weight_snapshots_before[name] = weight_sum
+                        grad_info = "None"
+                        if param.grad is not None:
+                            grad_sum = param.grad.float().sum().item()
+                            grad_norm_val = param.grad.float().norm().item()
+                            grad_info = f"sum={grad_sum:.10e}, norm={grad_norm_val:.10e}"
+                        print(f"  {name}: weight_sum={weight_sum:.10e}, grad={grad_info}", flush=True)
+        
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         
+        # DEBUG: Check weights after optimizer.step()
+        if debug_weight_update:
+            print(f"\n[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step():", flush=True)
+            print(f"  update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}", flush=True)
+            for model_chunk in model:
+                for name, param in model_chunk.named_parameters():
+                    if "layers.47" in name and ("experts" in name or "router" in name or "gate" in name):
+                        weight_sum_after = param.data.float().sum().item()
+                        weight_sum_before = weight_snapshots_before.get(name, 0)
+                        weight_diff = weight_sum_after - weight_sum_before
+                        changed = "CHANGED" if abs(weight_diff) > 1e-12 else "UNCHANGED"
+                        print(f"  {name}: weight_sum={weight_sum_after:.10e}, diff={weight_diff:.10e} [{changed}]", flush=True)
+        
         # DEBUG: Check router weights consistency after optimizer step
-        import os
         if os.environ.get("DEBUG_ROUTER_GRAD_SYNC", "0") == "1":
             _debug_check_router_weights_after_optimizer_step(model, step_id)
 
