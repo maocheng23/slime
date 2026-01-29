@@ -434,6 +434,12 @@ def train_one_step(
             else:
                 valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
 
+    # DEBUG: Per-layer gradient norm analysis
+    # Enable with DEBUG_PER_LAYER_GRAD_NORM=1 environment variable
+    import os
+    if os.environ.get("DEBUG_PER_LAYER_GRAD_NORM", "0") == "1":
+        _debug_per_layer_grad_norm(model, step_id, args)
+
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step
     if args.ci_test and args.enable_mtp_training:
@@ -545,6 +551,148 @@ def train_one_step(
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
     """Block forward pre-hook for certain configurations."""
     return args.use_distributed_optimizer and args.overlap_param_gather
+
+
+def _debug_per_layer_grad_norm(model, step_id, args):
+    """DEBUG: Compute and log per-layer gradient norms for first and last layers.
+    
+    This helps diagnose if certain layers are not receiving gradients properly.
+    Enable with DEBUG_PER_LAYER_GRAD_NORM=1 environment variable.
+    
+    Logs gradient norms for:
+    - Layer 0 (first transformer layer)
+    - Layer 47 (last transformer layer, or num_layers-1)
+    - Embedding layer
+    - Output layer (lm_head)
+    - Router weights (if MoE)
+    """
+    import torch.distributed as dist
+    import re
+    from collections import defaultdict
+    
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
+    # Only log on rank 0 to avoid spam
+    if rank != 0:
+        return
+    
+    # Determine last layer index
+    num_layers = getattr(args, 'num_layers', 48)
+    target_layers = [0, num_layers - 1]  # First and last layers
+    
+    # Collect gradient norms by category
+    layer_grad_norms = defaultdict(lambda: {"total_sq": 0.0, "count": 0, "params": []})
+    special_params = {}  # embedding, output, router
+    
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            # Get gradient (Megatron uses main_grad)
+            grad = None
+            if hasattr(param, 'main_grad') and param.main_grad is not None:
+                grad = param.main_grad
+            elif param.grad is not None:
+                grad = param.grad
+            
+            if grad is None:
+                grad_norm_val = 0.0
+                has_grad = False
+            else:
+                grad_norm_val = grad.float().norm().item()
+                has_grad = True
+            
+            # Categorize the parameter
+            # Check for layer index
+            layer_match = re.search(r'layers\.(\d+)\.', name)
+            if layer_match:
+                layer_idx = int(layer_match.group(1))
+                if layer_idx in target_layers:
+                    # Subcategorize by component type
+                    if 'self_attention' in name or 'attention' in name:
+                        category = f"layer{layer_idx}_attention"
+                    elif 'mlp' in name or 'experts' in name:
+                        category = f"layer{layer_idx}_mlp"
+                    elif 'router' in name or 'gate' in name:
+                        category = f"layer{layer_idx}_router"
+                    elif 'layernorm' in name or 'norm' in name:
+                        category = f"layer{layer_idx}_norm"
+                    else:
+                        category = f"layer{layer_idx}_other"
+                    
+                    layer_grad_norms[category]["total_sq"] += grad_norm_val ** 2
+                    layer_grad_norms[category]["count"] += 1
+                    layer_grad_norms[category]["params"].append((name, grad_norm_val, has_grad))
+            
+            # Check for special params
+            elif 'embedding' in name.lower() or 'embed_tokens' in name:
+                special_params[f"embedding:{name}"] = (grad_norm_val, has_grad)
+            elif 'output_layer' in name or 'lm_head' in name:
+                special_params[f"output:{name}"] = (grad_norm_val, has_grad)
+    
+    # Log results
+    print(f"\n{'='*80}", flush=True)
+    print(f"[DEBUG_PER_LAYER_GRAD_NORM] Step {step_id} - Per-layer gradient analysis", flush=True)
+    print(f"{'='*80}", flush=True)
+    
+    # Log layer-wise grad norms
+    for category in sorted(layer_grad_norms.keys()):
+        info = layer_grad_norms[category]
+        total_norm = math.sqrt(info["total_sq"]) if info["total_sq"] > 0 else 0.0
+        num_params_with_grad = sum(1 for _, _, has_grad in info["params"] if has_grad)
+        num_params_total = info["count"]
+        
+        print(f"\n[{category}] total_grad_norm={total_norm:.6e}, "
+              f"params_with_grad={num_params_with_grad}/{num_params_total}", flush=True)
+        
+        # Show individual params (first 3 and last 1 for brevity)
+        params_sorted = sorted(info["params"], key=lambda x: -x[1])  # Sort by grad_norm desc
+        for param_name, grad_norm_val, has_grad in params_sorted[:3]:
+            status = "HAS_GRAD" if has_grad else "NO_GRAD"
+            short_name = param_name.split('.')[-2] + '.' + param_name.split('.')[-1] if '.' in param_name else param_name
+            print(f"  - {short_name}: grad_norm={grad_norm_val:.6e} [{status}]", flush=True)
+        if len(params_sorted) > 4:
+            print(f"  ... ({len(params_sorted) - 4} more params)", flush=True)
+            param_name, grad_norm_val, has_grad = params_sorted[-1]
+            status = "HAS_GRAD" if has_grad else "NO_GRAD"
+            short_name = param_name.split('.')[-2] + '.' + param_name.split('.')[-1] if '.' in param_name else param_name
+            print(f"  - {short_name}: grad_norm={grad_norm_val:.6e} [{status}] (min)", flush=True)
+    
+    # Log special params
+    if special_params:
+        print(f"\n[Special Parameters]", flush=True)
+        for name, (grad_norm_val, has_grad) in special_params.items():
+            status = "HAS_GRAD" if has_grad else "NO_GRAD"
+            print(f"  - {name}: grad_norm={grad_norm_val:.6e} [{status}]", flush=True)
+    
+    # Summary comparison
+    print(f"\n[Summary - First vs Last Layer]", flush=True)
+    first_layer_total = sum(
+        layer_grad_norms[k]["total_sq"] 
+        for k in layer_grad_norms if k.startswith("layer0_")
+    )
+    last_layer_total = sum(
+        layer_grad_norms[k]["total_sq"] 
+        for k in layer_grad_norms if k.startswith(f"layer{num_layers-1}_")
+    )
+    first_norm = math.sqrt(first_layer_total) if first_layer_total > 0 else 0.0
+    last_norm = math.sqrt(last_layer_total) if last_layer_total > 0 else 0.0
+    ratio = last_norm / first_norm if first_norm > 0 else float('inf')
+    
+    print(f"  Layer 0 total grad_norm:  {first_norm:.6e}", flush=True)
+    print(f"  Layer {num_layers-1} total grad_norm: {last_norm:.6e}", flush=True)
+    print(f"  Ratio (last/first): {ratio:.4f}", flush=True)
+    print(f"{'='*80}\n", flush=True)
+    
+    # Also log to wandb if available
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.log({
+                f"debug/layer0_grad_norm": first_norm,
+                f"debug/layer{num_layers-1}_grad_norm": last_norm,
+                f"debug/grad_norm_ratio_last_first": ratio,
+            }, step=step_id)
+    except Exception:
+        pass
 
 
 def _debug_check_router_weights_after_optimizer_step(model, step_id):
