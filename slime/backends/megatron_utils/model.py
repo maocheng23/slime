@@ -449,6 +449,7 @@ def train_one_step(
         if debug_weight_update:
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             print(f"\n[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] Before optimizer.step():", flush=True)
+            logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] Before optimizer.step():")
             for model_chunk in model:
                 for name, param in model_chunk.named_parameters():
                     if "layers.47" in name and ("experts" in name or "router" in name or "gate" in name):
@@ -460,14 +461,16 @@ def train_one_step(
                             grad_norm_val = param.grad.float().norm().item()
                             grad_info = f"sum={grad_sum:.10e}, norm={grad_norm_val:.10e}"
                         print(f"  {name}: weight_sum={weight_sum:.10e}, grad={grad_info}", flush=True)
-        
+                        logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] {name}: weight_sum={weight_sum:.10e}, grad={grad_info}")
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         
         # DEBUG: Check weights after optimizer.step()
         if debug_weight_update:
             print(f"\n[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step():", flush=True)
+            logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step(): update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}")
             print(f"  update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}", flush=True)
+            logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step(): update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}")
             for model_chunk in model:
                 for name, param in model_chunk.named_parameters():
                     if "layers.47" in name and ("experts" in name or "router" in name or "gate" in name):
@@ -476,6 +479,7 @@ def train_one_step(
                         weight_diff = weight_sum_after - weight_sum_before
                         changed = "CHANGED" if abs(weight_diff) > 1e-12 else "UNCHANGED"
                         print(f"  {name}: weight_sum={weight_sum_after:.10e}, diff={weight_diff:.10e} [{changed}]", flush=True)
+                        logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] {name}: weight_sum={weight_sum_after:.10e}, diff={weight_diff:.10e} [{changed}]")
         
         # DEBUG: Check router weights consistency after optimizer step
         if os.environ.get("DEBUG_ROUTER_GRAD_SYNC", "0") == "1":
