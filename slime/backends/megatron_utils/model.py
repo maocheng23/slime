@@ -455,13 +455,33 @@ def train_one_step(
                     if "layers.47" in name and ("experts" in name or "router" in name or "gate" in name):
                         weight_sum = param.data.float().sum().item()
                         weight_snapshots_before[name] = weight_sum
+                        # Megatron stores gradients in main_grad, not param.grad
                         grad_info = "None"
-                        if param.grad is not None:
-                            grad_sum = param.grad.float().sum().item()
-                            grad_norm_val = param.grad.float().norm().item()
-                            grad_info = f"sum={grad_sum:.10e}, norm={grad_norm_val:.10e}"
-                        print(f"  {name}: weight_sum={weight_sum:.10e}, grad={grad_info}", flush=True)
-                        logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] {name}: weight_sum={weight_sum:.10e}, grad={grad_info}")
+                        grad = None
+                        grad_source = "none"
+                        # Try main_grad first (Megatron's gradient buffer)
+                        if hasattr(param, 'main_grad') and param.main_grad is not None:
+                            grad = param.main_grad
+                            grad_source = "main_grad"
+                        elif hasattr(param, 'get_main_grad'):
+                            try:
+                                grad = param.get_main_grad()
+                                grad_source = "get_main_grad()"
+                            except Exception:
+                                pass
+                        elif param.grad is not None:
+                            grad = param.grad
+                            grad_source = "param.grad"
+                        
+                        if grad is not None:
+                            grad_sum = grad.float().sum().item()
+                            grad_norm_val = grad.float().norm().item()
+                            grad_info = f"[{grad_source}] sum={grad_sum:.10e}, norm={grad_norm_val:.10e}"
+                        else:
+                            grad_info = "None (checked main_grad, get_main_grad(), param.grad)"
+                        if rank == 0:
+                            print(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] {name}: weight_sum={weight_sum:.10e}, grad={grad_info}", flush=True)
+                            logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] {name}: weight_sum={weight_sum:.10e}, grad={grad_info}")
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         
@@ -469,7 +489,8 @@ def train_one_step(
         if debug_weight_update:
             print(f"\n[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step():", flush=True)
             logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step(): update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}")
-            print(f"  update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}", flush=True)
+            if rank == 0:
+                print(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step(): update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}", flush=True)
             logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] After optimizer.step(): update_successful={update_successful}, grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}")
             for model_chunk in model:
                 for name, param in model_chunk.named_parameters():
@@ -478,8 +499,9 @@ def train_one_step(
                         weight_sum_before = weight_snapshots_before.get(name, 0)
                         weight_diff = weight_sum_after - weight_sum_before
                         changed = "CHANGED" if abs(weight_diff) > 1e-12 else "UNCHANGED"
-                        print(f"  {name}: weight_sum={weight_sum_after:.10e}, diff={weight_diff:.10e} [{changed}]", flush=True)
-                        logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] {name}: weight_sum={weight_sum_after:.10e}, diff={weight_diff:.10e} [{changed}]")
+                        if rank == 0:
+                            print(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] {name}: weight_sum={weight_sum_after:.10e}, diff={weight_diff:.10e} [{changed}]", flush=True)
+                            logger.info(f"[DEBUG_WEIGHT_UPDATE][rank {rank}][step {step_id}] {name}: weight_sum={weight_sum_after:.10e}, diff={weight_diff:.10e} [{changed}]")
         
         # DEBUG: Check router weights consistency after optimizer step
         if os.environ.get("DEBUG_ROUTER_GRAD_SYNC", "0") == "1":
@@ -514,7 +536,7 @@ def _debug_check_router_weights_after_optimizer_step(model, step_id):
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     
     # Only check layer 0 router weight to limit output
-    target_layer = 0
+    target_layer = 47
     found = False
     
     for model_chunk in model:
@@ -536,7 +558,7 @@ def _debug_check_router_weights_after_optimizer_step(model, step_id):
                         
                         if rank == 0:
                             print(f"\n[DEBUG_ROUTER_WEIGHTS][Step {step_id}] After optimizer.step():", flush=True)
-                            print(f"  Router '{name}' weight sums across ranks: {[f'{s:.10e}' for s in sums]}", flush=True)
+                            print(f"[DEBUG_ROUTER_WEIGHTS][rank {rank}][step {step_id}] Router '{name}' weight sums across ranks: {[f'{s:.10e}' for s in sums]}", flush=True)
                             print(f"  max_diff: {max_diff:.6e}", flush=True)
                             if max_diff > 1e-10:
                                 print(f"  *** WARNING: Router weights DIFFER across ranks! ***", flush=True)
