@@ -209,14 +209,14 @@ def execute():
         megatron_model_type=MODEL_TYPE,
         extra_env_vars={
             **true_on_policy_envs,
-            "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
-            "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_ROUTER": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_ATTN": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_LOGPROB_DIFF": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_TREE_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
-            # Debug gradient all-reduce for MoE backward pass
-            "DEBUG_GRAD_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
+            # "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
+            # "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
+            # "SLIME_DEBUG_ROUTER": "1" if MODE == "debug_one_sample" else "0",
+            # "SLIME_DEBUG_ATTN": "1" if MODE == "debug_one_sample" else "0",
+            # "SLIME_DEBUG_LOGPROB_DIFF": "1" if MODE == "debug_one_sample" else "0",
+            # "SLIME_DEBUG_TREE_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
+            # # Debug gradient all-reduce for MoE backward pass
+            # "DEBUG_GRAD_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
             # Debug gradient sync verification - enable to check if all-reduce is working
             # "DEBUG_GRAD_SYNC": "1",  # Enable to verify gradients are identical across ranks after all-reduce
             # "DEBUG_ROUTER_GRAD_SYNC": "1",  # Enable to see per-rank gradient values before/after all-reduce
