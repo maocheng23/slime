@@ -73,7 +73,7 @@ def execute():
         f"--num-rollout {3 if MODE == 'debug_one_sample' else 3000} "  # Need at least 2-3 steps to observe divergence pattern
         f"--rollout-batch-size {2 if MODE == 'debug_one_sample' else 16} "
         f"--n-samples-per-prompt {2 if MODE == 'debug_one_sample' else 8} "
-        f"--rollout-max-response-len {1024 if MODE == 'debug_one_sample' else 1024} "
+        f"--rollout-max-response-len {10 if MODE == 'debug_one_sample' else 1024} "
         "--rollout-temperature 1 "
         # temp remove this to make test easier
         # "--over-sampling-batch-size 64 "
