@@ -226,12 +226,12 @@ def execute():
             # Debug gradient all-reduce for MoE backward pass
             "DEBUG_GRAD_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
             # Debug gradient sync verification - enable to check if all-reduce is working
-            "DEBUG_GRAD_SYNC": "1",  # Enable to verify gradients are identical across ranks after all-reduce
-            "DEBUG_ROUTER_GRAD_SYNC": "1",  # Enable to see per-rank gradient values before/after all-reduce
-            # Debug EP broadcast during weight sync
-            "DEBUG_EP_BROADCAST": "1",  # Enable to check EP broadcast logic in weight sync
-            # Debug expert weight conversion during sync
-            "DEBUG_EXPERT_SYNC": "1",  # Enable to check Megatron->HF expert weight conversion
+            # "DEBUG_GRAD_SYNC": "1",  # Enable to verify gradients are identical across ranks after all-reduce
+            # "DEBUG_ROUTER_GRAD_SYNC": "1",  # Enable to see per-rank gradient values before/after all-reduce
+            # # Debug EP broadcast during weight sync
+            # "DEBUG_EP_BROADCAST": "1",  # Enable to check EP broadcast logic in weight sync
+            # # Debug expert weight conversion during sync
+            # "DEBUG_EXPERT_SYNC": "1",  # Enable to check Megatron->HF expert weight conversion
         },
     )
 
