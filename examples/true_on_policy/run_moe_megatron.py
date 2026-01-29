@@ -71,7 +71,7 @@ def execute():
         "--rollout-shuffle "
         "--rm-type math "
         f"--num-rollout {3 if MODE == 'debug_one_sample' else 3000} "  # Need at least 2-3 steps to observe divergence pattern
-        f"--rollout-batch-size {2 if MODE == 'debug_one_sample' else 16} "
+        f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 16} "
         f"--n-samples-per-prompt {2 if MODE == 'debug_one_sample' else 8} "
         f"--rollout-max-response-len {10 if MODE == 'debug_one_sample' else 1024} "
         "--rollout-temperature 1 "
@@ -225,6 +225,7 @@ def execute():
             "SLIME_DEBUG_TREE_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
             # Debug gradient all-reduce for MoE backward pass
             "DEBUG_GRAD_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
+            "DEBUG_OVERRIDE_REWARDS": "first_one" if MODE == "debug_one_sample" else "",
             # Debug gradient sync verification - enable to check if all-reduce is working
             # "DEBUG_GRAD_SYNC": "1",  # Enable to verify gradients are identical across ranks after all-reduce
             # "DEBUG_ROUTER_GRAD_SYNC": "1",  # Enable to see per-rank gradient values before/after all-reduce

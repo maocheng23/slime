@@ -40,7 +40,7 @@ def execute():
     )
     data_parallel_size = NUM_GPUS // tensor_parallel_size
 
-    global_batch_size = 1 if MODE == "debug_one_sample" else 128
+    global_batch_size = 2 if MODE == "debug_one_sample" else 128
     if global_batch_size % data_parallel_size != 0:
         # Megatron requires global_batch_size divisible by micro_batch_size * data_parallel_size
         global_batch_size = math.ceil(global_batch_size / data_parallel_size) * data_parallel_size
@@ -72,7 +72,7 @@ def execute():
         "--rm-type math "
         f"--num-rollout {3 if MODE == 'debug_one_sample' else 3000} "  # Need at least 2-3 steps to observe divergence pattern
         f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 16} "
-        f"--n-samples-per-prompt {1 if MODE == 'debug_one_sample' else 8} "
+        f"--n-samples-per-prompt {2 if MODE == 'debug_one_sample' else 8} "
         f"--rollout-max-response-len {10 if MODE == 'debug_one_sample' else 1024} "
         "--rollout-temperature 1 "
         # temp remove this to make test easier
@@ -209,6 +209,7 @@ def execute():
         megatron_model_type=MODEL_TYPE,
         extra_env_vars={
             **true_on_policy_envs,
+            "DEBUG_OVERRIDE_REWARDS": "first_one" if MODE == "debug_one_sample" else "",
             # "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
             # "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
             # "SLIME_DEBUG_ROUTER": "1" if MODE == "debug_one_sample" else "0",

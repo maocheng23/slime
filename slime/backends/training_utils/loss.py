@@ -255,6 +255,59 @@ def compute_advantages_and_returns(args: Namespace, parallel_state: ParallelStat
     total_lengths: list[int] = rollout_data.get("total_lengths")
     max_seq_lens: list[int] | None = rollout_data.get("max_seq_lens", None)
 
+    # DEBUG: Override rewards for debugging gradient flow
+    # Enable with DEBUG_OVERRIDE_REWARDS environment variable
+    # Options:
+    #   "alternating" or "0,1" - alternating 0, 1, 0, 1, ... pattern
+    #   "all_zero" - all rewards = 0
+    #   "all_one" - all rewards = 1
+    #   "first_one" - first sample = 1, rest = 0
+    #   "custom:0.5,1.0,-0.5,..." - custom values (will be cycled if fewer than num_samples)
+    import os
+    debug_reward_override = os.environ.get("DEBUG_OVERRIDE_REWARDS", "")
+    if debug_reward_override and rewards is not None:
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        num_samples = len(rewards)
+        original_rewards = list(rewards)  # Save original for logging
+        
+        if debug_reward_override in ["alternating", "0,1"]:
+            # Alternating 0, 1 pattern within each group
+            group_size = getattr(args, 'n_samples_per_prompt', 2)
+            rewards = []
+            for i in range(num_samples):
+                within_group_idx = i % group_size
+                rewards.append(float(within_group_idx % 2))  # 0, 1, 0, 1, ...
+        elif debug_reward_override == "all_zero":
+            rewards = [0.0] * num_samples
+        elif debug_reward_override == "all_one":
+            rewards = [1.0] * num_samples
+        elif debug_reward_override == "first_one":
+            rewards = [1.0 if i == 0 else 0.0 for i in range(num_samples)]
+        elif debug_reward_override == "contrast":
+            # Strong contrast: first half = 1, second half = 0 within each group
+            group_size = getattr(args, 'n_samples_per_prompt', 2)
+            rewards = []
+            for i in range(num_samples):
+                within_group_idx = i % group_size
+                rewards.append(1.0 if within_group_idx < group_size // 2 else 0.0)
+        elif debug_reward_override.startswith("custom:"):
+            custom_values = [float(x) for x in debug_reward_override[7:].split(",")]
+            rewards = [custom_values[i % len(custom_values)] for i in range(num_samples)]
+        else:
+            # Try parsing as comma-separated values
+            try:
+                custom_values = [float(x) for x in debug_reward_override.split(",")]
+                rewards = [custom_values[i % len(custom_values)] for i in range(num_samples)]
+            except ValueError:
+                pass  # Invalid format, keep original rewards
+        
+        if rank == 0:
+            print(f"\n[DEBUG_OVERRIDE_REWARDS] Mode: {debug_reward_override}", flush=True)
+            print(f"[DEBUG_OVERRIDE_REWARDS] Original rewards (first 8): {original_rewards[:8]}", flush=True)
+            print(f"[DEBUG_OVERRIDE_REWARDS] Overridden rewards (first 8): {rewards[:8]}", flush=True)
+            print(f"[DEBUG_OVERRIDE_REWARDS] Total samples: {num_samples}", flush=True)
+
     # return when not the last pp stage.
     if log_probs is None and values is None:
         return

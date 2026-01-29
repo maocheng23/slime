@@ -682,17 +682,63 @@ def _debug_per_layer_grad_norm(model, step_id, args):
     print(f"  Ratio (last/first): {ratio:.4f}", flush=True)
     print(f"{'='*80}\n", flush=True)
     
-    # Also log to wandb if available
+    # Log detailed metrics to wandb
     try:
         import wandb
         if wandb.run is not None:
-            wandb.log({
-                f"debug/layer0_grad_norm": first_norm,
-                f"debug/layer{num_layers-1}_grad_norm": last_norm,
-                f"debug/grad_norm_ratio_last_first": ratio,
-            }, step=step_id)
-    except Exception:
-        pass
+            wandb_metrics = {}
+            
+            # Per-category grad norms for first and last layers
+            for category in sorted(layer_grad_norms.keys()):
+                info = layer_grad_norms[category]
+                total_norm = math.sqrt(info["total_sq"]) if info["total_sq"] > 0 else 0.0
+                num_params_with_grad = sum(1 for _, _, has_grad in info["params"] if has_grad)
+                num_params_total = info["count"]
+                
+                # e.g., "grad_norm/layer0_attention", "grad_norm/layer47_mlp"
+                wandb_metrics[f"grad_norm/{category}"] = total_norm
+                wandb_metrics[f"grad_norm/{category}_params_with_grad"] = num_params_with_grad
+                wandb_metrics[f"grad_norm/{category}_params_total"] = num_params_total
+            
+            # Summary metrics
+            wandb_metrics["grad_norm/layer0_total"] = first_norm
+            wandb_metrics[f"grad_norm/layer{num_layers-1}_total"] = last_norm
+            wandb_metrics["grad_norm/ratio_last_first"] = ratio if ratio != float('inf') else 0.0
+            
+            # Per-component breakdown for first layer (layer 0)
+            for component in ["attention", "mlp", "router", "norm"]:
+                key = f"layer0_{component}"
+                if key in layer_grad_norms:
+                    wandb_metrics[f"grad_norm/first_{component}"] = math.sqrt(layer_grad_norms[key]["total_sq"])
+                else:
+                    wandb_metrics[f"grad_norm/first_{component}"] = 0.0
+            
+            # Per-component breakdown for last layer
+            for component in ["attention", "mlp", "router", "norm"]:
+                key = f"layer{num_layers-1}_{component}"
+                if key in layer_grad_norms:
+                    wandb_metrics[f"grad_norm/last_{component}"] = math.sqrt(layer_grad_norms[key]["total_sq"])
+                else:
+                    wandb_metrics[f"grad_norm/last_{component}"] = 0.0
+            
+            # Special params (embedding, output)
+            for name, (grad_norm_val, has_grad) in special_params.items():
+                clean_name = name.replace(":", "_").replace(".", "_")
+                wandb_metrics[f"grad_norm/{clean_name}"] = grad_norm_val
+            
+            # Count of parameters with zero gradients (potential issue indicator)
+            total_zero_grad = sum(
+                sum(1 for _, _, has_grad in info["params"] if not has_grad)
+                for info in layer_grad_norms.values()
+            )
+            total_params = sum(info["count"] for info in layer_grad_norms.values())
+            wandb_metrics["grad_norm/params_with_zero_grad"] = total_zero_grad
+            wandb_metrics["grad_norm/params_total_checked"] = total_params
+            
+            wandb.log(wandb_metrics, step=step_id)
+            logger.info(f"[DEBUG_PER_LAYER_GRAD_NORM] Logged {len(wandb_metrics)} metrics to wandb")
+    except Exception as e:
+        logger.warning(f"[DEBUG_PER_LAYER_GRAD_NORM] Failed to log to wandb: {e}")
 
 
 def _debug_check_router_weights_after_optimizer_step(model, step_id):
