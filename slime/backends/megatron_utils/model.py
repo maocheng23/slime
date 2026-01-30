@@ -554,31 +554,33 @@ def should_disable_forward_pre_hook(args: Namespace) -> bool:
 
 
 def _debug_per_layer_grad_norm(model, step_id, args):
-    """DEBUG: Compute and log per-layer gradient norms for first and last layers.
-    
+    """DEBUG: Compute and log per-layer gradient norms for ALL layers.
+
     This helps diagnose if certain layers are not receiving gradients properly.
     Enable with DEBUG_PER_LAYER_GRAD_NORM=1 environment variable.
-    
+    Set DEBUG_PER_LAYER_GRAD_NORM=2 for verbose per-param output.
+
     Logs gradient norms for:
-    - Layer 0 (first transformer layer)
-    - Layer 47 (last transformer layer, or num_layers-1)
+    - ALL transformer layers (0 to num_layers-1)
+    - Per-component breakdown: attention, mlp, router, norm
     - Embedding layer
     - Output layer (lm_head)
-    - Router weights (if MoE)
     """
     import torch.distributed as dist
     import re
     from collections import defaultdict
-    
+
     rank = dist.get_rank() if dist.is_initialized() else 0
-    
+
     # Only log on rank 0 to avoid spam
     if rank != 0:
         return
-    
+
     # Determine last layer index
     num_layers = getattr(args, 'num_layers', 48)
-    target_layers = [0, num_layers - 1]  # First and last layers
+    # Log ALL layers for comprehensive gradient flow analysis
+    target_layers = list(range(num_layers))  # All layers [0, 1, 2, ..., num_layers-1]
+    verbose = os.environ.get("DEBUG_PER_LAYER_GRAD_NORM", "0") == "2"
     
     # Collect gradient norms by category
     layer_grad_norms = defaultdict(lambda: {"total_sq": 0.0, "count": 0, "params": []})
@@ -628,113 +630,147 @@ def _debug_per_layer_grad_norm(model, step_id, args):
             elif 'output_layer' in name or 'lm_head' in name:
                 special_params[f"output:{name}"] = (grad_norm_val, has_grad)
     
+    # Compute per-layer totals for all layers
+    layer_totals = {}  # layer_idx -> {attention, mlp, router, norm, total}
+    for layer_idx in range(num_layers):
+        layer_totals[layer_idx] = {
+            "attention": 0.0, "mlp": 0.0, "router": 0.0, "norm": 0.0, "other": 0.0, "total": 0.0,
+            "attention_params": 0, "mlp_params": 0, "router_params": 0, "norm_params": 0, "other_params": 0,
+            "params_with_grad": 0, "params_total": 0
+        }
+        for component in ["attention", "mlp", "router", "norm", "other"]:
+            key = f"layer{layer_idx}_{component}"
+            if key in layer_grad_norms:
+                info = layer_grad_norms[key]
+                norm_val = math.sqrt(info["total_sq"]) if info["total_sq"] > 0 else 0.0
+                layer_totals[layer_idx][component] = norm_val
+                layer_totals[layer_idx][f"{component}_params"] = info["count"]
+                layer_totals[layer_idx]["params_total"] += info["count"]
+                layer_totals[layer_idx]["params_with_grad"] += sum(1 for _, _, has_grad in info["params"] if has_grad)
+        # Compute total (sqrt of sum of squares)
+        total_sq = sum(layer_totals[layer_idx][c] ** 2 for c in ["attention", "mlp", "router", "norm", "other"])
+        layer_totals[layer_idx]["total"] = math.sqrt(total_sq) if total_sq > 0 else 0.0
+
     # Log results
-    print(f"\n{'='*80}", flush=True)
-    print(f"[DEBUG_PER_LAYER_GRAD_NORM] Step {step_id} - Per-layer gradient analysis", flush=True)
-    print(f"{'='*80}", flush=True)
-    
-    # Log layer-wise grad norms
-    for category in sorted(layer_grad_norms.keys()):
-        info = layer_grad_norms[category]
-        total_norm = math.sqrt(info["total_sq"]) if info["total_sq"] > 0 else 0.0
-        num_params_with_grad = sum(1 for _, _, has_grad in info["params"] if has_grad)
-        num_params_total = info["count"]
-        
-        print(f"\n[{category}] total_grad_norm={total_norm:.6e}, "
-              f"params_with_grad={num_params_with_grad}/{num_params_total}", flush=True)
-        
-        # Show individual params (first 3 and last 1 for brevity)
-        params_sorted = sorted(info["params"], key=lambda x: -x[1])  # Sort by grad_norm desc
-        for param_name, grad_norm_val, has_grad in params_sorted[:3]:
-            status = "HAS_GRAD" if has_grad else "NO_GRAD"
-            short_name = param_name.split('.')[-2] + '.' + param_name.split('.')[-1] if '.' in param_name else param_name
-            print(f"  - {short_name}: grad_norm={grad_norm_val:.6e} [{status}]", flush=True)
-        if len(params_sorted) > 4:
-            print(f"  ... ({len(params_sorted) - 4} more params)", flush=True)
-            param_name, grad_norm_val, has_grad = params_sorted[-1]
-            status = "HAS_GRAD" if has_grad else "NO_GRAD"
-            short_name = param_name.split('.')[-2] + '.' + param_name.split('.')[-1] if '.' in param_name else param_name
-            print(f"  - {short_name}: grad_norm={grad_norm_val:.6e} [{status}] (min)", flush=True)
-    
+    print(f"\n{'='*100}", flush=True)
+    print(f"[DEBUG_PER_LAYER_GRAD_NORM] Step {step_id} - ALL LAYERS gradient analysis", flush=True)
+    print(f"{'='*100}", flush=True)
+
+    # Print condensed table header
+    print(f"\n{'Layer':<8} {'Total':<12} {'Attention':<12} {'MLP':<12} {'Router':<12} {'Norm':<12} {'Params':<12}", flush=True)
+    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12}", flush=True)
+
+    # Aggregate stats for component comparison
+    total_attention_sq, total_mlp_sq, total_router_sq, total_norm_sq = 0.0, 0.0, 0.0, 0.0
+
+    for layer_idx in range(num_layers):
+        lt = layer_totals[layer_idx]
+        total_attention_sq += lt["attention"] ** 2
+        total_mlp_sq += lt["mlp"] ** 2
+        total_router_sq += lt["router"] ** 2
+        total_norm_sq += lt["norm"] ** 2
+        params_str = f"{lt['params_with_grad']}/{lt['params_total']}"
+        print(f"L{layer_idx:<6} {lt['total']:<12.4e} {lt['attention']:<12.4e} {lt['mlp']:<12.4e} "
+              f"{lt['router']:<12.4e} {lt['norm']:<12.4e} {params_str:<12}", flush=True)
+
+    # Aggregate component totals
+    total_attention = math.sqrt(total_attention_sq) if total_attention_sq > 0 else 0.0
+    total_mlp = math.sqrt(total_mlp_sq) if total_mlp_sq > 0 else 0.0
+    total_router = math.sqrt(total_router_sq) if total_router_sq > 0 else 0.0
+    total_norm = math.sqrt(total_norm_sq) if total_norm_sq > 0 else 0.0
+    overall_total = math.sqrt(total_attention_sq + total_mlp_sq + total_router_sq + total_norm_sq)
+
+    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12}", flush=True)
+    print(f"{'TOTAL':<8} {overall_total:<12.4e} {total_attention:<12.4e} {total_mlp:<12.4e} "
+          f"{total_router:<12.4e} {total_norm:<12.4e}", flush=True)
+
     # Log special params
     if special_params:
         print(f"\n[Special Parameters]", flush=True)
         for name, (grad_norm_val, has_grad) in special_params.items():
             status = "HAS_GRAD" if has_grad else "NO_GRAD"
             print(f"  - {name}: grad_norm={grad_norm_val:.6e} [{status}]", flush=True)
-    
-    # Summary comparison
-    print(f"\n[Summary - First vs Last Layer]", flush=True)
-    first_layer_total = sum(
-        layer_grad_norms[k]["total_sq"] 
-        for k in layer_grad_norms if k.startswith("layer0_")
-    )
-    last_layer_total = sum(
-        layer_grad_norms[k]["total_sq"] 
-        for k in layer_grad_norms if k.startswith(f"layer{num_layers-1}_")
-    )
-    first_norm = math.sqrt(first_layer_total) if first_layer_total > 0 else 0.0
-    last_norm = math.sqrt(last_layer_total) if last_layer_total > 0 else 0.0
+
+    # Summary comparison: First vs Last layer
+    first_norm = layer_totals[0]["total"]
+    last_norm = layer_totals[num_layers - 1]["total"]
     ratio = last_norm / first_norm if first_norm > 0 else float('inf')
-    
+
+    print(f"\n[Summary - Component Breakdown]", flush=True)
+    print(f"  Attention total: {total_attention:.6e} ({100*total_attention_sq/(overall_total**2+1e-12):.1f}%)", flush=True)
+    print(f"  MLP total:       {total_mlp:.6e} ({100*total_mlp_sq/(overall_total**2+1e-12):.1f}%)", flush=True)
+    print(f"  Router total:    {total_router:.6e} ({100*total_router_sq/(overall_total**2+1e-12):.1f}%)", flush=True)
+    print(f"  Norm total:      {total_norm:.6e} ({100*total_norm_sq/(overall_total**2+1e-12):.1f}%)", flush=True)
+
+    print(f"\n[Summary - First vs Last Layer]", flush=True)
     print(f"  Layer 0 total grad_norm:  {first_norm:.6e}", flush=True)
     print(f"  Layer {num_layers-1} total grad_norm: {last_norm:.6e}", flush=True)
     print(f"  Ratio (last/first): {ratio:.4f}", flush=True)
-    print(f"{'='*80}\n", flush=True)
+    print(f"{'='*100}\n", flush=True)
+
+    # Verbose output: per-param details (only if DEBUG_PER_LAYER_GRAD_NORM=2)
+    if verbose:
+        print(f"\n[VERBOSE] Per-parameter gradient details:", flush=True)
+        for category in sorted(layer_grad_norms.keys()):
+            info = layer_grad_norms[category]
+            params_sorted = sorted(info["params"], key=lambda x: -x[1])
+            for param_name, grad_norm_val, has_grad in params_sorted[:5]:
+                status = "HAS_GRAD" if has_grad else "NO_GRAD"
+                print(f"  [{category}] {param_name}: {grad_norm_val:.6e} [{status}]", flush=True)
     
     # Log detailed metrics to wandb
     try:
         import wandb
         if wandb.run is not None:
             wandb_metrics = {}
-            
-            # Per-category grad norms for first and last layers
-            for category in sorted(layer_grad_norms.keys()):
-                info = layer_grad_norms[category]
-                total_norm = math.sqrt(info["total_sq"]) if info["total_sq"] > 0 else 0.0
-                num_params_with_grad = sum(1 for _, _, has_grad in info["params"] if has_grad)
-                num_params_total = info["count"]
-                
-                # e.g., "grad_norm/layer0_attention", "grad_norm/layer47_mlp"
-                wandb_metrics[f"grad_norm/{category}"] = total_norm
-                wandb_metrics[f"grad_norm/{category}_params_with_grad"] = num_params_with_grad
-                wandb_metrics[f"grad_norm/{category}_params_total"] = num_params_total
-            
+
+            # Per-layer total grad norms (ALL layers)
+            for layer_idx in range(num_layers):
+                lt = layer_totals[layer_idx]
+                wandb_metrics[f"grad_norm_layer/layer{layer_idx}_total"] = lt["total"]
+                wandb_metrics[f"grad_norm_layer/layer{layer_idx}_attention"] = lt["attention"]
+                wandb_metrics[f"grad_norm_layer/layer{layer_idx}_mlp"] = lt["mlp"]
+                wandb_metrics[f"grad_norm_layer/layer{layer_idx}_router"] = lt["router"]
+                wandb_metrics[f"grad_norm_layer/layer{layer_idx}_norm"] = lt["norm"]
+
             # Summary metrics
             wandb_metrics["grad_norm/layer0_total"] = first_norm
             wandb_metrics[f"grad_norm/layer{num_layers-1}_total"] = last_norm
             wandb_metrics["grad_norm/ratio_last_first"] = ratio if ratio != float('inf') else 0.0
-            
+            wandb_metrics["grad_norm/overall_total"] = overall_total
+
+            # Aggregate component breakdown (sum across ALL layers)
+            wandb_metrics["grad_norm/total_attention"] = total_attention
+            wandb_metrics["grad_norm/total_mlp"] = total_mlp
+            wandb_metrics["grad_norm/total_router"] = total_router
+            wandb_metrics["grad_norm/total_norm"] = total_norm
+
+            # Component percentages (helpful for comparing on-policy vs off-policy)
+            if overall_total > 1e-12:
+                wandb_metrics["grad_norm/pct_attention"] = 100 * total_attention_sq / (overall_total ** 2)
+                wandb_metrics["grad_norm/pct_mlp"] = 100 * total_mlp_sq / (overall_total ** 2)
+                wandb_metrics["grad_norm/pct_router"] = 100 * total_router_sq / (overall_total ** 2)
+                wandb_metrics["grad_norm/pct_norm"] = 100 * total_norm_sq / (overall_total ** 2)
+
             # Per-component breakdown for first layer (layer 0)
             for component in ["attention", "mlp", "router", "norm"]:
-                key = f"layer0_{component}"
-                if key in layer_grad_norms:
-                    wandb_metrics[f"grad_norm/first_{component}"] = math.sqrt(layer_grad_norms[key]["total_sq"])
-                else:
-                    wandb_metrics[f"grad_norm/first_{component}"] = 0.0
-            
+                wandb_metrics[f"grad_norm/first_{component}"] = layer_totals[0][component]
+
             # Per-component breakdown for last layer
             for component in ["attention", "mlp", "router", "norm"]:
-                key = f"layer{num_layers-1}_{component}"
-                if key in layer_grad_norms:
-                    wandb_metrics[f"grad_norm/last_{component}"] = math.sqrt(layer_grad_norms[key]["total_sq"])
-                else:
-                    wandb_metrics[f"grad_norm/last_{component}"] = 0.0
-            
+                wandb_metrics[f"grad_norm/last_{component}"] = layer_totals[num_layers - 1][component]
+
             # Special params (embedding, output)
             for name, (grad_norm_val, has_grad) in special_params.items():
                 clean_name = name.replace(":", "_").replace(".", "_")
                 wandb_metrics[f"grad_norm/{clean_name}"] = grad_norm_val
-            
+
             # Count of parameters with zero gradients (potential issue indicator)
-            total_zero_grad = sum(
-                sum(1 for _, _, has_grad in info["params"] if not has_grad)
-                for info in layer_grad_norms.values()
-            )
-            total_params = sum(info["count"] for info in layer_grad_norms.values())
+            total_zero_grad = sum(lt["params_total"] - lt["params_with_grad"] for lt in layer_totals.values())
+            total_params_checked = sum(lt["params_total"] for lt in layer_totals.values())
             wandb_metrics["grad_norm/params_with_zero_grad"] = total_zero_grad
-            wandb_metrics["grad_norm/params_total_checked"] = total_params
-            
+            wandb_metrics["grad_norm/params_total_checked"] = total_params_checked
+
             wandb.log(wandb_metrics, step=step_id)
             logger.info(f"[DEBUG_PER_LAYER_GRAD_NORM] Logged {len(wandb_metrics)} metrics to wandb")
     except Exception as e:
