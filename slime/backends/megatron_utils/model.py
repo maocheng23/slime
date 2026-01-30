@@ -609,14 +609,18 @@ def _debug_per_layer_grad_norm(model, step_id, args):
                 layer_idx = int(layer_match.group(1))
                 if layer_idx in target_layers:
                     # Subcategorize by component type
-                    if 'self_attention' in name or 'attention' in name:
+                    # IMPORTANT: Check more specific patterns FIRST before broader ones
+                    # e.g., "mlp.router" should match router, not mlp
+                    # e.g., "self_attention.q_layernorm" should match norm, not attention
+                    if 'router' in name:
+                        category = f"layer{layer_idx}_router"
+                    elif 'layernorm' in name or 'layer_norm' in name:
+                        # Catches: input_layernorm, pre_mlp_layernorm, q_layernorm, k_layernorm, etc.
+                        category = f"layer{layer_idx}_norm"
+                    elif 'self_attention' in name or 'attention' in name:
                         category = f"layer{layer_idx}_attention"
                     elif 'mlp' in name or 'experts' in name:
                         category = f"layer{layer_idx}_mlp"
-                    elif 'router' in name or 'gate' in name:
-                        category = f"layer{layer_idx}_router"
-                    elif 'layernorm' in name or 'norm' in name:
-                        category = f"layer{layer_idx}_norm"
                     else:
                         category = f"layer{layer_idx}_other"
                     
