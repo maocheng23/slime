@@ -579,7 +579,7 @@ def _debug_per_layer_grad_norm(model, step_id, args):
     # Determine last layer index
     num_layers = getattr(args, 'num_layers', 48)
     # Log ALL layers for comprehensive gradient flow analysis
-    target_layers = list(range(num_layers))  # All layers [0, 1, 2, ..., num_layers-1]
+    target_layers = set(range(num_layers))  # All layers [0, 1, 2, ..., num_layers-1] as set for O(1) lookup
     verbose = os.environ.get("DEBUG_PER_LAYER_GRAD_NORM", "0") == "2"
     
     # Collect gradient norms by category
@@ -661,7 +661,7 @@ def _debug_per_layer_grad_norm(model, step_id, args):
     print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12}", flush=True)
 
     # Aggregate stats for component comparison
-    total_attention_sq, total_mlp_sq, total_router_sq, total_norm_sq = 0.0, 0.0, 0.0, 0.0
+    total_attention_sq, total_mlp_sq, total_router_sq, total_norm_sq, total_other_sq = 0.0, 0.0, 0.0, 0.0, 0.0
 
     for layer_idx in range(num_layers):
         lt = layer_totals[layer_idx]
@@ -669,6 +669,7 @@ def _debug_per_layer_grad_norm(model, step_id, args):
         total_mlp_sq += lt["mlp"] ** 2
         total_router_sq += lt["router"] ** 2
         total_norm_sq += lt["norm"] ** 2
+        total_other_sq += lt["other"] ** 2
         params_str = f"{lt['params_with_grad']}/{lt['params_total']}"
         print(f"L{layer_idx:<6} {lt['total']:<12.4e} {lt['attention']:<12.4e} {lt['mlp']:<12.4e} "
               f"{lt['router']:<12.4e} {lt['norm']:<12.4e} {params_str:<12}", flush=True)
@@ -678,7 +679,8 @@ def _debug_per_layer_grad_norm(model, step_id, args):
     total_mlp = math.sqrt(total_mlp_sq) if total_mlp_sq > 0 else 0.0
     total_router = math.sqrt(total_router_sq) if total_router_sq > 0 else 0.0
     total_norm = math.sqrt(total_norm_sq) if total_norm_sq > 0 else 0.0
-    overall_total = math.sqrt(total_attention_sq + total_mlp_sq + total_router_sq + total_norm_sq)
+    total_other = math.sqrt(total_other_sq) if total_other_sq > 0 else 0.0
+    overall_total = math.sqrt(total_attention_sq + total_mlp_sq + total_router_sq + total_norm_sq + total_other_sq)
 
     print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12}", flush=True)
     print(f"{'TOTAL':<8} {overall_total:<12.4e} {total_attention:<12.4e} {total_mlp:<12.4e} "
@@ -701,6 +703,8 @@ def _debug_per_layer_grad_norm(model, step_id, args):
     print(f"  MLP total:       {total_mlp:.6e} ({100*total_mlp_sq/(overall_total**2+1e-12):.1f}%)", flush=True)
     print(f"  Router total:    {total_router:.6e} ({100*total_router_sq/(overall_total**2+1e-12):.1f}%)", flush=True)
     print(f"  Norm total:      {total_norm:.6e} ({100*total_norm_sq/(overall_total**2+1e-12):.1f}%)", flush=True)
+    if total_other > 1e-12:
+        print(f"  Other total:     {total_other:.6e} ({100*total_other_sq/(overall_total**2+1e-12):.1f}%)", flush=True)
 
     print(f"\n[Summary - First vs Last Layer]", flush=True)
     print(f"  Layer 0 total grad_norm:  {first_norm:.6e}", flush=True)
@@ -732,6 +736,7 @@ def _debug_per_layer_grad_norm(model, step_id, args):
                 wandb_metrics[f"grad_norm_layer/layer{layer_idx}_mlp"] = lt["mlp"]
                 wandb_metrics[f"grad_norm_layer/layer{layer_idx}_router"] = lt["router"]
                 wandb_metrics[f"grad_norm_layer/layer{layer_idx}_norm"] = lt["norm"]
+                wandb_metrics[f"grad_norm_layer/layer{layer_idx}_other"] = lt["other"]
 
             # Summary metrics
             wandb_metrics["grad_norm/layer0_total"] = first_norm
@@ -744,6 +749,7 @@ def _debug_per_layer_grad_norm(model, step_id, args):
             wandb_metrics["grad_norm/total_mlp"] = total_mlp
             wandb_metrics["grad_norm/total_router"] = total_router
             wandb_metrics["grad_norm/total_norm"] = total_norm
+            wandb_metrics["grad_norm/total_other"] = total_other
 
             # Component percentages (helpful for comparing on-policy vs off-policy)
             if overall_total > 1e-12:
@@ -751,13 +757,14 @@ def _debug_per_layer_grad_norm(model, step_id, args):
                 wandb_metrics["grad_norm/pct_mlp"] = 100 * total_mlp_sq / (overall_total ** 2)
                 wandb_metrics["grad_norm/pct_router"] = 100 * total_router_sq / (overall_total ** 2)
                 wandb_metrics["grad_norm/pct_norm"] = 100 * total_norm_sq / (overall_total ** 2)
+                wandb_metrics["grad_norm/pct_other"] = 100 * total_other_sq / (overall_total ** 2)
 
             # Per-component breakdown for first layer (layer 0)
-            for component in ["attention", "mlp", "router", "norm"]:
+            for component in ["attention", "mlp", "router", "norm", "other"]:
                 wandb_metrics[f"grad_norm/first_{component}"] = layer_totals[0][component]
 
             # Per-component breakdown for last layer
-            for component in ["attention", "mlp", "router", "norm"]:
+            for component in ["attention", "mlp", "router", "norm", "other"]:
                 wandb_metrics[f"grad_norm/last_{component}"] = layer_totals[num_layers - 1][component]
 
             # Special params (embedding, output)
