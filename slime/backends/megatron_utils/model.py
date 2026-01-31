@@ -571,10 +571,17 @@ def _debug_per_layer_grad_norm(model, step_id, args):
     from collections import defaultdict
 
     rank = dist.get_rank() if dist.is_initialized() else 0
-
-    # Only log on rank 0 to avoid spam
-    if rank != 0:
+    tp_rank = mpu.get_tensor_model_parallel_rank() if hasattr(mpu, 'get_tensor_model_parallel_rank') else 0
+    
+    # Print from all TP ranks if DEBUG_ALL_TP_RANKS=1
+    debug_all_tp_ranks = os.environ.get("DEBUG_ALL_TP_RANKS", "0") == "1"
+    
+    # Only log on rank 0 to avoid spam (unless DEBUG_ALL_TP_RANKS is set)
+    if rank != 0 and not debug_all_tp_ranks:
         return
+    
+    # Add TP rank info to prefix
+    rank_prefix = f"[Rank {rank}][TP {tp_rank}] " if debug_all_tp_ranks else ""
 
     # Determine last layer index
     num_layers = getattr(args, 'num_layers', 48)
@@ -661,8 +668,8 @@ def _debug_per_layer_grad_norm(model, step_id, args):
     print(f"{'='*100}", flush=True)
 
     # Print condensed table header
-    print(f"\n{'Layer':<8} {'Total':<12} {'Attention':<12} {'MLP':<12} {'Router':<12} {'Norm':<12} {'Params':<12}", flush=True)
-    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12}", flush=True)
+    print(f"\n{rank_prefix}{'Layer':<8} {'Total':<12} {'Attention':<12} {'MLP':<12} {'Router':<12} {'Norm':<12} {'Params':<12}", flush=True)
+    print(f"{rank_prefix}{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12}", flush=True)
 
     # Aggregate stats for component comparison
     total_attention_sq, total_mlp_sq, total_router_sq, total_norm_sq, total_other_sq = 0.0, 0.0, 0.0, 0.0, 0.0
@@ -675,7 +682,7 @@ def _debug_per_layer_grad_norm(model, step_id, args):
         total_norm_sq += lt["norm"] ** 2
         total_other_sq += lt["other"] ** 2
         params_str = f"{lt['params_with_grad']}/{lt['params_total']}"
-        print(f"L{layer_idx:<6} {lt['total']:<12.4e} {lt['attention']:<12.4e} {lt['mlp']:<12.4e} "
+        print(f"{rank_prefix}L{layer_idx:<6} {lt['total']:<12.4e} {lt['attention']:<12.4e} {lt['mlp']:<12.4e} "
               f"{lt['router']:<12.4e} {lt['norm']:<12.4e} {params_str:<12}", flush=True)
 
     # Aggregate component totals
@@ -686,8 +693,8 @@ def _debug_per_layer_grad_norm(model, step_id, args):
     total_other = math.sqrt(total_other_sq) if total_other_sq > 0 else 0.0
     overall_total = math.sqrt(total_attention_sq + total_mlp_sq + total_router_sq + total_norm_sq + total_other_sq)
 
-    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12}", flush=True)
-    print(f"{'TOTAL':<8} {overall_total:<12.4e} {total_attention:<12.4e} {total_mlp:<12.4e} "
+    print(f"{rank_prefix}{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12}", flush=True)
+    print(f"{rank_prefix}{'TOTAL':<8} {overall_total:<12.4e} {total_attention:<12.4e} {total_mlp:<12.4e} "
           f"{total_router:<12.4e} {total_norm:<12.4e}", flush=True)
 
     # Log special params
