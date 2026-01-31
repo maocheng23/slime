@@ -194,7 +194,7 @@ def execute():
         # Enable deterministic all-reduce in Megatron to match SGLang's tree_all_reduce_sum
         "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
         # DEBUG: Enable to get accurate CUDA error location (slows down execution significantly)
-        "CUDA_LAUNCH_BLOCKING": "1",  # ENABLED: Finding the real source of CUDA illegal memory access
+        #"CUDA_LAUNCH_BLOCKING": "1",  # ENABLED: Finding the real source of CUDA illegal memory access
     }
 
     train_args = (
