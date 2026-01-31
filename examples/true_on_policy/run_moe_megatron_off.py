@@ -119,7 +119,7 @@ def execute():
 
     tp_args = (
         f"--tensor-model-parallel-size {tensor_parallel_size} "
-        # "--sequence-parallel "  # Disabled: only use TP without SP for easier debugging
+        "--sequence-parallel "  # Disabled: only use TP without SP for easier debugging
         "--pipeline-model-parallel-size 1 "
         f"--expert-model-parallel-size {tensor_parallel_size} "  # EP = TP (SGLang requires TP >= EP)
         "--expert-tensor-parallel-size 1 "
