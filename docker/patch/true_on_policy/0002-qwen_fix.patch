@@ -1,0 +1,944 @@
+From d3b807d0d76835090ef5985fbcc3722d56b8f04c Mon Sep 17 00:00:00 2001
+From: maocheng23 <maocheng@berkeley.edu>
+Date: Thu, 29 Jan 2026 22:45:23 +0000
+Subject: [PATCH 2/3] qwen fix
+
+---
+ .../srt/distributed/communication_op.py       |   6 +
+ python/sglang/srt/layers/communicator.py      |   7 +-
+ .../layers/moe/fused_moe_triton/fused_moe.py  |  12 +-
+ .../srt/layers/moe/fused_moe_triton/layer.py  |  85 ++-
+ python/sglang/srt/server_args.py              |   8 +-
+ .../sglang/srt/tp_invariant_ops/__init__.py   |  19 +
+ .../srt/tp_invariant_ops/tp_invariant_ops.py  | 625 ++++++++++++++++++
+ 7 files changed, 746 insertions(+), 16 deletions(-)
+ create mode 100644 python/sglang/srt/tp_invariant_ops/__init__.py
+ create mode 100644 python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py
+
+diff --git a/python/sglang/srt/distributed/communication_op.py b/python/sglang/srt/distributed/communication_op.py
+index 95600ed..4d1b9c7 100644
+--- a/python/sglang/srt/distributed/communication_op.py
++++ b/python/sglang/srt/distributed/communication_op.py
+@@ -33,3 +33,9 @@ def broadcast_tensor_dict(
+     if not torch.distributed.is_initialized():
+         return tensor_dict
+     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
++
++def tensor_model_parallel_tree_all_reduce(input_: torch.Tensor) -> torch.Tensor:
++    """Tree all-reduce the input tensor across model parallel group."""
++    from sglang.srt.tp_invariant_ops import tree_all_reduce_sum
++
++    return tree_all_reduce_sum(input_, device_group=get_tp_group().device_group)
+\ No newline at end of file
+diff --git a/python/sglang/srt/layers/communicator.py b/python/sglang/srt/layers/communicator.py
+index 1636ed7..a7d9c1c 100644
+--- a/python/sglang/srt/layers/communicator.py
++++ b/python/sglang/srt/layers/communicator.py
+@@ -25,6 +25,7 @@ from sglang.srt.distributed import (
+     get_tensor_model_parallel_world_size,
+     get_tp_group,
+     tensor_model_parallel_all_reduce,
++    tensor_model_parallel_tree_all_reduce, 
+ )
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+@@ -38,6 +39,7 @@ from sglang.srt.layers.dp_attention import (
+     attn_tp_reduce_scatter_tensor,
+     dp_gather_partial,
+     dp_reduce_scatter_tensor,
++    dp_gather_replicate,
+     dp_scatter,
+     get_attention_dp_size,
+     get_attention_tp_rank,
+@@ -809,7 +811,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
+                     hidden_states, residual
+                 )
+             else:
+-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
++                if get_global_server_args().rl_on_policy_target == "fsdp_tp" or get_global_server_args().rl_on_policy_target == "fsdp":
++                    hidden_states = tensor_model_parallel_tree_all_reduce(hidden_states)
++                else:
++                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                 if _is_npu and context.cache is not None:
+                     _ = prepare_weight_cache(hidden_states, context.cache)
+                 hidden_states, residual = layernorm(hidden_states, residual)
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+index 14d6923..a93e969 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+@@ -8,7 +8,8 @@ from __future__ import annotations
+ import functools
+ import os
+ from typing import TYPE_CHECKING, List, Optional
+-
++from sglang.srt.tp_invariant_ops.tp_invariant_ops import moe_sum_tree_reduce
++from sglang.srt.server_args import get_global_server_args
+ import torch
+ import torch.nn.functional as F
+ import triton.language as tl
+@@ -320,6 +321,7 @@ def fused_experts_impl(
+     gemm1_alpha: Optional[float] = None,
+     gemm1_limit: Optional[float] = None,
+     filter_expert: bool = True,
++    layer_id: Optional[int] = None,  # Optional layer_id for debugging
+ ):
+     padded_size = padding_size
+     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
+@@ -572,6 +574,14 @@ def fused_experts_impl(
+                     intermediate_cache3[:, 1],
+                     out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                 ).squeeze(dim=1)
++            elif get_global_server_args().rl_on_policy_target and get_global_server_args().rl_on_policy_target == "fsdp_tp" or get_global_server_args().rl_on_policy_target == "fsdp":
++                moe_sum_tree_reduce(
++                    intermediate_cache3.view(*intermediate_cache3.shape),
++                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
++                    curr_topk_ids,
++                    routed_scaling_factor,
++                    E,
++                )
+             else:
+                 # According to micro benchmark results, torch.compile can get better performance for small token.
+                 if (
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index 7948779..dc453f7 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -67,7 +67,7 @@ from sglang.srt.utils import (
+     next_power_of_2,
+     round_up,
+ )
+-from sglang.srt.utils.custom_op import register_custom_op
++from sglang.srt.utils.common import direct_register_custom_op
+ 
+ if is_flashinfer_available():
+     from flashinfer import fp4_quantize
+@@ -909,7 +909,7 @@ class FusedMoE(torch.nn.Module):
+             assert TopKOutputChecker.format_is_standard(
+                 topk_output
+             ), "Only standard topk output is supported for piecewise cuda graph"
+-            return moe_forward_piecewise_cuda_graph_impl(
++            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+                 hidden_states,
+                 topk_output.topk_weights,
+                 topk_output.topk_ids,
+@@ -923,6 +923,18 @@ class FusedMoE(torch.nn.Module):
+         origin_hidden_states_dim = hidden_states.shape[-1]
+         assert self.quant_method is not None
+ 
++        # Debug: compare expert input (SGLang side) - only print for layer 0
++        import os
++        if os.environ.get("DEBUG_SGLANG_EP_MAPPING", "0") == "1" and self.layer_id == 0:
++            import logging
++            _logger = logging.getLogger(__name__)
++            position = 91 if hidden_states.shape[0] > 91 else 0
++            _logger.info(f"[layer.py][SGLang Expert Input][Layer {self.layer_id}] hidden_states.shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
++            _logger.info(f"[layer.py][SGLang Expert Input][Layer {self.layer_id}] hidden_states[{position}, :5]: {hidden_states[position, :5].tolist()}")
++            _logger.info(f"[layer.py][SGLang Expert Input][Layer {self.layer_id}] w13_weight.shape: {self.w13_weight.shape}, w2_weight.shape: {self.w2_weight.shape}")
++            _logger.info(f"[layer.py][SGLang Expert Input][Layer {self.layer_id}] topk_ids.shape: {topk_output.topk_ids.shape}, topk_ids[{position}]: {topk_output.topk_ids[position].tolist()}")
++            _logger.info(f"[layer.py][SGLang Expert Input][Layer {self.layer_id}] topk_weights.shape: {topk_output.topk_weights.shape}, topk_weights[{position}]: {topk_output.topk_weights[position].tolist()}")
++
+         dispatch_output = self.dispatcher.dispatch(
+             hidden_states=hidden_states, topk_output=topk_output
+         )
+@@ -953,6 +965,16 @@ class FusedMoE(torch.nn.Module):
+         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+ 
++        # Debug: compare expert output (SGLang side) - only print for layer 0
++        import os
++        if os.environ.get("DEBUG_SGLANG_EP_MAPPING", "0") == "1" and self.layer_id == 0:
++            import logging
++            _logger = logging.getLogger(__name__)
++            _logger.info(f"[layer.py][SGLang Expert Output][Layer {self.layer_id}] output.shape: {final_hidden_states.shape}, dtype: {final_hidden_states.dtype}")
++            _logger.info(f"[layer.py][SGLang Expert Output][Layer {self.layer_id}] output[0, :5]: {final_hidden_states[0, :5].tolist()}")
++            _logger.info(f"[layer.py][SGLang Expert Output][Layer {self.layer_id}] output.norm(): {final_hidden_states.norm().item():.6f}")
++            _logger.info(f"[layer.py][SGLang Expert Output][Layer {self.layer_id}] output.sum(): {final_hidden_states.sum().item():.6f}")
++
+         return final_hidden_states
+ 
+     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
+@@ -1081,7 +1103,7 @@ class FlashInferFusedMoE(FusedMoE):
+             assert TopKOutputChecker.format_is_standard(
+                 topk_output
+             ), "Only standard topk output is supported for piecewise cuda graph"
+-            return moe_forward_piecewise_cuda_graph_impl(
++            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+                 hidden_states,
+                 topk_output.topk_weights,
+                 topk_output.topk_ids,
+@@ -1210,14 +1232,16 @@ class FlashInferFP4MoE(FusedMoE):
+         ), "Only bypassed topk output is supported for flashinfer fp4 moe"
+ 
+         if is_in_piecewise_cuda_graph():
+-            return flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
+-                hidden_states,
+-                topk_output.router_logits,
+-                topk_output.topk_config.top_k,
+-                topk_output.topk_config.topk_group,
+-                topk_output.topk_config.num_expert_group,
+-                topk_output.topk_config.correction_bias,
+-                self.layer_id,
++            return (
++                torch.ops.sglang.flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
++                    hidden_states,
++                    topk_output.router_logits,
++                    topk_output.topk_config.top_k,
++                    topk_output.topk_config.topk_group,
++                    topk_output.topk_config.num_expert_group,
++                    topk_output.topk_config.correction_bias,
++                    self.layer_id,
++                )
+             )
+         else:
+             return self.forward_impl(hidden_states, topk_output)
+@@ -1315,7 +1339,6 @@ class FlashInferFP4MoE(FusedMoE):
+         return result
+ 
+ 
+-@register_custom_op(out_shape="hidden_states")
+ def moe_forward_piecewise_cuda_graph_impl(
+     hidden_states: torch.Tensor,
+     topk_weights: torch.Tensor,
+@@ -1332,7 +1355,16 @@ def moe_forward_piecewise_cuda_graph_impl(
+     return moe_layer.forward_impl(hidden_states, topk_output)
+ 
+ 
+-@register_custom_op(out_shape="hidden_states")
++def moe_forward_piecewise_cuda_graph_impl_fake(
++    hidden_states: torch.Tensor,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    router_logits: torch.Tensor,
++    layer_id: int,
++) -> torch.Tensor:
++    return torch.empty_like(hidden_states)
++
++
+ def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
+     hidden_states: torch.Tensor,
+     router_logits: torch.Tensor,
+@@ -1355,3 +1387,30 @@ def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
+     forward_context = get_forward_context()
+     moe_layer = forward_context.moe_layers[layer_id]
+     return moe_layer.forward_impl(hidden_states, topk_output)
++
++
++def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl_fake(
++    hidden_states: torch.Tensor,
++    router_logits: torch.Tensor,
++    top_k: int,
++    topk_group: Optional[int],
++    num_expert_group: Optional[int],
++    correction_bias: Optional[torch.Tensor],
++    layer_id: int,
++) -> torch.Tensor:
++    return torch.empty_like(hidden_states)
++
++
++direct_register_custom_op(
++    op_name="moe_forward_piecewise_cuda_graph_impl",
++    op_func=moe_forward_piecewise_cuda_graph_impl,
++    mutates_args=[],
++    fake_impl=moe_forward_piecewise_cuda_graph_impl_fake,
++)
++
++direct_register_custom_op(
++    op_name="flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl",
++    op_func=flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl,
++    mutates_args=[],
++    fake_impl=flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl_fake,
++)
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 72db298..c5aaa28 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -164,7 +164,7 @@ NSA_CHOICES = [
+ 
+ RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+ 
+-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
++RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "fsdp_tp"]
+ 
+ MOE_RUNNER_BACKEND_CHOICES = [
+     "auto",
+@@ -285,6 +285,7 @@ class ServerArgs:
+     quantization_param_path: Optional[str] = None
+     kv_cache_dtype: str = "auto"
+     enable_fp32_lm_head: bool = False
++    enable_fp32_route: bool = False
+     modelopt_quant: Optional[Union[str, Dict]] = None
+     modelopt_checkpoint_restore_path: Optional[str] = None
+     modelopt_checkpoint_save_path: Optional[str] = None
+@@ -2708,6 +2709,11 @@ class ServerArgs:
+             action="store_true",
+             help="If set, the LM head outputs (logits) are in FP32.",
+         )
++        parser.add_argument(
++            "--enable-fp32-route",
++            action="store_true",
++            help="If set, the route(moe) are in FP32.",
++        )
+         parser.add_argument(
+             "--modelopt-quant",
+             type=str,
+diff --git a/python/sglang/srt/tp_invariant_ops/__init__.py b/python/sglang/srt/tp_invariant_ops/__init__.py
+new file mode 100644
+index 0000000..b6bcea9
+--- /dev/null
++++ b/python/sglang/srt/tp_invariant_ops/__init__.py
+@@ -0,0 +1,19 @@
++from .tp_invariant_ops import (
++    disable_tp_invariant_mode,
++    enable_tp_invariant_mode,
++    is_tp_invariant_mode_enabled,
++    matmul_tp_persistent,
++    set_tp_invariant_mode,
++    tree_all_reduce_sum,
++)
++
++__version__ = "0.1.0"
++
++__all__ = [
++    "matmul_tp_persistent",
++    "tree_all_reduce_sum",
++    "set_tp_invariant_mode",
++    "is_tp_invariant_mode_enabled",
++    "disable_tp_invariant_mode",
++    "enable_tp_invariant_mode",
++]
+\ No newline at end of file
+diff --git a/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py b/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py
+new file mode 100644
+index 0000000..389f2ef
+--- /dev/null
++++ b/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py
+@@ -0,0 +1,625 @@
++import contextlib
++import math
++from typing import Any, Callable, Dict
++
++import torch
++import torch.distributed as dist
++import triton
++import triton.language as tl
++import os
++
++def _matmul_launch_metadata(
++    grid: Callable[..., Any], kernel: Any, args: Dict[str, Any]
++) -> Dict[str, Any]:
++    ret = {}
++    m, n, k = args["M"], args["N"], args["K"]
++    ret["name"] = f"{kernel.name} [M={m}, N={n}, K={k}]"
++    if "tiles_per_update" in args:
++        ret["name"] = (
++            f"{kernel.name} [M={m}, N={n}, K={k}, tiles_per_update={args['tiles_per_update']:02}]"
++        )
++    if "c_ptr" in args:
++        bytes_per_elem = args["c_ptr"].element_size()
++    else:
++        bytes_per_elem = 1 if args["FP8_OUTPUT"] else 2
++    ret[f"flops{bytes_per_elem * 8}"] = 2.0 * m * n * k
++    ret["bytes"] = bytes_per_elem * (m * k + n * k + m * n)
++    return ret
++
++
++@triton.jit
++def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
++    group_id = tile_id // num_pid_in_group
++    first_pid_m = group_id * GROUP_SIZE_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
++    pid_m = first_pid_m + (tile_id % group_size_m)
++    pid_n = (tile_id % num_pid_in_group) // group_size_m
++    return pid_m, pid_n
++
++
++def _get_tl_dtype(dtype):
++    if dtype == torch.float32:
++        return tl.float32
++    elif dtype == torch.float16:
++        return tl.float16
++    elif dtype == torch.bfloat16:
++        return tl.bfloat16
++
++
++# ---- kernel ----
++@triton.jit(launch_metadata=_matmul_launch_metadata)
++def matmul_kernel_tp_persistent(
++    A_ptr,
++    B_ptr,
++    C_ptr,
++    M,
++    N,
++    K,
++    stride_am,
++    stride_ak,
++    stride_bk,
++    stride_bn,
++    stride_cm,
++    stride_cn,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    GROUP_SIZE_M: tl.constexpr,
++    NUM_SMS: tl.constexpr,
++    LEVEL_K: tl.constexpr,
++    TILE_K: tl.constexpr,
++    FIRST_LEVEL_BLOCK: tl.constexpr,
++    NEXT_POWER_OF_LEVEL: tl.constexpr,
++    NEXT_POWER_OF_REMAIN_LEVEL: tl.constexpr,
++    ACC_DTYPE: tl.constexpr,
++    OUT_DTYPE: tl.constexpr,
++    A_LARGE: tl.constexpr,
++    B_LARGE: tl.constexpr,
++    C_LARGE: tl.constexpr,
++):
++    pid = tl.program_id(axis=0)
++    num_pid_m = tl.cdiv(M, BLOCK_M)
++    num_pid_n = tl.cdiv(N, BLOCK_N)
++    num_tiles = num_pid_m * num_pid_n
++
++    num_pid_in_group = GROUP_SIZE_M * num_pid_n
++
++    manual_acc = 3
++    acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
++    acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
++    acc3 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
++
++    S = tl.zeros((NEXT_POWER_OF_REMAIN_LEVEL, BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
++
++    S_mask = tl.arange(0, NEXT_POWER_OF_REMAIN_LEVEL)[:, None, None]
++
++    offs_k = tl.arange(0, BLOCK_K)
++    offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
++
++    for tile_id in tl.range(pid, num_tiles, NUM_SMS, flatten=False):
++        pid_m, pid_n = _compute_pid(
++            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
++        )
++
++        start_m = pid_m * BLOCK_M
++        start_n = pid_n * BLOCK_N
++
++        offs_am = start_m + tl.arange(0, BLOCK_M)
++        if A_LARGE:
++            offs_am = offs_am.to(tl.int64)
++        offs_am = tl.where(offs_am < M, offs_am, 0)
++
++        offs_bn = start_n + tl.arange(0, BLOCK_N)
++        if B_LARGE:
++            offs_bn = offs_bn.to(tl.int64)
++        offs_bn = tl.where(offs_bn < N, offs_bn, 0)
++
++        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_M), BLOCK_M)
++        offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_N), BLOCK_N)
++
++        a_ptrs = A_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
++        b_ptrs = B_ptr + offs_bn[None, :] * stride_bn + offs_k[:, None] * stride_bk
++
++        count = tl.zeros((NEXT_POWER_OF_LEVEL,), dtype=tl.int32)
++
++        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
++        for s_tile_idx in range(0, TILE_K):
++            k0 = s_tile_idx * BLOCK_K
++            a = tl.load(
++                a_ptrs,
++                mask=(offs_am[:, None] < M) & ((k0 + offs_k)[None, :] < K),
++                other=0.0,
++            )
++            b = tl.load(
++                b_ptrs,
++                mask=((k0 + offs_k)[:, None] < K) & (offs_bn[None, :] < N),
++                other=0.0,
++            )
++            a_ptrs += BLOCK_K * stride_ak
++            b_ptrs += BLOCK_K * stride_bk
++
++            acc = tl.dot(a, b).to(ACC_DTYPE)
++
++            break_flag = 0
++            for level in range(LEVEL_K):
++                if break_flag == 0:
++                    idx_mask = tl.arange(0, NEXT_POWER_OF_LEVEL) == level
++
++                    count_value_added = tl.sum(count * idx_mask) + 1
++
++                    table_value = FIRST_LEVEL_BLOCK if level == 0 else 2
++
++                    carry_over = (table_value == count_value_added).to(tl.int1)
++
++                    if count_value_added > 1:
++                        if level == 0:
++                            acc = acc1 + acc
++                        elif level == 1:
++                            acc = acc2 + acc
++                        elif level == 2:
++                            acc = acc3 + acc
++                        else:
++                            tmp_acc_mask = S_mask == (level - manual_acc)
++                            acc = (
++                                tl.sum(S * tmp_acc_mask, axis=0, dtype=ACC_DTYPE) + acc
++                            )
++
++                    count = tl.where(
++                        idx_mask, count_value_added * (1 - carry_over), count
++                    )
++                    if not carry_over:
++                        break_flag = 1
++                        if level == 0:
++                            acc1 = acc
++                        elif level == 1:
++                            acc2 = acc
++                        elif level == 2:
++                            acc3 = acc
++                        else:
++                            tmp_acc_mask = S_mask == (level - manual_acc)
++                            S = tl.where(tmp_acc_mask, acc[None, :, :], S)
++
++        c_ptr = C_ptr + (offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn)
++        offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++        offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++        if C_LARGE:
++            offs_cm = offs_cm.to(tl.int64)
++            offs_cn = offs_cn.to(tl.int64)
++        offs_cm = tl.where(offs_cm < M, offs_cm, 0)
++        offs_cn = tl.where(offs_cn < N, offs_cn, 0)
++        offs_cm = tl.max_contiguous(tl.multiple_of(offs_cm, BLOCK_M), BLOCK_M)
++        offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_N), BLOCK_N)
++        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
++        tl.store(c_ptr, acc.to(OUT_DTYPE), mask=mask_c)
++
++
++def matmul_tp_persistent(A: torch.Tensor, B: torch.Tensor, bias: torch.Tensor = None):
++    assert A.shape[-1] == B.shape[-2], "Dim doesn't match"
++
++    out_dtype = A.dtype
++    acc_dtype = A.dtype
++
++    NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
++
++    # 1D launch kernel where each block gets its own program.
++    def grid(META):
++        return (
++            min(
++                NUM_SMS,
++                triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
++            ),
++        )
++
++    configs = {
++        torch.bfloat16: {
++            "BLOCK_SIZE_M": 64,
++            "BLOCK_SIZE_N": 128,
++            "BLOCK_SIZE_K": 128,
++            "GROUP_SIZE_M": 8,
++            "num_stages": 2,
++            "num_warps": 8,
++        },
++        torch.float16: {
++            "BLOCK_SIZE_M": 64,
++            "BLOCK_SIZE_N": 128,
++            "BLOCK_SIZE_K": 128,
++            "GROUP_SIZE_M": 8,
++            "num_stages": 2,
++            "num_warps": 8,
++        },
++        torch.float32: {
++            "BLOCK_SIZE_M": 32,
++            "BLOCK_SIZE_N": 64,
++            "BLOCK_SIZE_K": 128,
++            "GROUP_SIZE_M": 8,
++            "num_stages": 2,
++            "num_warps": 8,
++        },
++    }
++
++    BLOCK_M = configs[out_dtype]["BLOCK_SIZE_M"]
++    BLOCK_N = configs[out_dtype]["BLOCK_SIZE_N"]
++    BLOCK_K = configs[out_dtype]["BLOCK_SIZE_K"]
++    GROUP_SIZE_M = configs[out_dtype]["GROUP_SIZE_M"]
++    num_stages = configs[out_dtype]["num_stages"]
++    num_warps = configs[out_dtype]["num_warps"]
++
++    M, K = A.shape
++    _, N = B.shape
++    assert (
++        K % BLOCK_K == 0
++    ), f"Dimension K should be divisible by BLOCK_K. Got K={K}, BLOCK_K={BLOCK_K}."
++    T = K // BLOCK_K
++    FIRST_LEVEL_BLOCK = T
++
++    LEVEL_K = 1
++    while FIRST_LEVEL_BLOCK > 2 and FIRST_LEVEL_BLOCK % 2 == 0:
++        FIRST_LEVEL_BLOCK //= 2
++        LEVEL_K += 1
++
++    C = torch.empty((M, N), device=A.device, dtype=out_dtype)
++
++    # manually add 3 accumulators
++    manual_acc = 3
++
++    NEXT_POWER_OF_LEVEL = 2 ** math.ceil(math.log2(LEVEL_K))
++    # set the minimum value to 1 to avoid NEXT_POWER_OF_LEVEL being 0
++    NEXT_POWER_OF_REMAIN_LEVEL = (
++        2 ** math.ceil(math.log2(LEVEL_K - manual_acc)) if LEVEL_K > manual_acc else 1
++    )
++
++    matmul_kernel_tp_persistent[grid](
++        A,
++        B,
++        C,
++        M,
++        N,
++        K,
++        *A.stride(),
++        *B.stride(),
++        *C.stride(),
++        BLOCK_M=BLOCK_M,
++        BLOCK_N=BLOCK_N,
++        BLOCK_K=BLOCK_K,
++        GROUP_SIZE_M=GROUP_SIZE_M,
++        NUM_SMS=NUM_SMS,
++        NEXT_POWER_OF_REMAIN_LEVEL=NEXT_POWER_OF_REMAIN_LEVEL,
++        LEVEL_K=LEVEL_K,
++        TILE_K=T,
++        FIRST_LEVEL_BLOCK=FIRST_LEVEL_BLOCK,
++        NEXT_POWER_OF_LEVEL=NEXT_POWER_OF_LEVEL,
++        ACC_DTYPE=_get_tl_dtype(acc_dtype),
++        OUT_DTYPE=_get_tl_dtype(out_dtype),
++        A_LARGE=A.numel() > 2**31,
++        B_LARGE=B.numel() > 2**31,
++        C_LARGE=C.numel() > 2**31,
++        num_warps=num_warps,
++        num_stages=num_stages,
++    )
++    if bias is not None:
++        C += bias
++    return C
++
++
++def tree_all_reduce_sum(x: torch.Tensor, device_group=None) -> torch.Tensor:
++    rank = dist.get_rank(device_group)
++    world_size = dist.get_world_size(device_group)
++
++    if world_size & (world_size - 1) != 0:
++        raise ValueError(
++            "world_size must be the pow of 2 in order to use all_reduce_sum。"
++        )
++
++    result = [torch.zeros_like(x) for _ in range(world_size)]
++    dist.all_gather(result, x, group=device_group)
++
++    for level in range(1, world_size.bit_length()):
++        for left in range(0, world_size, 1 << level):
++            right = left + (1 << (level - 1))
++            result[left] += result[right]
++
++    return result[0]
++
++
++_tp_inv_MODE = False
++
++try:
++    def_lib = torch.library.Library("tp_inv_ops", "DEF")
++    def_lib.define("matmul_tp_inv(Tensor a, Tensor b, Tensor? bias=None) -> Tensor")
++except RuntimeError:
++    pass
++
++try:
++    impl = torch.library.Library("tp_inv_ops", "IMPL")
++
++    impl.impl("matmul_tp_inv", matmul_tp_persistent, "CUDA")
++except RuntimeError:
++    pass
++
++
++def is_tp_invariant_mode_enabled():
++    return _tp_inv_MODE
++
++
++def enable_tp_invariant_mode():
++    global _tp_inv_MODE
++
++    if _tp_inv_MODE:
++        return
++
++    _tp_inv_MODE = True
++
++
++def disable_tp_invariant_mode():
++    global _tp_inv_MODE
++
++    _tp_inv_MODE = False
++
++
++@contextlib.contextmanager
++def set_tp_invariant_mode(enabled=True):
++    global _tp_inv_MODE
++
++    old_state = _tp_inv_MODE
++
++    if enabled:
++        enable_tp_invariant_mode()
++    else:
++        disable_tp_invariant_mode()
++
++    try:
++        yield
++    finally:
++        _tp_inv_MODE = old_state
++
++
++def scatter_input_by_local_expert(topk: torch.Tensor, input: torch.Tensor, E: int) -> torch.Tensor:
++    """
++    Args:
++        topk: [M, topk], long, -1 means remote expert
++        input: [M, topk, hidden_size], float
++        E: int, number of local experts (expert ids in [0, E))
++    Returns:
++        output: [M, E, hidden_size]
++    """
++    M, _, hidden_size = input.shape
++    
++    # Mask out remote experts in output
++    valid = (topk != -1).unsqueeze(-1)  # [M, topk, 1]
++    output_masked = input * valid.to(input.dtype)  # [M, topk, hidden_size]
++    
++    # Replace -1 with 0 for safe indexing (value doesn't matter because output is zero)
++    topk_index = topk.clamp(min=0)  # turns -1 → 0, others unchanged
++    
++    # Expand index to match output
++    index = topk_index.unsqueeze(-1).expand(-1, -1, hidden_size)  # [M, topk, hidden_size]
++    
++    # Initialize result
++    output = torch.zeros(M, E, hidden_size, device=input.device, dtype=input.dtype)
++    
++    # Scatter add
++    output.scatter_add_(1, index, output_masked)
++    
++    return output
++
++@triton.jit
++def _moe_tree_sum_reduce_kernel(
++    input_ptr,
++    input_stride_0,
++    input_stride_1,
++    input_stride_2,
++    output_ptr,
++    output_stride_0,
++    output_stride_1,
++    E: int,
++    E_level: int,
++    token_num: int,
++    hidden_dim: int,
++    routed_scaling_factor: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_DIM: tl.constexpr,
++    NUM_STAGE: tl.constexpr,
++):
++    input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
++    input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
++    output_stride_0 = tl.cast(output_stride_0, dtype=tl.int64)
++
++    token_block_id = tl.program_id(0)
++    dim_block_id = tl.program_id(1)
++
++    offs_token = token_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_dim = dim_block_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
++
++    mask_token = offs_token < token_num
++    mask_dim = offs_dim < hidden_dim
++
++    base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
++
++    accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
++
++    for level in tl.range(1, E_level, num_stages=NUM_STAGE):
++        for left in range(0, E, 1 << level):
++            right = left + (1 << (level - 1))
++            left_tile = tl.load(
++                base_ptrs + left * input_stride_1,
++                mask=mask_token[:, None] & mask_dim[None, :],
++                other=0.0,
++            ).to(tl.float32)
++            right_tile = tl.load(
++                base_ptrs + right * input_stride_1,
++                mask=mask_token[:, None] & mask_dim[None, :],
++                other=0.0,
++            ).to(tl.float32)
++            tl.store(
++                base_ptrs + left * input_stride_1,
++                (left_tile + right_tile).to(input_ptr.dtype.element_ty),
++                mask=mask_token[:, None] & mask_dim[None, :],
++            )
++    accumulator += tl.load(
++        base_ptrs,
++        mask=mask_token[:, None] & mask_dim[None, :],
++        other=0.0,
++    ).to(tl.float32) * routed_scaling_factor
++    # -------- Write back --------
++    store_ptrs = output_ptr + offs_token[:, None] * output_stride_0 + offs_dim[None, :]
++    tl.store(
++        store_ptrs,
++        accumulator.to(input_ptr.dtype.element_ty),
++        mask=mask_token[:, None] & mask_dim[None, :],
++    )
++
++def moe_sum_tree_reduce(
++    input: torch.Tensor, #[M, topk, hidden_dim]
++    output: torch.Tensor, #[M, hidden_dim]
++    curr_topk_ids: torch.Tensor, #[M, topk]
++    routed_scaling_factor: float,
++    E: int,
++):
++    assert input.is_contiguous()
++    assert output.is_contiguous()
++
++    token_num, _, hidden_dim = input.shape
++    assert output.shape[0] == token_num and output.shape[1] == hidden_dim
++    input_masked = scatter_input_by_local_expert(
++        topk=curr_topk_ids,
++        input=input,
++        E=E,
++    ) # [M, E, hidden_dim]
++    
++    # for level in range(1, E.bit_length()):
++    #     for left in range(0, E, 1 << level):
++    #         right = left + (1 << (level - 1))
++    #         input_masked[:,left] += input_masked[:,right]
++    # output.copy_(input_masked[:,0] * routed_scaling_factor)BLOCK_M = 1
++    
++    BLOCK_M = 1
++    BLOCK_DIM = 2048
++    NUM_STAGE = 1
++    num_warps = 16
++
++    grid = (
++        triton.cdiv(token_num, BLOCK_M),
++        triton.cdiv(hidden_dim, BLOCK_DIM),
++    )
++
++    _moe_tree_sum_reduce_kernel[grid](
++        input_masked,
++        *input_masked.stride(),
++        output,
++        *output.stride(),
++        token_num=token_num,
++        E=E,
++        E_level=E.bit_length(),
++        hidden_dim=hidden_dim,
++        routed_scaling_factor=routed_scaling_factor,
++        BLOCK_M=BLOCK_M,
++        BLOCK_DIM=BLOCK_DIM,
++        NUM_STAGE=NUM_STAGE,
++        num_warps=num_warps,
++    )
++    return
++
++
++class BitConsistentFullScatterReduce(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, input, curr_topk_ids, routed_scaling_factor, E):
++        """
++        全量执行 (No Chunking) + 确定性 Scatter + Tree Reduce。
++        """
++        ctx.routed_scaling_factor = routed_scaling_factor
++        ctx.input_shape = input.shape
++        
++        M, K, H = input.shape
++        
++        # ========================================================
++        # 1. 确定性 Scatter (Deterministic Scatter)
++        # ========================================================
++        
++        # 1.1 处理 Index：将 -1 (Remote) 映射到 E (垃圾桶)
++        # 这一步是为了避免 clamp(0) 导致的覆盖问题
++        # 必须 clone，避免修改原始 input
++        scatter_index = curr_topk_ids.clone()
++        mask_remote = (scatter_index == -1)
++        scatter_index[mask_remote] = E 
++        
++        # [M, K, H]
++        scatter_index_expanded = scatter_index.unsqueeze(-1).expand(-1, -1, H)
++        
++        # 1.2 分配全量显存
++        # E=52 (EP10) -> padding 到 64
++        # 申请 [M, 64, H] 的空间。对于 28k 序列 BF16，大约 14GB。
++        # 相比分块，这里会有一个瞬间的显存波峰，但对于 H100 (141GB) 完全安全。
++        
++        # 计算下一个 2 的幂次 (Tree Reduce 需要)
++        target_E = E
++        if E > 0 and (E & (E - 1) != 0):
++            target_E = 1 << (E - 1).bit_length()
++        
++        # 我们直接申请 target_E + 1 大小的空间 (多一个是垃圾桶)
++        dense_tensor = torch.zeros(
++            M, target_E + 1, H, 
++            device=input.device, dtype=input.dtype
++        )
++        
++        # 1.3 执行 Scatter (赋值模式)
++        # 核心：使用 scatter_ 而不是 scatter_add_
++        # 因为 TopK 互斥，赋值是确定性的。
++        dense_tensor.scatter_(1, scatter_index_expanded, input)
++        
++        # 1.4 丢弃垃圾桶 & 截断到 target_E
++        # 此时 dense_tensor 已经是 Pad 好的 2 的幂次形状
++        dense_tensor = dense_tensor[:, :target_E, :]
++        
++        # ========================================================
++        # 2. 全量 Tree Reduce
++        # ========================================================
++        
++        # 28k 的大张量直接并行规约
++        steps = target_E.bit_length() - 1
++        current_tensor = dense_tensor
++        
++        for _ in range(steps):
++            # 向量化折叠
++            # PyTorch 会自动生成高效的 Element-wise Kernel
++            current_tensor = current_tensor[:, 0::2] + current_tensor[:, 1::2]
++            
++        # ========================================================
++        # 3. 清理与返回
++        # ========================================================
++        # 函数返回后，dense_tensor 和中间变量会立即释放
++        # 显存占用回到 0
++        
++        return current_tensor.squeeze(1) * routed_scaling_factor
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        # Backward 逻辑永远不变：Broadcast
++        routed_scaling_factor = ctx.routed_scaling_factor
++        M, K, H = ctx.input_shape
++        
++        grad_sum = grad_output * routed_scaling_factor
++        grad_input = grad_sum.unsqueeze(1).expand(M, K, H)
++        
++        return grad_input.contiguous(), None, None, None
++
++def moe_sum_tree_reduce_optim(
++    input: torch.Tensor,                
++    output: torch.Tensor,               
++    curr_topk_ids: torch.Tensor,        
++    routed_scaling_factor: float,
++    E: int,
++):
++    """
++    全量、确定性、保留 Scatter 拓扑的 Reduce。
++    适合显存充裕 (80GB+) 的场景。
++    """
++    res = BitConsistentFullScatterReduce.apply(input, curr_topk_ids, routed_scaling_factor, E)
++    output.copy_(res)
++    return
++
++# 根据环境变量选择使用哪个版本
++if os.getenv("MOE_SUM_OPTIM", "0") == "1":
++    moe_sum_tree_reduce = moe_sum_tree_reduce_optim
++    print("使用优化版本 moe_sum_tree_reduce_optim")
++else:
++    print("使用原始版本 moe_sum_tree_reduce_original")
+\ No newline at end of file
+-- 
+2.43.0
+
