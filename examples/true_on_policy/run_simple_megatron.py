@@ -1,3 +1,4 @@
+import math
 import os
 
 
@@ -17,7 +18,7 @@ NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "4"))
 USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 
 # TP configuration for verifying true on-policy with tensor parallelism
-USE_TP = os.environ.get("SLIME_USE_TP", "0") == "1"
+USE_TP = os.environ.get("SLIME_USE_TP", "1") == "1"
 TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "4"))
 
 def prepare():
@@ -31,6 +32,17 @@ def prepare():
 
 
 def execute():
+    tensor_parallel_size = TP_SIZE if USE_TP else 1
+    assert NUM_GPUS % tensor_parallel_size == 0, (
+        f"NUM_GPUS ({NUM_GPUS}) must be divisible by tensor_parallel_size ({tensor_parallel_size})"
+    )
+    data_parallel_size = NUM_GPUS // tensor_parallel_size
+
+    global_batch_size = 1 if MODE == "debug_one_sample" else 256
+    if global_batch_size % data_parallel_size != 0:
+        # Megatron requires global_batch_size divisible by micro_batch_size * data_parallel_size
+        global_batch_size = math.ceil(global_batch_size / data_parallel_size) * data_parallel_size
+
     if USE_RAW:
         ckpt_args = (
             f"--hf-checkpoint /root/models/{MODEL_NAME} "
@@ -56,15 +68,15 @@ def execute():
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type math "
-        f"--num-rollout {2 if MODE == 'debug_one_sample' else 3000} "
-        f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 32} "
+        f"--num-rollout {1 if MODE == 'debug_one_sample' else 3000} "
+        f"--rollout-batch-size {4 if MODE == 'debug_one_sample' else 32} "
         f"--n-samples-per-prompt {1 if MODE == 'debug_one_sample' else 8} "
         f"--rollout-max-response-len {2 if MODE == 'debug_one_sample' else 1024} "
         "--rollout-temperature 1 "
         # temp remove this to make test easier
         # "--over-sampling-batch-size 64 "
         # "--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
-        f"--global-batch-size {1 if MODE == 'debug_one_sample' else 256} "
+        f"--global-batch-size {global_batch_size} "
     )
 
     eval_args = ""
@@ -101,7 +113,7 @@ def execute():
     if USE_TP:
         tp_args = (
             f"--tensor-model-parallel-size {TP_SIZE} "
-            "--sequence-parallel "  # Required for TP with MoE/attention
+            # "--sequence-parallel "  # Disabled: only use TP without SP for easier debugging
             "--pipeline-model-parallel-size 1 "
         )
         sglang_args = (
@@ -164,11 +176,17 @@ def execute():
         "--no-rope-fusion "
     )
     true_on_policy_envs = {
-        # TODO note: "Ring" in original RL PR, "allreduce:tree" in SGLang
-        "NCCL_ALGO": "Ring",
-        # "NCCL_ALGO": "allreduce:tree",
+        # NOTE: Use "allreduce:Tree" instead of "Tree" to only affect AllReduce operations
+        # "Tree" would affect ALL NCCL operations (AllGather, ReduceScatter, etc.) and may cause errors
+        # like "no algorithm/protocol available for function AllGather with datatype ncclInt8"
+        "NCCL_ALGO": "allreduce:Tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        # Disable NVLS (NVLink SHARP) to ensure consistent all-reduce behavior between sglang and megatron
+        "NCCL_NVLS_ENABLE": "0",
+        # Use deterministic tree all-reduce (all_gather + local tree sum) instead of NCCL all_reduce
+        # This ensures SGLang and Megatron use identical all-reduce implementation for true on-policy
+        "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
     }
 
     train_args = (
@@ -193,6 +211,7 @@ def execute():
             **true_on_policy_envs,
             "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
             "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
+            "SLIME_DEBUG_ATTN": "1" if MODE == "debug_one_sample" else "0",
         },
     )
 

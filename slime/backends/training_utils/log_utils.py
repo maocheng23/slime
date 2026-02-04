@@ -163,7 +163,10 @@ def log_rollout_data(
                 and "rollout/log_probs" in reduced_log_dict
                 and "rollout/ref_log_probs" in reduced_log_dict
             ):
-                assert reduced_log_dict["rollout/log_probs"] == reduced_log_dict["rollout/ref_log_probs"]
+                log_probs_val = reduced_log_dict["rollout/log_probs"]
+                ref_log_probs_val = reduced_log_dict["rollout/ref_log_probs"]
+                assert reduced_log_dict["rollout/log_probs"] == reduced_log_dict["rollout/ref_log_probs"], \
+                    f"log_probs={log_probs_val} != ref_log_probs={ref_log_probs_val}, diff={abs(log_probs_val - ref_log_probs_val)}"
             if "rollout/log_probs" in reduced_log_dict and "rollout/rollout_log_probs" in reduced_log_dict:
                 assert isclose(
                     reduced_log_dict["rollout/log_probs"], reduced_log_dict["rollout/rollout_log_probs"], abs_tol=0.03

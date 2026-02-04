@@ -79,16 +79,19 @@ def _get_megatron_full_params(
     # broadcast params across ep ranks
     if ep_size > 1:
         handles = []
+        ep_group = mpu.get_expert_model_parallel_group()
+        ep_group_ranks = dist.get_process_group_ranks(ep_group)
+        
         for info, param in zip(megatron_local_param_infos, params, strict=False):
             if ".experts." in info.name:
                 src_rank = (
                     info.src_rank
-                    if info.src_rank in dist.get_process_group_ranks(mpu.get_expert_model_parallel_group())
+                    if info.src_rank in ep_group_ranks
                     else rank
                 )
                 handles.append(
                     torch.distributed.broadcast(
-                        param, src=src_rank, group=mpu.get_expert_model_parallel_group(), async_op=True
+                        param, src=src_rank, group=ep_group, async_op=True
                     )
                 )
         for handle in handles:
@@ -146,12 +149,13 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
     param_infos = {}
     rank = dist.get_rank()
     for name, param in named_params_and_buffers(args, model):
+        tp_attr = getattr(param, "tensor_model_parallel", False)
         param_infos[name] = ParamInfo(
             name=name,
             dtype=param.dtype,
             shape=param.shape,
             attrs={
-                "tensor_model_parallel": getattr(param, "tensor_model_parallel", False),
+                "tensor_model_parallel": tp_attr,
                 "partition_dim": getattr(param, "partition_dim", -1),
                 "partition_stride": getattr(param, "partition_stride", 1),
                 "parallel_mode": getattr(param, "parallel_mode", None),
