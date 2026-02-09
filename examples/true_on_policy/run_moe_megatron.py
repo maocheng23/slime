@@ -21,6 +21,13 @@ USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 USE_TP = os.environ.get("SLIME_USE_TP", "0") == "1"
 TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "1"))
 
+# PP configuration for verifying true on-policy with pipeline parallelism
+# With 8 GPUs and PP=2: TP=4, PP=2, EP=4, DP=1
+#   - Each PP stage has 4 GPUs for TP/EP
+#   - SGLang engine uses all 8 GPUs (TP=4 x PP=2)
+#   - No sequence splitting, so attention is bitwise identical to SGLang inference
+PP_SIZE = int(os.environ.get("SLIME_PP_SIZE", "1"))
+
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
     U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -32,13 +39,25 @@ def prepare():
 
 
 def execute():
-    # For MoE models, SGLang requires TP >= EP
-    # Use TP_SIZE from env var, default to NUM_GPUS (so TP=EP=NUM_GPUS, DP=1)
-    tensor_parallel_size = TP_SIZE if USE_TP else NUM_GPUS
-    assert NUM_GPUS % tensor_parallel_size == 0, (
-        f"NUM_GPUS ({NUM_GPUS}) must be divisible by tensor_parallel_size ({tensor_parallel_size})"
+    pipeline_parallel_size = PP_SIZE
+
+    # For MoE models, SGLang requires TP >= EP.
+    # Default TP fills all GPUs within each PP stage (so DP=1).
+    # Examples:
+    #   8 GPUs, PP=1 → TP=8, EP=8, DP=1  (original behavior)
+    #   8 GPUs, PP=2 → TP=4, EP=4, DP=1
+    tensor_parallel_size = TP_SIZE if USE_TP else (NUM_GPUS // pipeline_parallel_size)
+
+    assert NUM_GPUS % (tensor_parallel_size * pipeline_parallel_size) == 0, (
+        f"NUM_GPUS ({NUM_GPUS}) must be divisible by "
+        f"TP * PP ({tensor_parallel_size} * {pipeline_parallel_size})"
     )
-    data_parallel_size = NUM_GPUS // tensor_parallel_size
+    data_parallel_size = NUM_GPUS // (tensor_parallel_size * pipeline_parallel_size)
+
+    # EP = TP within each PP stage (SGLang requires TP >= EP)
+    expert_parallel_size = tensor_parallel_size
+    # SGLang engine needs TP * PP GPUs total
+    gpus_per_sglang_engine = tensor_parallel_size * pipeline_parallel_size
 
     global_batch_size = 2 if MODE == "debug_one_sample" else 128
     if global_batch_size % data_parallel_size != 0:
@@ -120,14 +139,15 @@ def execute():
     tp_args = (
         f"--tensor-model-parallel-size {tensor_parallel_size} "
         # "--sequence-parallel "  # Disabled: only use TP without SP for easier debugging
-        "--pipeline-model-parallel-size 1 "
-        f"--expert-model-parallel-size {tensor_parallel_size} "  # EP = TP (SGLang requires TP >= EP)
+        f"--pipeline-model-parallel-size {pipeline_parallel_size} "
+        f"--expert-model-parallel-size {expert_parallel_size} "  # EP = TP (SGLang requires TP >= EP)
         "--expert-tensor-parallel-size 1 "
     )
     sglang_args = (
-        f"--rollout-num-gpus-per-engine {tensor_parallel_size} "
+        f"--rollout-num-gpus-per-engine {gpus_per_sglang_engine} "
         f"--sglang-tp-size {tensor_parallel_size} "  # SGLang requires TP >= EP
-        f"--sglang-ep-size {tensor_parallel_size} "  # EP = TP
+        f"--sglang-pipeline-parallel-size {pipeline_parallel_size} "
+        f"--sglang-ep-size {expert_parallel_size} "  # EP = TP
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
         f"--sglang-mem-fraction-static {0.35 if MODEL_NAME == 'Qwen3-30B-A3B' else 0.5} "
