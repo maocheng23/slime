@@ -3,7 +3,7 @@ import logging
 import time
 
 import ray
-from ray.exceptions import ActorDiedError, ActorUnavailableError, RaySystemError
+from ray.exceptions import ActorUnavailableError, RaySystemError
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
@@ -88,7 +88,10 @@ def train(args):
             try:
                 rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
                 break
-            except (ActorUnavailableError, ActorDiedError, RaySystemError) as e:
+            except (ActorUnavailableError, RaySystemError) as e:
+                # Only retry transient errors. ActorDiedError means the actor is
+                # permanently gone and retrying the same handle will always fail;
+                # let it propagate so the caller can decide on recovery.
                 if rollout_generate_attempt >= rollout_generate_max_retries:
                     raise
                 rollout_generate_attempt += 1
@@ -118,17 +121,18 @@ def train(args):
             save(rollout_id)
 
         offload_train()
-        should_skip_post_train_sync = skip_post_train_sync and rollout_id == args.num_rollout - 1
+        is_last_rollout = rollout_id == args.num_rollout - 1
+        should_skip_post_train_sync = skip_post_train_sync and is_last_rollout
+        will_eval = should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch)
         if not should_skip_post_train_sync:
             if args.offload_rollout:
                 ray.get(rollout_manager.onload_weights.remote())
             actor_model.update_weights()
-            # No need to restore KV/cache after the last rollout iteration.
-            # This avoids unnecessary end-of-run memory churn in colocated PP runs.
-            if args.offload_rollout and rollout_id < args.num_rollout - 1:
+            # Skip KV restore on the very last iteration unless eval still needs it.
+            if args.offload_rollout and (not is_last_rollout or will_eval):
                 ray.get(rollout_manager.onload_kv.remote())
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+        if will_eval:
             ray.get(rollout_manager.eval.remote(rollout_id))
 
     ray.get(rollout_manager.dispose.remote())

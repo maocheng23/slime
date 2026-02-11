@@ -114,7 +114,7 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self._default_http_timeout_sec = float(os.environ.get("SLIME_SGLANG_HTTP_TIMEOUT_SEC", "30"))
         self._weight_update_http_timeout_sec = float(os.environ.get("SLIME_WEIGHT_UPDATE_HTTP_TIMEOUT_SEC", "300"))
-        self._weight_update_http_max_retries = int(os.environ.get("SLIME_WEIGHT_UPDATE_HTTP_MAX_RETRIES", "6"))
+        self._weight_update_http_max_attempts = int(os.environ.get("SLIME_WEIGHT_UPDATE_HTTP_MAX_RETRIES", "6"))
         self._weight_update_http_retry_backoff_sec = float(
             os.environ.get("SLIME_WEIGHT_UPDATE_HTTP_RETRY_BACKOFF_SEC", "1")
         )
@@ -215,7 +215,7 @@ class SGLangEngine(RayActor):
         payload: dict | None = None,
         *,
         timeout: float | None = None,
-        max_retries: int = 1,
+        max_attempts: int = 1,
         retry_backoff_sec: float = 1.0,
     ):
         """Make a POST request to the specified endpoint with the given payload.
@@ -224,7 +224,7 @@ class SGLangEngine(RayActor):
             endpoint: The API endpoint to call
             payload: The JSON payload to send (default: empty dict)
             timeout: Request timeout in seconds.
-            max_retries: Number of request attempts for retriable failures.
+            max_attempts: Total number of attempts (``1`` = no retry).
             retry_backoff_sec: Base backoff between retries in seconds.
 
         Returns:
@@ -235,21 +235,21 @@ class SGLangEngine(RayActor):
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
         timeout = self._default_http_timeout_sec if timeout is None else timeout
-        max_retries = max(1, int(max_retries))
+        max_attempts = max(1, int(max_attempts))
 
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, max_attempts + 1):
             response = None
             try:
                 response = requests.post(url, json=payload or {}, timeout=timeout)
                 # Retry transient 5xx responses for weight update paths.
-                if response.status_code >= 500 and attempt < max_retries:
+                if response.status_code >= 500 and attempt < max_attempts:
                     sleep_s = min(retry_backoff_sec * (2 ** (attempt - 1)), 8.0)
                     logger.warning(
                         "Request to %s failed with status %s (attempt %s/%s), retry in %.1fs",
                         endpoint,
                         response.status_code,
                         attempt,
-                        max_retries,
+                        max_attempts,
                         sleep_s,
                     )
                     time.sleep(sleep_s)
@@ -258,7 +258,7 @@ class SGLangEngine(RayActor):
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
-                if attempt >= max_retries:
+                if attempt >= max_attempts:
                     if isinstance(e, requests.exceptions.HTTPError) and response is not None:
                         e.add_note(f"{response.text=}")
                     raise
@@ -268,7 +268,7 @@ class SGLangEngine(RayActor):
                     "Request to %s failed (attempt %s/%s): %s; retry in %.1fs",
                     endpoint,
                     attempt,
-                    max_retries,
+                    max_attempts,
                     e,
                     sleep_s,
                 )
@@ -320,7 +320,7 @@ class SGLangEngine(RayActor):
             "update_weights_from_tensor",
             payload,
             timeout=self._weight_update_http_timeout_sec,
-            max_retries=self._weight_update_http_max_retries,
+            max_attempts=self._weight_update_http_max_attempts,
             retry_backoff_sec=self._weight_update_http_retry_backoff_sec,
         )
 
@@ -442,15 +442,15 @@ class SGLangEngine(RayActor):
             "update_weights_from_distributed",
             payload,
             timeout=self._weight_update_http_timeout_sec,
-            max_retries=self._weight_update_http_max_retries,
+            max_attempts=self._weight_update_http_max_attempts,
             retry_backoff_sec=self._weight_update_http_retry_backoff_sec,
         )
 
     def pause_generation(self):
-        return self._make_request("pause_generation", {}, timeout=self._default_http_timeout_sec, max_retries=3)
+        return self._make_request("pause_generation", {}, timeout=self._default_http_timeout_sec, max_attempts=3)
 
     def continue_generation(self):
-        return self._make_request("continue_generation", {}, timeout=self._default_http_timeout_sec, max_retries=3)
+        return self._make_request("continue_generation", {}, timeout=self._default_http_timeout_sec, max_attempts=3)
 
     def post_process_weights(
         self,

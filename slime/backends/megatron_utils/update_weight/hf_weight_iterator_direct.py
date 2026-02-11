@@ -1,5 +1,4 @@
 import dataclasses
-import gc
 import logging
 import os
 from argparse import Namespace
@@ -36,10 +35,16 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
         for megatron_local_param_infos in tqdm(
             self.megatron_local_param_info_buckets, disable=rank != 0, desc="Update weights"
         ):
-            yield from self._get_hf_weight_chunks_with_retry(
-                megatron_local_param_infos=megatron_local_param_infos,
-                megatron_local_weights=megatron_local_weights,
+            megatron_full_params = _get_megatron_full_params(
+                megatron_local_param_infos,
+                megatron_local_weights,
+                stage_local_pp_sync=self._stage_local_pp_sync,
             )
+            hf_named_tensors = self._convert_to_hf_named_tensors(megatron_full_params, megatron_local_param_infos)
+            # Release gathered full tensors before the caller starts sending
+            # this chunk to rollout engines, to reduce peak memory.
+            del megatron_full_params
+            yield hf_named_tensors
 
     def _convert_to_hf_named_tensors(self, megatron_full_params: Sequence[torch.Tensor], param_infos: list[ParamInfo]):
         hf_named_tensors = []
@@ -48,72 +53,6 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
                 convert_to_hf(self.args, self.model_name, info.name, param, self.quantization_config)
             )
         return hf_named_tensors
-
-    def _build_hf_named_tensors(
-        self,
-        *,
-        megatron_local_param_infos: list[ParamInfo],
-        megatron_local_weights,
-    ) -> list[tuple[str, torch.Tensor]]:
-        megatron_full_params = _get_megatron_full_params(
-            megatron_local_param_infos,
-            megatron_local_weights,
-            stage_local_pp_sync=self._stage_local_pp_sync,
-        )
-        try:
-            return self._convert_to_hf_named_tensors(megatron_full_params, megatron_local_param_infos)
-        finally:
-            # Release gathered Megatron full tensors before the caller starts
-            # sending this chunk to rollout engines. Otherwise a yielded chunk can
-            # keep both gathered params and converted HF tensors live at once.
-            del megatron_full_params
-
-    def _get_hf_weight_chunks_with_retry(
-        self,
-        *,
-        megatron_local_param_infos: list[ParamInfo],
-        megatron_local_weights,
-        retry_depth: int = 0,
-    ):
-        try:
-            hf_named_tensors = self._build_hf_named_tensors(
-                megatron_local_param_infos=megatron_local_param_infos,
-                megatron_local_weights=megatron_local_weights,
-            )
-            yield hf_named_tensors
-            return
-        except torch.OutOfMemoryError:
-            # Retry by splitting the bucket to reduce temporary tensor peak memory.
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-
-            if len(megatron_local_param_infos) <= 1:
-                raise
-
-            rank = dist.get_rank()
-            if rank == 0:
-                logger.warning(
-                    "OOM in direct HF iterator bucket (size=%d, depth=%d); split bucket and retry.",
-                    len(megatron_local_param_infos),
-                    retry_depth,
-                )
-
-            mid = len(megatron_local_param_infos) // 2
-            left_infos = megatron_local_param_infos[:mid]
-            right_infos = megatron_local_param_infos[mid:]
-
-            yield from self._get_hf_weight_chunks_with_retry(
-                megatron_local_param_infos=left_infos,
-                megatron_local_weights=megatron_local_weights,
-                retry_depth=retry_depth + 1,
-            )
-            yield from self._get_hf_weight_chunks_with_retry(
-                megatron_local_param_infos=right_infos,
-                megatron_local_weights=megatron_local_weights,
-                retry_depth=retry_depth + 1,
-            )
 
 
 def _get_megatron_full_params(

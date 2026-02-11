@@ -1,8 +1,8 @@
 import math
 import os
 
-
 import slime.utils.external_utils.command_utils as U
+from script_utils import build_debug_envs, build_tensor_sync_envs, make_system_helpers
 
 MODEL_NAME = os.environ.get("SLIME_SCRIPT_MODEL_NAME", "Qwen3-30B-A3B")
 assert MODEL_NAME in {"Qwen3-30B-A3B"}
@@ -27,23 +27,9 @@ TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "1"))
 #   - SGLang engine uses all 8 GPUs (TP=4 x PP=2)
 #   - No sequence splitting, so attention is bitwise identical to SGLang inference
 PP_SIZE = int(os.environ.get("SLIME_PP_SIZE", "1"))
-# Keep script-level runtime setup authoritative by default.
-# Set SLIME_USE_EXTERNAL_SYSTEM_SETUP=1 only when intentionally debugging overrides.
+
 USE_EXTERNAL_SYSTEM_SETUP = os.environ.get("SLIME_USE_EXTERNAL_SYSTEM_SETUP", "0") == "1"
-
-
-def _system_env(name: str, default: str) -> str:
-    if USE_EXTERNAL_SYSTEM_SETUP:
-        return os.environ.get(name, default)
-    return default
-
-
-def _system_bool(name: str, default: bool) -> bool:
-    return _system_env(name, "1" if default else "0") == "1"
-
-
-def _system_int(name: str, default: int) -> int:
-    return int(_system_env(name, str(default)))
+_system_env, _system_bool, _system_int = make_system_helpers(USE_EXTERNAL_SYSTEM_SETUP)
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
@@ -317,73 +303,18 @@ def execute():
         "--no-rope-fusion "
     )
     true_on_policy_envs = {
-        # NOTE: Use "allreduce:Tree" instead of "Tree" to only affect AllReduce operations
-        # "Tree" would affect ALL NCCL operations (AllGather, ReduceScatter, etc.) and may cause errors
-        # like "no algorithm/protocol available for function AllGather with datatype ncclInt8"
         "NCCL_ALGO": "allreduce:Tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-        # Disable NVLS (NVLink SHARP) to ensure consistent all-reduce behavior between sglang and megatron
         "NCCL_NVLS_ENABLE": "0",
-        # Enable deterministic all-reduce in Megatron to match SGLang's tree_all_reduce_sum
         "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
-        # PP>1: use stage-local tensor sync by default.
-        # This aligns Megatron PP stages with SGLang PP stages and avoids
-        # cross-stage IPC mapping errors in colocated update_weights.
-        "SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP": _system_env(
-            "SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP",
-            "1" if pipeline_parallel_size > 1 else "0",
-        ),
-        # For PP runs, prefer GPU bucket sync by default (faster and more stable
-        # than CPU staging in our colocated true-on-policy setup).
-        "SLIME_TENSOR_SYNC_CPU_STAGING": _system_env(
-            "SLIME_TENSOR_SYNC_CPU_STAGING",
-            "0" if pipeline_parallel_size > 1 else "1",
-        ),
-        # Keep direct IPC path opt-in unless explicitly requested.
-        "SLIME_TENSOR_SYNC_GPU_DIRECT": _system_env("SLIME_TENSOR_SYNC_GPU_DIRECT", "0"),
-        # PP direct CUDA-IPC tensor sync is unstable for large MoE updates; keep opt-in.
-        "SLIME_TENSOR_SYNC_GPU_DIRECT_ALLOW_PP": _system_env(
-            "SLIME_TENSOR_SYNC_GPU_DIRECT_ALLOW_PP",
-            "0" if pipeline_parallel_size > 1 else "1",
-        ),
-        # Safety rail: for PP runs, force-disable full GPU-direct tensor sync unless
-        # explicitly turned off by the operator.
-        "SLIME_TENSOR_SYNC_FORCE_SAFE_PP": _system_env(
-            "SLIME_TENSOR_SYNC_FORCE_SAFE_PP",
-            "1" if pipeline_parallel_size > 1 else "0",
-        ),
-        # For PP with non-direct sync, allow flattened GPU bucket mode by default.
-        "SLIME_TENSOR_SYNC_GPU_BUCKET_ALLOW_PP": _system_env(
-            "SLIME_TENSOR_SYNC_GPU_BUCKET_ALLOW_PP",
-            "1" if pipeline_parallel_size > 1 else "0",
-        ),
-        # Keep flattened-bucket for most tensors, but force direct IPC for
-        # vocab/lm_head buckets to avoid PP flattened-bucket load instability.
-        "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB": _system_env(
-            "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB",
-            "1" if pipeline_parallel_size > 1 else "0",
-        ),
-        # Direct named-tensor IPC for all MoE buckets can accumulate many CUDA
-        # IPC handles across repeated updates and cause later train-step OOM.
-        # Keep it opt-in; default to flattened-bucket transfer.
-        "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_MOE": _system_env(
-            "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_MOE",
-            "0",
-        ),
-        # DEBUG: Enable to get accurate CUDA error location (slows down execution significantly)
-        #"CUDA_LAUNCH_BLOCKING": "1",  # ENABLED: Finding the real source of CUDA illegal memory access
+        **build_tensor_sync_envs(pipeline_parallel_size, _system_env),
     }
     if pipeline_parallel_size > 1:
-        # torch_memory_saver (used by rollout offload) is incompatible with
-        # expandable_segments. Only set this allocator mode by default when
-        # rollout offload is disabled; still honor explicit user override.
         alloc_conf = _system_env("PYTORCH_CUDA_ALLOC_CONF", "")
         if alloc_conf:
             true_on_policy_envs["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
         elif disable_rollout_offload:
-            # Reduce allocator fragmentation for repeated large all-gather/cat
-            # during PP weight sync when rollout memory saver is not used.
             true_on_policy_envs["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     train_args = (
@@ -409,30 +340,11 @@ def execute():
         megatron_model_type=MODEL_TYPE,
         extra_env_vars={
             **true_on_policy_envs,
-            # In debug_one_sample with num_rollout=1, keep post-train sync enabled
-            # by default so this mode still validates a full training flow.
             "SLIME_SKIP_POST_TRAIN_SYNC": _system_env(
                 "SLIME_SKIP_POST_TRAIN_SYNC",
                 default_skip_post_train_sync,
             ),
-            "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
-            "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_ROUTER": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_ATTN": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_LOGPROB_DIFF": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_TREE_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
-            # Debug gradient all-reduce for MoE backward pass
-            "DEBUG_GRAD_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
-            "DEBUG_OVERRIDE_REWARDS": "first_one" if MODE == "debug_one_sample" else "",
-            # Debug-only: allow simulating repeated update_weights without rollout/train loop.
-            "SLIME_DEBUG_EXTRA_WEIGHT_UPDATES": _system_env("SLIME_DEBUG_EXTRA_WEIGHT_UPDATES", "0"),
-            # Debug gradient sync verification - enable to check if all-reduce is working
-            # "DEBUG_GRAD_SYNC": "1",  # Enable to verify gradients are identical across ranks after all-reduce
-            # "DEBUG_ROUTER_GRAD_SYNC": "1",  # Enable to see per-rank gradient values before/after all-reduce
-            # # Debug EP broadcast during weight sync
-            # "DEBUG_EP_BROADCAST": "1",  # Enable to check EP broadcast logic in weight sync
-            # # Debug expert weight conversion during sync
-            # "DEBUG_EXPERT_SYNC": "1",  # Enable to check Megatron->HF expert weight conversion
+            **build_debug_envs(MODE, _system_env),
         },
     )
 

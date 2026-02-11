@@ -1,8 +1,8 @@
 import math
 import os
 
-
 import slime.utils.external_utils.command_utils as U
+from script_utils import build_debug_envs, build_tensor_sync_envs, make_system_helpers, resolve_parallel_sizes
 
 MODEL_NAME = os.environ.get("SLIME_SCRIPT_MODEL_NAME", "Qwen3-0.6B")
 assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
@@ -28,37 +28,9 @@ TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", str(max(1, NUM_GPUS // PP_SIZE))))
 
 # CI checks are disabled by default for local debug runs.
 ENABLE_CI = os.environ.get("SLIME_ENABLE_CI", "0") == "1"
-# Keep script-level runtime setup authoritative by default.
-# Set SLIME_USE_EXTERNAL_SYSTEM_SETUP=1 only when intentionally debugging overrides.
+
 USE_EXTERNAL_SYSTEM_SETUP = os.environ.get("SLIME_USE_EXTERNAL_SYSTEM_SETUP", "0") == "1"
-
-
-def _system_env(name: str, default: str) -> str:
-    if USE_EXTERNAL_SYSTEM_SETUP:
-        return os.environ.get(name, default)
-    return default
-
-
-def _system_bool(name: str, default: bool) -> bool:
-    return _system_env(name, "1" if default else "0") == "1"
-
-
-def _system_int(name: str, default: int) -> int:
-    return int(_system_env(name, str(default)))
-
-
-def resolve_parallel_sizes(num_gpus: int, use_tp: bool, tp_size: int, pp_size: int) -> tuple[int, int, int, int]:
-    """Resolve TP/PP/DP and rollout-engine GPU counts under a single topology."""
-    pipeline_parallel_size = pp_size
-    tensor_parallel_size = tp_size if use_tp else 1
-    assert tensor_parallel_size >= 1, f"tensor_parallel_size must be >= 1, got {tensor_parallel_size}"
-    assert pipeline_parallel_size >= 1, f"pipeline_parallel_size must be >= 1, got {pipeline_parallel_size}"
-    assert num_gpus % (tensor_parallel_size * pipeline_parallel_size) == 0, (
-        f"NUM_GPUS ({num_gpus}) must be divisible by TP * PP ({tensor_parallel_size} * {pipeline_parallel_size})"
-    )
-    data_parallel_size = num_gpus // (tensor_parallel_size * pipeline_parallel_size)
-    gpus_per_sglang_engine = tensor_parallel_size * pipeline_parallel_size
-    return tensor_parallel_size, pipeline_parallel_size, data_parallel_size, gpus_per_sglang_engine
+_system_env, _system_bool, _system_int = make_system_helpers(USE_EXTERNAL_SYSTEM_SETUP)
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
@@ -255,46 +227,12 @@ def execute():
         "--no-rope-fusion "
     )
     true_on_policy_envs = {
-        # NOTE: Use "allreduce:Tree" instead of "Tree" to only affect AllReduce operations
-        # "Tree" would affect ALL NCCL operations (AllGather, ReduceScatter, etc.) and may cause errors
-        # like "no algorithm/protocol available for function AllGather with datatype ncclInt8"
         "NCCL_ALGO": "allreduce:Tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-        # Disable NVLS (NVLink SHARP) to ensure consistent all-reduce behavior between sglang and megatron
         "NCCL_NVLS_ENABLE": "0",
-        # Use deterministic tree all-reduce (all_gather + local tree sum) instead of NCCL all_reduce
-        # This ensures SGLang and Megatron use identical all-reduce implementation for true on-policy
         "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
-        "SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP": _system_env(
-            "SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP",
-            "1" if pipeline_parallel_size > 1 else "0",
-        ),
-        "SLIME_TENSOR_SYNC_CPU_STAGING": _system_env(
-            "SLIME_TENSOR_SYNC_CPU_STAGING",
-            "0" if pipeline_parallel_size > 1 else "1",
-        ),
-        "SLIME_TENSOR_SYNC_GPU_DIRECT": _system_env("SLIME_TENSOR_SYNC_GPU_DIRECT", "0"),
-        "SLIME_TENSOR_SYNC_GPU_DIRECT_ALLOW_PP": _system_env(
-            "SLIME_TENSOR_SYNC_GPU_DIRECT_ALLOW_PP",
-            "0" if pipeline_parallel_size > 1 else "1",
-        ),
-        "SLIME_TENSOR_SYNC_FORCE_SAFE_PP": _system_env(
-            "SLIME_TENSOR_SYNC_FORCE_SAFE_PP",
-            "1" if pipeline_parallel_size > 1 else "0",
-        ),
-        "SLIME_TENSOR_SYNC_GPU_BUCKET_ALLOW_PP": _system_env(
-            "SLIME_TENSOR_SYNC_GPU_BUCKET_ALLOW_PP",
-            "1" if pipeline_parallel_size > 1 else "0",
-        ),
-        "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB": _system_env(
-            "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB",
-            "1" if pipeline_parallel_size > 1 else "0",
-        ),
-        "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_MOE": _system_env(
-            "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_MOE",
-            "0",
-        ),
+        **build_tensor_sync_envs(pipeline_parallel_size, _system_env),
     }
     if pipeline_parallel_size > 1:
         alloc_conf = _system_env("PYTORCH_CUDA_ALLOC_CONF", "")
@@ -330,15 +268,7 @@ def execute():
                 "SLIME_SKIP_POST_TRAIN_SYNC",
                 default_skip_post_train_sync,
             ),
-            "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
-            "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_ROUTER": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_ATTN": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_LOGPROB_DIFF": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_TREE_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
-            "DEBUG_GRAD_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
-            "DEBUG_OVERRIDE_REWARDS": "first_one" if MODE == "debug_one_sample" else "",
-            "SLIME_DEBUG_EXTRA_WEIGHT_UPDATES": _system_env("SLIME_DEBUG_EXTRA_WEIGHT_UPDATES", "0"),
+            **build_debug_envs(MODE, _system_env),
         },
     )
 
