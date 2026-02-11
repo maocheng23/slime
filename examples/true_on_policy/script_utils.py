@@ -60,16 +60,19 @@ def build_tensor_sync_envs(
 ) -> dict[str, str]:
     """Build the ``SLIME_TENSOR_SYNC_*`` environment variable dict.
 
-    Two core knobs are propagated here:
+    Three knobs are propagated here:
 
-    * ``STAGE_LOCAL_GROUP`` — whether each PP stage syncs independently.
-    * ``GPU_DIRECT``        — use per-tensor CUDA IPC (opt-in, off by default).
+    * ``STAGE_LOCAL_GROUP``    — whether each PP stage syncs independently.
+    * ``GPU_DIRECT``           — use per-tensor CUDA IPC globally (opt-in).
+    * ``GPU_DIRECT_FOR_VOCAB`` — force per-tensor CUDA IPC for vocab/lm_head
+      buckets. Required for PP>1 because SGLang broadcasts flattened-bucket
+      updates to all PP stages, causing cross-device CUDA errors on vocab
+      weights that are shared across stages (tied embeddings).
 
     The default transfer path is flattened-bucket GPU (always on GPU,
     no CPU staging). ``TensorSyncConfig.from_args()`` resolves the final
-    strategy. Per-bucket debug overrides (``GPU_DIRECT_FOR_VOCAB``,
-    ``GPU_DIRECT_FOR_MOE``) are still read from env by the code; set them
-    directly when debugging without adding them here.
+    strategy. ``GPU_DIRECT_FOR_MOE`` is still read from env by the code;
+    set it directly when debugging without adding it here.
     """
     is_pp = pipeline_parallel_size > 1
     return {
@@ -78,6 +81,15 @@ def build_tensor_sync_envs(
         ),
         "SLIME_TENSOR_SYNC_GPU_DIRECT": system_env(
             "SLIME_TENSOR_SYNC_GPU_DIRECT", "0"
+        ),
+        # PP>1: vocab/lm_head weights are shared across PP stages (tied
+        # embeddings). Flattened-bucket GPU transfer fails with cross-device
+        # CUDA errors when SGLang PP0 receives tensors from PP1's GPUs.
+        # Route vocab buckets through GPU-direct named-tensor IPC which
+        # SGLang's load_weights path can handle cross-device.
+        "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB": system_env(
+            "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB",
+            "1" if is_pp else "0",
         ),
     }
 

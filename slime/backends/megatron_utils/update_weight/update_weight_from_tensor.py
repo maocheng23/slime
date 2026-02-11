@@ -320,13 +320,18 @@ def _should_use_gpu_direct(
     hf_named_tensors: list[tuple[str, torch.Tensor]],
     use_gpu_direct: bool,
 ) -> bool:
-    """Decide whether to use the direct per-tensor CUDA IPC path."""
-    if not use_gpu_direct:
-        return False
-    max_tensors = _env_int("SLIME_TENSOR_SYNC_GPU_DIRECT_MAX_TENSORS", 256)
-    if len(hf_named_tensors) <= max_tensors:
-        return True
-    # Allow forced direct IPC for specific buckets even when count exceeds the limit.
+    """Decide whether to use the direct per-tensor CUDA IPC path.
+
+    GPU direct is used when:
+    1. ``use_gpu_direct`` is True globally and tensor count ≤ max, OR
+    2. ``GPU_DIRECT_FOR_VOCAB`` forces it for vocab/lm_head buckets
+       (independent of the global ``use_gpu_direct`` knob — needed for PP>1
+       where flattened-bucket cross-device copy fails), OR
+    3. ``GPU_DIRECT_FOR_MOE`` forces it for MoE expert buckets.
+    """
+    # Per-bucket force overrides — checked independently of use_gpu_direct
+    # so that PP>1 can route vocab through named-tensor IPC while keeping
+    # flattened-bucket for everything else.
     force_vocab = _env_bool("SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB", False) and any(
         _is_vocab_or_lm_head_weight(n) for n, _ in hf_named_tensors
     )
@@ -334,6 +339,12 @@ def _should_use_gpu_direct(
         _is_moe_expert_weight(n) for n, _ in hf_named_tensors
     )
     if force_vocab or force_moe:
+        return True
+
+    if not use_gpu_direct:
+        return False
+    max_tensors = _env_int("SLIME_TENSOR_SYNC_GPU_DIRECT_MAX_TENSORS", 256)
+    if len(hf_named_tensors) <= max_tensors:
         return True
     logger.warning(
         "Fallback to flattened-bucket GPU transfer: num_tensors=%s > max=%s",
