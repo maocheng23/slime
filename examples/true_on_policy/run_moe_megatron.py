@@ -189,14 +189,14 @@ def execute():
         "--expert-tensor-parallel-size 1 "
     )
     default_sglang_mem_fraction_static = 0.35 if MODEL_NAME == "Qwen3-30B-A3B" else 0.5
-    if pipeline_parallel_size > 1:
-        # Keep GPU headroom in PP colocated mode.
-        # When rollout offload is enabled, onload_kv must reserve KV cache after
-        # Megatron weights are resident; use a smaller default to avoid resume OOM.
-        default_sglang_mem_fraction_static = min(
-            default_sglang_mem_fraction_static,
-            0.10 if not disable_rollout_offload else 0.30,
-        )
+    # if pipeline_parallel_size > 1:
+    #     # Keep GPU headroom in PP colocated mode.
+    #     # When rollout offload is enabled, onload_kv must reserve KV cache after
+    #     # Megatron weights are resident; use a smaller default to avoid resume OOM.
+    #     default_sglang_mem_fraction_static = min(
+    #         default_sglang_mem_fraction_static,
+    #         0.10 if not disable_rollout_offload else 0.30,
+    #     )
     sglang_mem_fraction_static = float(_system_env("SLIME_SGLANG_MEM_FRACTION_STATIC", str(default_sglang_mem_fraction_static)))
 
     sglang_args = (
