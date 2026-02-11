@@ -1,3 +1,5 @@
+import logging
+import os
 import socket
 import time
 from argparse import Namespace
@@ -15,6 +17,8 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
+
+logger = logging.getLogger(__name__)
 
 
 class UpdateWeightFromDistributed:
@@ -69,6 +73,32 @@ class UpdateWeightFromDistributed:
             self._model_update_groups = connect_rollout_engines_from_distributed(
                 self.args, self._group_name, rollout_engines
             )
+
+    def _debug_weight_sync_enabled(self) -> bool:
+        return os.environ.get("SLIME_DEBUG_WEIGHT_SYNC", "0") == "1"
+
+    def _rank_context(self) -> str:
+        return (
+            f"global_rank={dist.get_rank()} "
+            f"pp_rank={mpu.get_pipeline_model_parallel_rank()} "
+            f"tp_rank={mpu.get_tensor_model_parallel_rank()} "
+            f"dp_rank={mpu.get_data_parallel_rank(with_context_parallel=True)}"
+        )
+
+    def _sync_cuda_with_context(self, stage: str, name: str) -> None:
+        if not self._debug_weight_sync_enabled() or not torch.cuda.is_available():
+            return
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            logger.exception(
+                "[%s] CUDA sync failed at %s for param=%s (%s)",
+                getattr(self, "_group_name", "unknown-group"),
+                stage,
+                name,
+                self._rank_context(),
+            )
+            raise
 
     @torch.no_grad()
     def update_weights(self) -> None:
@@ -142,7 +172,21 @@ class UpdateWeightFromDistributed:
         Non-expert: gather TP → rm pad → HF → buffer (flush if full). All gather, PP source buffers.
         Returns updated bytes on source, None on non-source.
         """
-        param = all_gather_param(name, param)
+        self._sync_cuda_with_context("before_all_gather", name)
+        try:
+            param = all_gather_param(name, param)
+        except Exception:
+            logger.exception(
+                "[%s] all_gather_param failed for %s shape=%s dtype=%s device=%s (%s)",
+                getattr(self, "_group_name", "unknown-group"),
+                name,
+                tuple(param.shape),
+                param.dtype,
+                param.device,
+                self._rank_context(),
+            )
+            raise
+        self._sync_cuda_with_context("after_all_gather", name)
         if not self._is_pp_src_rank:
             return
 
@@ -165,7 +209,21 @@ class UpdateWeightFromDistributed:
         """
         Expert: gather TP → rm pad → buffer. EP gather + HF deferred. Threshold × EP size.
         """
-        param = all_gather_param(name, param)
+        self._sync_cuda_with_context("before_expert_all_gather", name)
+        try:
+            param = all_gather_param(name, param)
+        except Exception:
+            logger.exception(
+                "[%s] expert all_gather_param failed for %s shape=%s dtype=%s device=%s (%s)",
+                getattr(self, "_group_name", "unknown-group"),
+                name,
+                tuple(param.shape),
+                param.dtype,
+                param.device,
+                self._rank_context(),
+            )
+            raise
+        self._sync_cuda_with_context("after_expert_all_gather", name)
 
         param_size = param.numel() * param.element_size()
         if (
@@ -244,19 +302,23 @@ def connect_rollout_engines_from_distributed(
     args: Namespace, group_name: str, rollout_engines: Sequence[ActorHandle]
 ) -> dist.ProcessGroup:
     """
-    Create NCCL group: training rank 0 + all engine GPUs. Blocks until joined.
+    Create NCCL group for one PP stage:
+    training rank 0 + rollout TP ranks for the target stage only.
+    Blocks until joined.
     """
     master_address = ray._private.services.get_node_ip_address()
     with socket.socket() as sock:
         sock.bind(("", 0))
         master_port = sock.getsockname()[1]
-    world_size = len(rollout_engines) * args.rollout_num_gpus_per_engine + 1
+    # `slime-pp_{k}` groups are stage-local. Each rollout engine contributes TP ranks only.
+    sglang_tp_size = args.sglang_tp_size or args.rollout_num_gpus_per_engine
+    world_size = len(rollout_engines) * sglang_tp_size + 1
 
     refs = [
         engine.init_weights_update_group.remote(
             master_address,
             master_port,
-            i * args.rollout_num_gpus_per_engine + 1,
+            i * sglang_tp_size + 1,
             world_size,
             group_name,
             backend="nccl",
@@ -293,6 +355,7 @@ def update_weights_from_distributed(
     """
     Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines).
     """
+    debug_weight_sync = os.environ.get("SLIME_DEBUG_WEIGHT_SYNC", "0") == "1"
     refs = [
         engine.update_weights_from_distributed.remote(
             names=[name for name, _ in converted_named_tensors],
@@ -304,11 +367,37 @@ def update_weights_from_distributed(
         for engine in rollout_engines
     ]
 
-    handles = []
-    for _, param in converted_named_tensors:
-        handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
-    for handle in handles:
-        handle.wait()
+    if debug_weight_sync:
+        logger.info(
+            "[%s] broadcasting %d tensors on cuda:%d",
+            group_name,
+            len(converted_named_tensors),
+            torch.cuda.current_device(),
+        )
+    # Use contiguous tensors and blocking broadcasts for stability in PP distributed updates.
+    for idx, (name, param) in enumerate(converted_named_tensors):
+        send_tensor = param
+        if debug_weight_sync:
+            logger.info(
+                "[%s] tensor[%d]=%s shape=%s dtype=%s device=%s contiguous=%s",
+                group_name,
+                idx,
+                name,
+                tuple(send_tensor.shape),
+                send_tensor.dtype,
+                send_tensor.device,
+                send_tensor.is_contiguous(),
+            )
+            # Surface latent CUDA errors before launch.
+            torch.cuda.synchronize()
+        if not send_tensor.is_contiguous():
+            send_tensor = send_tensor.contiguous()
+        if not send_tensor.is_cuda:
+            send_tensor = send_tensor.to(device=torch.cuda.current_device(), non_blocking=True)
+        dist.broadcast(send_tensor, 0, group=group)
+        if debug_weight_sync:
+            # Surface errors from this broadcast before moving on.
+            torch.cuda.synchronize()
 
     return refs
 

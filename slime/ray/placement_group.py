@@ -1,4 +1,5 @@
 import logging
+import os
 import socket
 
 import ray
@@ -11,7 +12,7 @@ from .rollout import RolloutManager
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_gpus=1, enable_task_events=False)
 class InfoActor:
     def get_ip_and_gpu_id(self):
         return ray.util.get_node_ip_address(), ray.get_gpu_ids()[0]
@@ -170,6 +171,7 @@ def create_rollout_manager(args, pg):
     rollout_manager = RolloutManager.options(
         num_cpus=1,
         num_gpus=0,
+        enable_task_events=False,
     ).remote(args, pg)
 
     # calculate num_rollout from num_epoch
@@ -181,7 +183,8 @@ def create_rollout_manager(args, pg):
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="snapshot"))
-        ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
+        if os.environ.get("SLIME_CHECK_WEIGHT_UPDATE_COMPARE_ONLY", "0") != "1":
+            ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
 
     if args.offload_rollout:
         ray.get(rollout_manager.offload.remote())

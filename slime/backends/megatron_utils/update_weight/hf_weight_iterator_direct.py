@@ -1,4 +1,7 @@
 import dataclasses
+import gc
+import logging
+import os
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -15,11 +18,17 @@ from ..sglang import monkey_patch_torch_reductions
 from .common import all_gather_params_async, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
+logger = logging.getLogger(__name__)
+
 
 class HfWeightIteratorDirect(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(self.args, self.model)
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        self._stage_local_pp_sync = pp_size > 1 and os.environ.get("SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP", "0") == "1"
+        self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(
+            self.args, self.model, stage_local_pp_sync=self._stage_local_pp_sync
+        )
 
     def get_hf_weight_chunks(self, megatron_local_weights):
         rank = dist.get_rank()
@@ -27,10 +36,10 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
         for megatron_local_param_infos in tqdm(
             self.megatron_local_param_info_buckets, disable=rank != 0, desc="Update weights"
         ):
-            megatron_full_params = _get_megatron_full_params(megatron_local_param_infos, megatron_local_weights)
-            hf_named_tensors = self._convert_to_hf_named_tensors(megatron_full_params, megatron_local_param_infos)
-            yield hf_named_tensors
-            del megatron_full_params
+            yield from self._get_hf_weight_chunks_with_retry(
+                megatron_local_param_infos=megatron_local_param_infos,
+                megatron_local_weights=megatron_local_weights,
+            )
 
     def _convert_to_hf_named_tensors(self, megatron_full_params: Sequence[torch.Tensor], param_infos: list[ParamInfo]):
         hf_named_tensors = []
@@ -40,10 +49,78 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
             )
         return hf_named_tensors
 
+    def _build_hf_named_tensors(
+        self,
+        *,
+        megatron_local_param_infos: list[ParamInfo],
+        megatron_local_weights,
+    ) -> list[tuple[str, torch.Tensor]]:
+        megatron_full_params = _get_megatron_full_params(
+            megatron_local_param_infos,
+            megatron_local_weights,
+            stage_local_pp_sync=self._stage_local_pp_sync,
+        )
+        try:
+            return self._convert_to_hf_named_tensors(megatron_full_params, megatron_local_param_infos)
+        finally:
+            # Release gathered Megatron full tensors before the caller starts
+            # sending this chunk to rollout engines. Otherwise a yielded chunk can
+            # keep both gathered params and converted HF tensors live at once.
+            del megatron_full_params
+
+    def _get_hf_weight_chunks_with_retry(
+        self,
+        *,
+        megatron_local_param_infos: list[ParamInfo],
+        megatron_local_weights,
+        retry_depth: int = 0,
+    ):
+        try:
+            hf_named_tensors = self._build_hf_named_tensors(
+                megatron_local_param_infos=megatron_local_param_infos,
+                megatron_local_weights=megatron_local_weights,
+            )
+            yield hf_named_tensors
+            return
+        except torch.OutOfMemoryError:
+            # Retry by splitting the bucket to reduce temporary tensor peak memory.
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+            if len(megatron_local_param_infos) <= 1:
+                raise
+
+            rank = dist.get_rank()
+            if rank == 0:
+                logger.warning(
+                    "OOM in direct HF iterator bucket (size=%d, depth=%d); split bucket and retry.",
+                    len(megatron_local_param_infos),
+                    retry_depth,
+                )
+
+            mid = len(megatron_local_param_infos) // 2
+            left_infos = megatron_local_param_infos[:mid]
+            right_infos = megatron_local_param_infos[mid:]
+
+            yield from self._get_hf_weight_chunks_with_retry(
+                megatron_local_param_infos=left_infos,
+                megatron_local_weights=megatron_local_weights,
+                retry_depth=retry_depth + 1,
+            )
+            yield from self._get_hf_weight_chunks_with_retry(
+                megatron_local_param_infos=right_infos,
+                megatron_local_weights=megatron_local_weights,
+                retry_depth=retry_depth + 1,
+            )
+
 
 def _get_megatron_full_params(
     megatron_local_param_infos: Sequence[ParamInfo],
     megatron_local_weights,
+    *,
+    stage_local_pp_sync: bool = False,
 ) -> Sequence[torch.Tensor]:
     monkey_patch_torch_reductions()
     pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -53,9 +130,14 @@ def _get_megatron_full_params(
     params = []
     for info in megatron_local_param_infos:
         if dist.get_rank() == info.src_rank:
+            src_param = megatron_local_weights[info.name]
+            if src_param.device.type == "cuda" and src_param.device.index == torch.cuda.current_device():
+                src_param = src_param.detach()
+            else:
+                src_param = src_param.to(device=torch.cuda.current_device(), non_blocking=True)
             params.append(
                 torch.nn.Parameter(
-                    megatron_local_weights[info.name].to(device=torch.cuda.current_device(), non_blocking=True),
+                    src_param,
                     requires_grad=False,
                 )
             )
@@ -63,8 +145,9 @@ def _get_megatron_full_params(
             params.append(torch.empty(info.shape, dtype=info.dtype, device=torch.cuda.current_device()))
     torch.cuda.synchronize()
 
-    # broadcast params across pp ranks
-    if pp_size > 1:
+    # For stage-local tensor sync, each PP stage updates its paired SGLang stage
+    # with local-layer tensors only, so cross-PP broadcast is unnecessary.
+    if pp_size > 1 and not stage_local_pp_sync:
         handles = []
         for info, param in zip(megatron_local_param_infos, params, strict=False):
             if info.src_rank in dist.get_process_group_ranks(mpu.get_pipeline_model_parallel_group()):
@@ -108,11 +191,13 @@ def _get_megatron_full_params(
     return gathered_params
 
 
-def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torch.nn.Module]) -> list[list[ParamInfo]]:
+def _get_megatron_local_param_info_buckets(
+    args: Namespace, model: Sequence[torch.nn.Module], *, stage_local_pp_sync: bool = False
+) -> list[list[ParamInfo]]:
     """
     Partition params into buckets ≤ update_weight_buffer_size (with TP replication).
     """
-    param_infos = _get_megatron_local_param_infos(args, model)
+    param_infos = _get_megatron_local_param_infos(args, model, stage_local_pp_sync=stage_local_pp_sync)
     param_info_buckets = [[]]  # Start with one empty bucket
     buffer_size = 0  # Track current bucket size in bytes
 
@@ -138,7 +223,9 @@ def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torc
     return param_info_buckets
 
 
-def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Module]) -> list[ParamInfo]:
+def _get_megatron_local_param_infos(
+    args: Namespace, model: Sequence[torch.nn.Module], *, stage_local_pp_sync: bool = False
+) -> list[ParamInfo]:
     """
     Build global param metadata: collect → exchange PP/EP → resolve duplicates (MTP virtual PP)
     by min src_rank → validate. Returns sorted ParamInfo identical across all ranks.
@@ -164,7 +251,7 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
             src_rank=rank,
         )
 
-    if pp_size > 1:
+    if pp_size > 1 and not stage_local_pp_sync:
         param_infos_list = [None] * pp_size
         dist.all_gather_object(
             obj=(rank, param_infos), object_list=param_infos_list, group=mpu.get_pipeline_model_parallel_group()
@@ -196,21 +283,22 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
     param_infos = list(param_infos.values())
     param_infos = sorted(param_infos, key=lambda info: info.name)
 
-    # Check all ranks has the same parameter info
-    all_param_info_list = [None] * dist.get_world_size()
-    dist.all_gather_object(
-        obj=param_infos,
-        object_list=all_param_info_list,
-        group=get_gloo_group(),
-    )
-    for i, param_info in enumerate(param_infos):
-        for infos in all_param_info_list:
-            assert infos[i].name == param_info.name, f"Parameter name mismatch: {infos[i].name} != {param_info.name}"
-            assert (
-                infos[i].shape == param_info.shape
-            ), f"Parameter shape mismatch: {infos[i].shape} != {param_info.shape}"
-            assert (
-                infos[i].dtype == param_info.dtype
-            ), f"Parameter dtype mismatch: {infos[i].dtype} != {param_info.dtype}"
+    if not stage_local_pp_sync:
+        # Check all ranks have the same parameter info in engine-wide sync mode.
+        all_param_info_list = [None] * dist.get_world_size()
+        dist.all_gather_object(
+            obj=param_infos,
+            object_list=all_param_info_list,
+            group=get_gloo_group(),
+        )
+        for i, param_info in enumerate(param_infos):
+            for infos in all_param_info_list:
+                assert infos[i].name == param_info.name, f"Parameter name mismatch: {infos[i].name} != {param_info.name}"
+                assert (
+                    infos[i].shape == param_info.shape
+                ), f"Parameter shape mismatch: {infos[i].shape} != {param_info.shape}"
+                assert (
+                    infos[i].dtype == param_info.dtype
+                ), f"Parameter dtype mismatch: {infos[i].dtype} != {param_info.dtype}"
 
     return param_infos

@@ -127,10 +127,13 @@ def execute_train(
     )
 
     if not external_ray:
+        ray_num_cpus_env = os.environ.get("SLIME_RAY_NUM_CPUS", "").strip()
+        ray_num_cpus_arg = f" --num-cpus {int(ray_num_cpus_env)}" if ray_num_cpus_env else ""
         exec_command(
             # will prevent ray from buffering stdout/stderr
             f"export PYTHONBUFFERED=16 && "
-            f"ray start --head --node-ip-address {master_addr} --num-gpus {num_gpus_per_node} --disable-usage-stats"
+            f"ray start --head --node-ip-address {master_addr} --num-gpus {num_gpus_per_node}"
+            f"{ray_num_cpus_arg} --disable-usage-stats"
         )
 
     if (f := before_ray_job_submit) is not None:
@@ -174,10 +177,11 @@ def execute_train(
             if megatron_model_type is not None
             else ""
         )
+        no_wait_arg = "--no-wait " if get_bool_env_var("SLIME_SCRIPT_RAY_SUBMIT_NO_WAIT", "0") else ""
         exec_command(
             f"export no_proxy=127.0.0.1 && export PYTHONBUFFERED=16 && "
             f"{cmd_megatron_model_source}"
-            f'ray job submit --address="http://127.0.0.1:8265" '
+            f"ray job submit {no_wait_arg}--address=\"http://127.0.0.1:8265\" "
             f"--runtime-env-json='{runtime_env_json}' "
             f"-- python3 {train_script} "
             f"{'${MODEL_ARGS[@]}' if megatron_model_type is not None else ''} "

@@ -35,7 +35,7 @@ def get_physical_gpu_id():
     return str(props.uuid)
 
 
-@ray.remote
+@ray.remote(enable_task_events=False)
 class Lock(RayActor):
     def __init__(self):
         self._locked = False  # False: unlocked, True: locked

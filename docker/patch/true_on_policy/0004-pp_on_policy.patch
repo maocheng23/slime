@@ -1,0 +1,240 @@
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index d984c2e1..c917341b 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -15,10 +15,12 @@
+ 
+ import datetime
+ import gc
++import io
+ import inspect
+ import json
+ import logging
+ import os
++import re
+ import socket
+ import threading
+ import time
+@@ -1213,7 +1215,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         ), "Default torch process group must be initialized"
+         assert group_name != "", "Group name cannot be empty"
+ 
+-        rank = rank_offset + self.tp_rank
++        target_pp_rank = self._target_pp_rank_from_update_group_name(group_name)
++        if target_pp_rank is not None and self.pp_rank != target_pp_rank:
++            logger.info(
++                "skip init custom process group for non-target stage: local_pp_rank=%s target_pp_rank=%s group_name=%s",
++                self.pp_rank,
++                target_pp_rank,
++                group_name,
++            )
++            return True, "Skipped init for non-target pp stage."
++
++        if target_pp_rank is None:
++            # Legacy/global groups keep the original (pp,tp)-flattened rank mapping.
++            rank = rank_offset + self.pp_rank * self.tp_size + self.tp_rank
++        else:
++            # Stage-local groups use TP-only rank mapping within the target PP stage.
++            rank = rank_offset + self.tp_rank
+ 
+         logger.info(
+             f"init custom process group: master_address={master_address}, master_port={master_port}, "
+@@ -1235,6 +1252,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             return False, message
+ 
+     def destroy_weights_update_group(self, group_name):
++        target_pp_rank = self._target_pp_rank_from_update_group_name(group_name)
++        if target_pp_rank is not None and self.pp_rank != target_pp_rank:
++            return True, "Skipped destroy for non-target pp stage."
+         try:
+             if group_name in self._model_update_group:
+                 pg = self._model_update_group.pop(group_name)
+@@ -1265,6 +1285,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             shape: the shape of the parameter to be updated.
+         """
+ 
++        target_pp_rank = self._target_pp_rank_from_update_group_name(group_name)
++        if target_pp_rank is not None and self.pp_rank != target_pp_rank:
++            return True, "Skipped update for non-target pp stage."
++
+         assert group_name in self._model_update_group, (
+             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+             "Please call `init_weights_update_group` first."
+@@ -1298,14 +1322,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             return True, "Succeeded to update parameter online."
+ 
+         except Exception as e:
++            exc_detail = self._format_exception_detail(e)
+             error_msg = (
+-                f"Failed to update parameter online: {e}. "
++                f"Failed to update parameter online: {exc_detail}. "
+                 f"The full weights of the ModelRunner are partially updated. "
+                 f"Please discard the whole weights."
+             )
+-            logger.error(error_msg)
++            logger.exception(
++                "%s group_name=%s pp_rank=%s tp_rank=%s num_tensors=%s first_name=%s last_name=%s",
++                error_msg,
++                group_name,
++                self.pp_rank,
++                self.tp_rank,
++                len(names),
++                names[0] if names else None,
++                names[-1] if names else None,
++            )
+             return False, error_msg
+ 
++    @staticmethod
++    def _target_pp_rank_from_update_group_name(group_name: str) -> Optional[int]:
++        # Stage-local update groups are named like `slime-pp_{pp_rank}`.
++        # Be tolerant to future suffixes (e.g. `slime-pp_1-extra`) when parsing.
++        match = re.search(r"slime-pp_(\d+)", str(group_name))
++        if match is None:
++            return None
++        return int(match.group(1))
++
++    @staticmethod
++    def _format_exception_detail(exc: Exception) -> str:
++        # Some exceptions such as StopIteration stringify to an empty string,
++        # which hides root cause in logs.
++        detail = str(exc).strip()
++        if detail:
++            return f"{exc.__class__.__name__}: {detail}"
++        return exc.__class__.__name__
++
+     def _update_bucketed_weights_from_distributed(
+         self, names, dtypes, shapes, group_name
+     ):
+@@ -1329,12 +1381,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             self.model.load_weights(reconstructed_tensors)
+             return True, f"Succeeded to update parameter online."
+         except Exception as e:
++            exc_detail = self._format_exception_detail(e)
+             error_msg = (
+-                f"Failed to update parameter online: {e}. "
++                f"Failed to update parameter online: {exc_detail}. "
+                 f"The full weights of the ModelRunner are partially updated. "
+                 f"Please discard the whole weights."
+             )
+-            logger.error(error_msg)
++            logger.exception(
++                "%s group_name=%s pp_rank=%s tp_rank=%s num_tensors=%s first_name=%s last_name=%s",
++                error_msg,
++                group_name,
++                self.pp_rank,
++                self.tp_rank,
++                len(names),
++                names[0] if names else None,
++                names[-1] if names else None,
++            )
+             return False, error_msg
+ 
+     def update_weights_from_tensor(
+@@ -1373,7 +1435,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         flattened_tensor_bucket_dict,
+     ):
+         """Handle flattened bucket format for weight updates"""
+-        flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
++        if "flattened_tensor_torch_save" in flattened_tensor_bucket_dict:
++            # CPU-staged payload encoded via torch.save bytes to avoid
++            # torch multiprocessing FD transport across process boundaries.
++            with io.BytesIO(flattened_tensor_bucket_dict["flattened_tensor_torch_save"]) as f:
++                flattened_tensor = torch.load(f, map_location=self.device)
++        else:
++            flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
+         metadata = flattened_tensor_bucket_dict["metadata"]
+ 
+         # Convert metadata dict to our format
+diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
+index 59a9da95..0d04df14 100644
+--- a/python/sglang/srt/model_loader/weight_utils.py
++++ b/python/sglang/srt/model_loader/weight_utils.py
+@@ -937,6 +937,13 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
+ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+     """Default weight loader."""
+     try:
++        if loaded_weight.device != param.device:
++            loaded_weight = loaded_weight.to(device=param.device, non_blocking=True)
++        if loaded_weight.dtype != param.dtype:
++            loaded_weight = loaded_weight.to(dtype=param.dtype)
++        if not loaded_weight.is_contiguous():
++            loaded_weight = loaded_weight.contiguous()
++
+         if param.numel() == 1 and loaded_weight.numel() == 1:
+             # Sometimes scalar values aren't considered tensors with shapes
+             # so if both param and loaded_weight are a scalar,
+diff --git a/python/sglang/srt/models/qwen3.py b/python/sglang/srt/models/qwen3.py
+index 47a1a4e4..b7370761 100644
+--- a/python/sglang/srt/models/qwen3.py
++++ b/python/sglang/srt/models/qwen3.py
+@@ -517,12 +517,20 @@ class Qwen3ForCausalLM(nn.Module):
+                 continue
+             if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                 if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
+-                    # Handle pp weight tying here
+-                    # find the embed_tokens.weight in the weights
+-                    embed_token_weights = next(
+-                        filter(lambda x: x[0] == "model.embed_tokens.weight", weights)
+-                    )[1]
+-                    loaded_weight = embed_token_weights
++                    # For stage-local online updates, the payload can contain only
++                    # `lm_head.weight` without `model.embed_tokens.weight`.
++                    # Prefer embed tokens when present, otherwise use lm_head directly.
++                    if isinstance(weights, (list, tuple)):
++                        embed_token_weights = next(
++                            (
++                                tensor
++                                for weight_name, tensor in weights
++                                if weight_name == "model.embed_tokens.weight"
++                            ),
++                            None,
++                        )
++                        if embed_token_weights is not None:
++                            loaded_weight = embed_token_weights
+                 else:
+                     continue
+             if name.startswith("model.vision_tower") and name not in params_dict:
+diff --git a/python/sglang/srt/models/qwen3_moe.py b/python/sglang/srt/models/qwen3_moe.py
+index 8322385b..cd718e08 100644
+--- a/python/sglang/srt/models/qwen3_moe.py
++++ b/python/sglang/srt/models/qwen3_moe.py
+@@ -1166,7 +1166,21 @@ class Qwen3MoeForCausalLM(nn.Module):
+                         weight_loader = getattr(
+                             param, "weight_loader", default_weight_loader
+                         )
+-                        weight_loader(param, loaded_weight)
++                        try:
++                            weight_loader(param, loaded_weight)
++                        except Exception:
++                            logger.exception(
++                                "Failed loading weight name=%s param_shape=%s param_dtype=%s param_device=%s "
++                                "loaded_shape=%s loaded_dtype=%s loaded_device=%s",
++                                name,
++                                tuple(param.shape),
++                                param.dtype,
++                                param.device,
++                                tuple(loaded_weight.shape),
++                                loaded_weight.dtype,
++                                loaded_weight.device,
++                            )
++                            raise
+                     else:
+                         logger.warning(f"Parameter {name} not found in params_dict")
+ 
+diff --git a/python/sglang/srt/utils/patch_torch.py b/python/sglang/srt/utils/patch_torch.py
+index 37868c80..245965ea 100644
+--- a/python/sglang/srt/utils/patch_torch.py
++++ b/python/sglang/srt/utils/patch_torch.py
+@@ -100,6 +100,12 @@ def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
+ 
+ 
+ def _modify_tuple(t, index: int, modifier: Callable):
++    # Some tensor reduce paths (e.g., CPU tensors) return fewer args.
++    # Skip modification instead of raising IndexError.
++    if index < 0:
++        index += len(t)
++    if index < 0 or index >= len(t):
++        return t
+     return *t[:index], modifier(t[index]), *t[index + 1 :]
+ 
+ 

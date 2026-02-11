@@ -36,7 +36,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-@ray.remote
+@ray.remote(enable_task_events=False)
 class RolloutManager:
     """The class to run rollout and convert rollout data to training data."""
 
@@ -174,7 +174,10 @@ class RolloutManager:
         self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     def onload_kv(self):
-        self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
+        tags = [GPU_MEMORY_TYPE_KV_CACHE]
+        if not getattr(self.args, "sglang_disable_cuda_graph", False):
+            tags.append(GPU_MEMORY_TYPE_CUDA_GRAPH)
+        self.onload(tags=tags)
 
     def recover_rollout_engines(self):
         """Restart any dead rollout engines and update num_new_engines for update_weights detection."""
@@ -462,7 +465,7 @@ def init_rollout_engines(args, pg, all_rollout_engines):
 
     pg, reordered_bundle_indices, reordered_gpu_ids = pg
 
-    RolloutRayActor = ray.remote(SGLangEngine)
+    RolloutRayActor = ray.remote(enable_task_events=False)(SGLangEngine)
 
     rollout_engines = []
     for i in range(num_engines):
@@ -486,7 +489,7 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
             "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
             "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-            "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
+            "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "false" if args.sglang_disable_cuda_graph else "true",
             "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
             "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
@@ -506,6 +509,7 @@ def init_rollout_engines(args, pg, all_rollout_engines):
         rollout_engine = RolloutRayActor.options(
             num_cpus=num_cpus,
             num_gpus=num_gpus,
+            enable_task_events=False,
             scheduling_strategy=scheduling_strategy,
             runtime_env={
                 "env_vars": env_vars,

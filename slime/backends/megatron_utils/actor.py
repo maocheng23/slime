@@ -44,6 +44,28 @@ logging.getLogger("megatron").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _resolve_weight_updater_cls(args: Namespace):
+    forced_mode = os.environ.get("SLIME_WEIGHT_UPDATER", "auto").strip().lower()
+    if forced_mode not in {"auto", "tensor", "distributed"}:
+        logger.warning(
+            "Unknown SLIME_WEIGHT_UPDATER=%r, fallback to auto (valid: auto|tensor|distributed).",
+            forced_mode,
+        )
+        forced_mode = "auto"
+
+    if forced_mode == "tensor":
+        return UpdateWeightFromTensor
+    if forced_mode == "distributed":
+        return UpdateWeightFromDistributed
+
+    # In colocate mode, train and rollout can share physical GPUs. Distributed updater creates
+    # NCCL groups across train/rollout ranks and can trigger duplicate-device communicators in PP.
+    # Prefer tensor updater for colocated runs; distributed updater remains default for non-colocate.
+    if args.colocate:
+        return UpdateWeightFromTensor
+    return UpdateWeightFromDistributed
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
@@ -127,7 +149,15 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+        update_weight_cls = _resolve_weight_updater_cls(self.args)
+        logger.info(
+            "Use %s for weight updates (mode=%s, colocate=%s, pipeline_model_parallel_size=%s, sglang_pipeline_parallel_size=%s)",
+            update_weight_cls.__name__,
+            os.environ.get("SLIME_WEIGHT_UPDATER", "auto"),
+            self.args.colocate,
+            getattr(self.args, "pipeline_model_parallel_size", None),
+            getattr(self.args, "sglang_pipeline_parallel_size", None),
+        )
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,
