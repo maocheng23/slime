@@ -260,6 +260,14 @@ class UpdateWeightFromTensor:
             del long_lived_tensors, refs, hf_named_tensors
             self._maybe_gc_after_bucket(bucket_idx, cfg)
 
+        # Always release IPC handles and cached allocator blocks after the last
+        # bucket.  In colocated mode Megatron and SGLang share the same physical
+        # GPUs: without this, pinned IPC memory and caching-allocator blocks
+        # accumulated during the last GC interval remain held by the Megatron
+        # process, starving SGLang's generation pass (NCCL workspace, KV cache)
+        # and causing device-side CUDA errors.
+        self._final_gc_after_update()
+
         dist.barrier(group=get_gloo_group())
 
         # int4/fp4 post_process
@@ -282,6 +290,34 @@ class UpdateWeightFromTensor:
                 torch.cuda.ipc_collect()
                 torch.cuda.empty_cache()
         if cfg.use_gpu_direct and (step % cfg.gpu_direct_ipc_gc_interval == 0 or bucket_idx == 0):
+            torch.cuda.ipc_collect()
+            torch.cuda.empty_cache()
+
+    @staticmethod
+    def _final_gc_after_update() -> None:
+        """Unconditional GC after the weight-sync loop.
+
+        In colocated setups Megatron and SGLang share the same physical GPUs.
+        Three resources must be released before SGLang can safely generate:
+
+        1. **Python reference cycles** — ``gc.collect()`` breaks cycles that
+           prevent tensor pointers from reaching refcount-zero.
+        2. **CUDA IPC pins** — ``ipc_collect()`` releases the export pins
+           Megatron holds on tensors previously sent via CUDA IPC.  Until this
+           runs, the underlying GPU memory is pinned by the CUDA driver even
+           after ``del long_lived_tensors``.
+        3. **Caching-allocator blocks** — ``empty_cache()`` returns freed
+           blocks to the CUDA driver so that *other processes* (SGLang) can
+           ``cudaMalloc`` them.  Without this, the blocks sit in Megatron's
+           per-process allocator cache, invisible to SGLang.
+
+        Skipping this when ``ipc_gc_interval > 1`` leaves the tail buckets'
+        memory pinned / cached, which in tight PP + MoE colocated runs can
+        starve SGLang's NCCL workspace or KV-cache allocation and trigger
+        ``CUDA error: device-side assert triggered`` during the first prefill.
+        """
+        gc.collect()
+        if torch.cuda.is_available():
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
 
