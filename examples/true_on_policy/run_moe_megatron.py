@@ -1,9 +1,12 @@
 import math
 import os
 
-
 import slime.utils.external_utils.command_utils as U
+from script_utils import build_debug_envs, make_system_helpers
 
+# ---------------------------------------------------------------------------
+# Environment configuration
+# ---------------------------------------------------------------------------
 MODEL_NAME = os.environ.get("SLIME_SCRIPT_MODEL_NAME", "Qwen3-30B-A3B")
 assert MODEL_NAME in {"Qwen3-30B-A3B"}
 
@@ -14,12 +17,24 @@ MODE = os.environ.get("SLIME_SCRIPT_MODE", "normal")
 assert MODE in {"normal", "debug_minimal", "debug_one_sample"}
 
 NUM_GPUS = int(os.environ.get("SLIME_SCRIPT_NUM_GPUS", "8"))
-
 USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 
 # TP configuration for verifying true on-policy with tensor parallelism
 USE_TP = os.environ.get("SLIME_USE_TP", "0") == "1"
 TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "1"))
+
+# --- PP add-on ---
+PP_SIZE = int(os.environ.get("SLIME_PP_SIZE", "1"))
+
+WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "")
+assert WANDB_API_KEY != "", "WANDB_API_KEY is not set"
+
+ENABLE_CI = os.environ.get("SLIME_ENABLE_CI", "1" if MODE != "debug_one_sample" else "0") == "1"
+CHECK_WEIGHT_UPDATE_EQUAL = os.environ.get("SLIME_CHECK_WEIGHT_UPDATE_EQUAL", "0") == "1"
+
+USE_EXTERNAL_SYSTEM_SETUP = os.environ.get("SLIME_USE_EXTERNAL_SYSTEM_SETUP", "0") == "1"
+_system_env, _system_bool, _system_int = make_system_helpers(USE_EXTERNAL_SYSTEM_SETUP)
+
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
@@ -32,15 +47,23 @@ def prepare():
 
 
 def execute():
+    is_debug = MODE == "debug_one_sample"
+
+    # --- PP add-on: pipeline parallel topology ---
+    pipeline_parallel_size = PP_SIZE
+    is_pp = pipeline_parallel_size > 1
+
     # For MoE models, SGLang requires TP >= EP
     # Use TP_SIZE from env var, default to NUM_GPUS (so TP=EP=NUM_GPUS, DP=1)
-    tensor_parallel_size = TP_SIZE if USE_TP else NUM_GPUS
-    assert NUM_GPUS % tensor_parallel_size == 0, (
-        f"NUM_GPUS ({NUM_GPUS}) must be divisible by tensor_parallel_size ({tensor_parallel_size})"
+    tensor_parallel_size = TP_SIZE if USE_TP else (NUM_GPUS // pipeline_parallel_size)
+    assert NUM_GPUS % (tensor_parallel_size * pipeline_parallel_size) == 0, (
+        f"NUM_GPUS ({NUM_GPUS}) must be divisible by TP * PP ({tensor_parallel_size} * {pipeline_parallel_size})"
     )
-    data_parallel_size = NUM_GPUS // tensor_parallel_size
+    data_parallel_size = NUM_GPUS // (tensor_parallel_size * pipeline_parallel_size)
+    expert_parallel_size = tensor_parallel_size
+    gpus_per_sglang_engine = tensor_parallel_size * pipeline_parallel_size
 
-    global_batch_size = 2 if MODE == "debug_one_sample" else 128
+    global_batch_size = 2 if is_debug else 128
     if global_batch_size % data_parallel_size != 0:
         # Megatron requires global_batch_size divisible by micro_batch_size * data_parallel_size
         global_batch_size = math.ceil(global_batch_size / data_parallel_size) * data_parallel_size
@@ -50,11 +73,8 @@ def execute():
             f"--hf-checkpoint /root/models/{MODEL_NAME} "
             f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
         )
-    else:   
-        ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
-
-    WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "")
-    assert WANDB_API_KEY != "", "WANDB_API_KEY is not set"
+    else:
+        ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ --ref-load /root/models/{MODEL_NAME}/ "
 
     wandb_args = (
         "--use-wandb "
@@ -63,6 +83,7 @@ def execute():
         f"--wandb-key {WANDB_API_KEY} "
         "--disable-wandb-random-suffix "
     )
+
     rollout_args = (
         "--prompt-data /root/datasets/gsm8k/train.parquet "
         "--input-key messages "
@@ -70,21 +91,19 @@ def execute():
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type math "
-        f"--num-rollout {3 if MODE == 'debug_one_sample' else 3000} "  # Need at least 2-3 steps to observe divergence pattern
-        f"--rollout-batch-size {1 if MODE == 'debug_one_sample' else 16} "
-        f"--n-samples-per-prompt {2 if MODE == 'debug_one_sample' else 8} "
-        f"--rollout-max-response-len {10 if MODE == 'debug_one_sample' else 1024} "
+        f"--num-rollout {3 if is_debug else 3000} "
+        f"--rollout-batch-size {1 if is_debug else 16} "
+        f"--n-samples-per-prompt {2 if is_debug else 8} "
+        f"--rollout-max-response-len {10 if is_debug else 1024} "
         "--rollout-temperature 1 "
-        # temp remove this to make test easier
-        # "--over-sampling-batch-size 64 "
-        # "--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
         f"--global-batch-size {global_batch_size} "
     )
 
     eval_args = ""
     if MODE == "normal":
         eval_args = (
-            f"--eval-interval {2 if MODE == 'debug_one_sample' else 10} "
+            "--skip-eval-before-train "
+            f"--eval-interval 10 "
             "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
             "--n-samples-per-eval-prompt 1 "
             "--eval-max-response-len 1024 "
@@ -109,65 +128,85 @@ def execute():
         "--adam-beta1 0.9 "
         "--adam-beta2 0.98 "
     )
-
-    if MODE == "debug_one_sample":
+    if is_debug:
+        optimizer_args += "--lr-decay-iters 4 "
+    # --- PP add-on: CPU offload for memory savings ---
+    if is_pp:
         optimizer_args += (
-            "--lr-decay-iters 4 "
+            "--optimizer-cpu-offload "
+            "--overlap-cpu-optimizer-d2h-h2d "
+            "--use-precision-aware-optimizer "
         )
 
-    
+    recompute_args = ""
+    if _system_bool("SLIME_ENABLE_RECOMPUTE", is_pp):
+        recompute_args = _system_env("SLIME_RECOMPUTE_ARGS", "--recompute-activations ")
+
+    disable_rollout_offload = _system_bool("SLIME_DISABLE_ROLLOUT_OFFLOAD", False)
 
     tp_args = (
         f"--tensor-model-parallel-size {tensor_parallel_size} "
-        # "--sequence-parallel "  # Disabled: only use TP without SP for easier debugging
-        "--pipeline-model-parallel-size 1 "
-        f"--expert-model-parallel-size {tensor_parallel_size} "  # EP = TP (SGLang requires TP >= EP)
+        f"--pipeline-model-parallel-size {pipeline_parallel_size} "
+        f"--expert-model-parallel-size {expert_parallel_size} "
         "--expert-tensor-parallel-size 1 "
     )
+
+    sglang_mem_fraction_static = float(
+        _system_env("SLIME_SGLANG_MEM_FRACTION_STATIC", "0.35" if MODEL_NAME == "Qwen3-30B-A3B" else "0.5")
+    )
     sglang_args = (
-        f"--rollout-num-gpus-per-engine {tensor_parallel_size} "
-        f"--sglang-tp-size {tensor_parallel_size} "  # SGLang requires TP >= EP
-        f"--sglang-ep-size {tensor_parallel_size} "  # EP = TP
+        f"--rollout-num-gpus-per-engine {gpus_per_sglang_engine} "
+        f"--sglang-tp-size {tensor_parallel_size} "
+        f"--sglang-pipeline-parallel-size {pipeline_parallel_size} "
+        f"--sglang-ep-size {expert_parallel_size} "
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
-        f"--sglang-mem-fraction-static {0.35 if MODEL_NAME == 'Qwen3-30B-A3B' else 0.5} "
-        # Disable CUDA graph for true on-policy to ensure numerical consistency
-        # CUDA graph can cause non-determinism in MoE routing and expert computation
-        "--sglang-disable-cuda-graph "
+        f"--sglang-mem-fraction-static {sglang_mem_fraction_static} "
     )
 
-
-    ci_args = (
-        "--ci-test "
-        "--ci-disable-kl-checker "
-        "--ci-metric-checker-key eval/gsm8k "
-        "--ci-metric-checker-threshold 0.71 "  # loose threshold at 60 step
+    router_args = (
+        "--router-health-check-timeout-secs 30 "
+        "--router-health-failure-threshold 10 "
     )
 
-    if USE_RAW:
-        misc_args = "--megatron-to-hf-mode raw "
-    else:
-        misc_args = "--megatron-to-hf-mode bridge "
+    fault_tolerance_args = ""
+    if _system_bool("SLIME_USE_FAULT_TOLERANCE", False):
+        fault_tolerance_args = "--use-fault-tolerance "
 
+    ci_args = ""
+    if ENABLE_CI:
+        ci_args = (
+            "--ci-test "
+            "--ci-disable-kl-checker "
+            "--ci-metric-checker-key eval/gsm8k "
+            "--ci-metric-checker-threshold 0.71 "
+        )
+
+    misc_args = "--megatron-to-hf-mode raw " if USE_RAW else "--megatron-to-hf-mode bridge "
     misc_args += (
-        # default dropout in megatron is 0.1
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
         "--actor-num-nodes 1 "
         f"--actor-num-gpus-per-node {NUM_GPUS} "
         "--colocate "
     )
-    
-    # Enable weight comparison check in debug mode to verify weight sync
-    # if MODE == "debug_one_sample":
-    #     misc_args += "--check-weight-update-equal "
-    
-    if MODEL_NAME == "Qwen3-4B":
-        misc_args += (
-            #"--use-dynamic-batch-size "
-            # TODO pick a good value
-            "--max-tokens-per-gpu 2048 "
-        )
+    # --- PP add-on: offload & buffer settings ---
+    if is_pp:
+        if _system_bool("SLIME_DISABLE_TRAIN_OFFLOAD", False):
+            misc_args += "--no-offload-train "
+        if disable_rollout_offload:
+            misc_args += "--no-offload-rollout "
+        update_weight_buffer_size = _system_int("SLIME_UPDATE_WEIGHT_BUFFER_SIZE", 256 * 1024**2)
+        misc_args += f"--update-weight-buffer-size {update_weight_buffer_size} "
+
+    train_memory_margin_bytes = _system_int(
+        "SLIME_TRAIN_MEMORY_MARGIN_BYTES",
+        0 if is_pp and is_debug else 1024**3,
+    )
+    misc_args += f"--train-memory-margin-bytes {train_memory_margin_bytes} "
+
+    if CHECK_WEIGHT_UPDATE_EQUAL:
+        misc_args += "--check-weight-update-equal "
 
     true_on_policy_args = (
         "--sglang-enable-deterministic-inference "
@@ -184,55 +223,50 @@ def execute():
     )
     true_on_policy_envs = {
         # NOTE: Use "allreduce:Tree" instead of "Tree" to only affect AllReduce operations
-        # "Tree" would affect ALL NCCL operations (AllGather, ReduceScatter, etc.) and may cause errors
-        # like "no algorithm/protocol available for function AllGather with datatype ncclInt8"
         "NCCL_ALGO": "allreduce:Tree",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-        # Disable NVLS (NVLink SHARP) to ensure consistent all-reduce behavior between sglang and megatron
         "NCCL_NVLS_ENABLE": "0",
-        # Enable deterministic all-reduce in Megatron to match SGLang's tree_all_reduce_sum
         "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
-        # DEBUG: Enable to get accurate CUDA error location (slows down execution significantly)
-        #"CUDA_LAUNCH_BLOCKING": "1",  # ENABLED: Finding the real source of CUDA illegal memory access
     }
+    # --- PP add-on: stage-local sync + GPU-direct for vocab ---
+    if is_pp:
+        true_on_policy_envs["SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP"] = _system_env(
+            "SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP", "1"
+        )
+        true_on_policy_envs["SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB"] = _system_env(
+            "SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB", "1"
+        )
+        alloc_conf = _system_env("PYTORCH_CUDA_ALLOC_CONF", "")
+        if alloc_conf:
+            true_on_policy_envs["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
+        elif disable_rollout_offload:
+            true_on_policy_envs["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     train_args = (
         f"{ckpt_args} "
         f"{rollout_args} "
         f"{optimizer_args} "
+        f"{recompute_args} "
         f"{grpo_args} "
         f"{wandb_args} "
-        f"{tp_args} "  # TP configuration (empty if USE_TP=False)
+        f"{tp_args} "
         f"{eval_args} "
         f"{sglang_args} "
+        f"{router_args} "
+        f"{fault_tolerance_args} "
         f"{ci_args} "
         f"{misc_args} "
         f"{true_on_policy_args} "
     )
-    
+
     U.execute_train(
         train_args=train_args,
         num_gpus_per_node=NUM_GPUS,
         megatron_model_type=MODEL_TYPE,
         extra_env_vars={
             **true_on_policy_envs,
-            "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
-            "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_ROUTER": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_ATTN": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_LOGPROB_DIFF": "1" if MODE == "debug_one_sample" else "0",
-            "SLIME_DEBUG_TREE_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
-            # Debug gradient all-reduce for MoE backward pass
-            "DEBUG_GRAD_ALLREDUCE": "1" if MODE == "debug_one_sample" else "0",
-            "DEBUG_OVERRIDE_REWARDS": "first_one" if MODE == "debug_one_sample" else "",
-            # Debug gradient sync verification - enable to check if all-reduce is working
-            # "DEBUG_GRAD_SYNC": "1",  # Enable to verify gradients are identical across ranks after all-reduce
-            # "DEBUG_ROUTER_GRAD_SYNC": "1",  # Enable to see per-rank gradient values before/after all-reduce
-            # # Debug EP broadcast during weight sync
-            # "DEBUG_EP_BROADCAST": "1",  # Enable to check EP broadcast logic in weight sync
-            # # Debug expert weight conversion during sync
-            # "DEBUG_EXPERT_SYNC": "1",  # Enable to check Megatron->HF expert weight conversion
+            **build_debug_envs(MODE, _system_env),
         },
     )
 

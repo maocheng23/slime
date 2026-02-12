@@ -112,6 +112,10 @@ class SGLangEngine(RayActor):
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
+        self._default_http_timeout_sec = 30.0
+        self._weight_update_http_timeout_sec = 300.0
+        self._weight_update_http_max_attempts = 6
+        self._weight_update_http_retry_backoff_sec = 1.0
 
     def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
         self.router_ip = self.args.sglang_router_ip
@@ -203,12 +207,23 @@ class SGLangEngine(RayActor):
                 )
             response.raise_for_status()
 
-    def _make_request(self, endpoint: str, payload: dict | None = None):
+    def _make_request(
+        self,
+        endpoint: str,
+        payload: dict | None = None,
+        *,
+        timeout: float | None = None,
+        max_attempts: int = 1,
+        retry_backoff_sec: float = 1.0,
+    ):
         """Make a POST request to the specified endpoint with the given payload.
 
         Args:
             endpoint: The API endpoint to call
             payload: The JSON payload to send (default: empty dict)
+            timeout: Request timeout in seconds.
+            max_attempts: Total number of attempts (``1`` = no retry).
+            retry_backoff_sec: Base backoff between retries in seconds.
 
         Returns:
             The JSON response from the server
@@ -217,13 +232,45 @@ class SGLangEngine(RayActor):
             return
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            e.add_note(f"{response.text=}")
-            raise
-        return response.json()
+        timeout = self._default_http_timeout_sec if timeout is None else timeout
+        max_attempts = max(1, int(max_attempts))
+
+        for attempt in range(1, max_attempts + 1):
+            response = None
+            try:
+                response = requests.post(url, json=payload or {}, timeout=timeout)
+                # Retry transient 5xx responses for weight update paths.
+                if response.status_code >= 500 and attempt < max_attempts:
+                    sleep_s = min(retry_backoff_sec * (2 ** (attempt - 1)), 8.0)
+                    logger.warning(
+                        "Request to %s failed with status %s (attempt %s/%s), retry in %.1fs",
+                        endpoint,
+                        response.status_code,
+                        attempt,
+                        max_attempts,
+                        sleep_s,
+                    )
+                    time.sleep(sleep_s)
+                    continue
+
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as e:
+                if attempt >= max_attempts:
+                    if isinstance(e, requests.exceptions.HTTPError) and response is not None:
+                        e.add_note(f"{response.text=}")
+                    raise
+
+                sleep_s = min(retry_backoff_sec * (2 ** (attempt - 1)), 8.0)
+                logger.warning(
+                    "Request to %s failed (attempt %s/%s): %s; retry in %.1fs",
+                    endpoint,
+                    attempt,
+                    max_attempts,
+                    e,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
 
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.
@@ -270,6 +317,9 @@ class SGLangEngine(RayActor):
         return self._make_request(
             "update_weights_from_tensor",
             payload,
+            timeout=self._weight_update_http_timeout_sec,
+            max_attempts=self._weight_update_http_max_attempts,
+            retry_backoff_sec=self._weight_update_http_retry_backoff_sec,
         )
 
     def flush_cache(self):
@@ -389,17 +439,16 @@ class SGLangEngine(RayActor):
         return self._make_request(
             "update_weights_from_distributed",
             payload,
+            timeout=self._weight_update_http_timeout_sec,
+            max_attempts=self._weight_update_http_max_attempts,
+            retry_backoff_sec=self._weight_update_http_retry_backoff_sec,
         )
 
     def pause_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})
-        response.raise_for_status()
-        return response
+        return self._make_request("pause_generation", {}, timeout=self._default_http_timeout_sec, max_attempts=3)
 
     def continue_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
-        response.raise_for_status()
-        return response
+        return self._make_request("continue_generation", {}, timeout=self._default_http_timeout_sec, max_attempts=3)
 
     def post_process_weights(
         self,

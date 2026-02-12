@@ -30,6 +30,24 @@ def _is_linear_fc2_weight(name: str) -> bool:
     return "linear_fc2.weight" in name or "linear_fc2.linear.weight" in name
 
 
+def _reorder_partitions_by_stride(
+    param_partitions: Sequence[torch.Tensor],
+    *,
+    partition_dim: int,
+    partition_stride: int,
+) -> list[torch.Tensor]:
+    """Reorder TP shards produced by rank-major all_gather into stride-major order."""
+    if partition_stride <= 1:
+        return list(param_partitions)
+
+    split_partitions = [p.chunk(partition_stride, dim=partition_dim) for p in param_partitions]
+    reordered = []
+    for stride_idx in range(partition_stride):
+        for rank_idx in range(len(split_partitions)):
+            reordered.append(split_partitions[rank_idx][stride_idx])
+    return reordered
+
+
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     """
     All-gather TP-sharded param to full tensor. expert_bias→param, non-TP/duplicated→param.data.
@@ -52,10 +70,13 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
     dist.all_gather(param_partitions, param.data, group=tp_group)
     partition_dim = param.partition_dim
-    assert param.partition_stride == 1, "partition_stride != 1 is not supported"
+    partition_stride = int(getattr(param, "partition_stride", 1))
+    param_partitions = _reorder_partitions_by_stride(
+        param_partitions, partition_dim=partition_dim, partition_stride=partition_stride
+    )
     # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
-    # TODO: check only GLU is used.
-    if _is_linear_fc1_weight(name):
+    # TODO: remove linear_fc1 fallback once all checkpoints carry correct partition_stride.
+    if _is_linear_fc1_weight(name) and partition_stride == 1:
         param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
         param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
     # this is bug in megatron's grouped moe.
@@ -81,10 +102,10 @@ def all_gather_params_async(
     for info, param in param_infos_and_params:
         # Prepare async all_gather
         if "expert_bias" in info.name:
-            gather_tasks.append((info, param, None, None, None))
+            gather_tasks.append((info, param, None, None, None, None))
             handles.append(None)
         elif not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
-            gather_tasks.append((info, param.data, None, None, None))
+            gather_tasks.append((info, param.data, None, None, None, None))
             handles.append(None)
         else:
             # Start async all_gather
@@ -97,7 +118,16 @@ def all_gather_params_async(
 
             param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
             handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
-            gather_tasks.append((info, None, handle, param_partitions, param.partition_dim))
+            gather_tasks.append(
+                (
+                    info,
+                    None,
+                    handle,
+                    param_partitions,
+                    param.partition_dim,
+                    int(getattr(param, "partition_stride", 1)),
+                )
+            )
             handles.append(handle)
 
     # Phase 2: Wait for ALL async operations to complete at once
@@ -108,16 +138,20 @@ def all_gather_params_async(
 
     # Phase 3: Process all results after all communications are done
     gathered_params = []
-    for info, direct_param, handle, param_partitions, partition_dim in gather_tasks:
+    for info, direct_param, handle, param_partitions, partition_dim, partition_stride in gather_tasks:
         if handle is None:
             # No all_gather needed
             param = direct_param
         else:
             # Process the gathered partitions (same logic as original all_gather_param)
-            assert partition_dim is not None, "partition_stride != 1 is not supported"
+            assert partition_dim is not None
+            assert partition_stride is not None
+            param_partitions = _reorder_partitions_by_stride(
+                param_partitions, partition_dim=partition_dim, partition_stride=partition_stride
+            )
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
-            # TODO: check only GLU is used.
-            if _is_linear_fc1_weight(info.name):
+            # TODO: remove linear_fc1 fallback once all checkpoints carry correct partition_stride.
+            if _is_linear_fc1_weight(info.name) and partition_stride == 1:
                 param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
                 param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
             # this is bug in megatron's grouped moe.

@@ -1,3 +1,6 @@
+import gc
+import logging
+import os
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -19,6 +22,12 @@ from .update_weight_from_distributed import (
     post_process_weights,
     update_weights_from_distributed,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _is_vocab_or_lm_head_weight(name: str) -> bool:
+    return name in {"model.embed_tokens.weight", "lm_head.weight"}
 
 
 class UpdateWeightFromTensor:
@@ -52,14 +61,55 @@ class UpdateWeightFromTensor:
             args=args, model=model, model_name=model_name, quantization_config=quantization_config
         )
 
+        # --- PP stage-local IPC configuration (add-on for PP>1) ---
+        self._pp_size = int(
+            getattr(self.args, "sglang_pipeline_parallel_size", 0)
+            or getattr(self.args, "pipeline_model_parallel_size", 0)
+            or 1
+        )
+        self._use_stage_local_ipc_group = (
+            os.environ.get("SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP", "1" if self._pp_size > 1 else "0") == "1"
+        )
+        if self._pp_size > 1 and self._use_stage_local_ipc_group:
+            logger.warning(
+                "PP stage-local IPC tensor sync is experimental. "
+                "If rollout generate fails after update_weights, set "
+                "SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP=0."
+            )
+        self._gpu_direct_for_vocab = (
+            os.environ.get("SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB", "1" if self._pp_size > 1 else "0") == "1"
+        )
+        self._ipc_gc_interval = max(
+            0, int(os.environ.get("SLIME_TENSOR_SYNC_IPC_GC_INTERVAL", "1" if self._pp_size > 1 else "0"))
+        )
+
+        # --- Create IPC Gloo groups ---
+        # PP>1 + stage_local: group_size = tp_size (one group per PP stage)
+        # Otherwise (original): group_size = rollout_num_gpus_per_engine
+        if self._use_stage_local_ipc_group:
+            tp_size = int(getattr(self.args, "sglang_tp_size", 0) or 0)
+            if tp_size <= 0:
+                tp_size = max(1, self.args.rollout_num_gpus_per_engine // self._pp_size)
+            ipc_group_size = tp_size
+        else:
+            ipc_group_size = self.args.rollout_num_gpus_per_engine
+        self._ipc_group_size = ipc_group_size
+
+        world_size = dist.get_world_size()
+        assert world_size % self._ipc_group_size == 0, (
+            f"world_size ({world_size}) must be divisible by IPC group size ({self._ipc_group_size})"
+        )
+
         # create the group within megatron.
-        for start_rank in range(0, dist.get_world_size(), self.args.rollout_num_gpus_per_engine):
-            end_rank = start_rank + self.args.rollout_num_gpus_per_engine
+        self._ipc_group_index = None
+        for start_rank in range(0, world_size, self._ipc_group_size):
+            end_rank = start_rank + self._ipc_group_size
             group_ranks = list(range(start_rank, end_rank))
             new_group = dist.new_group(ranks=group_ranks, backend="gloo")
             if dist.get_rank() in group_ranks:
                 self._ipc_gather_group = new_group
                 self._ipc_gather_src = start_rank
+                self._ipc_group_index = start_rank // self._ipc_group_size
 
         self._model_update_groups = None
 
@@ -95,13 +145,30 @@ class UpdateWeightFromTensor:
                     self.args, self._group_name, self.distributed_rollout_engines
                 )
 
-        # Here we assume the gpu id of rollout engines and train actors are the same.
-        for i, engine in enumerate(self.rollout_engines):
-            start_rank = i * self.args.rollout_num_gpus_per_engine
-            end_rank = (i + 1) * self.args.rollout_num_gpus_per_engine
-            group_ranks = list(range(start_rank, end_rank))
-            if dist.get_rank() in group_ranks:
-                self._ipc_engine = engine
+        # Map current rank to its colocated IPC engine.
+        # PP>1 + stage_local: multiple IPC groups map to one engine (pp_size groups per engine).
+        # Otherwise (original): one IPC group per engine.
+        if self._use_stage_local_ipc_group:
+            self._ipc_engine = None
+            if self.rollout_engines:
+                assert self._ipc_group_index is not None
+                engine_index = self._ipc_group_index // self._pp_size
+                if engine_index < len(self.rollout_engines):
+                    self._ipc_engine = self.rollout_engines[engine_index]
+            if dist.get_rank() == self._ipc_gather_src:
+                assert self._ipc_engine is not None, (
+                    f"Failed to map IPC source rank {dist.get_rank()} to a rollout engine "
+                    f"(group_index={self._ipc_group_index}, pp_size={self._pp_size}, "
+                    f"num_rollout_engines={len(self.rollout_engines)})"
+                )
+        else:
+            # Here we assume the gpu id of rollout engines and train actors are the same.
+            for i, engine in enumerate(self.rollout_engines):
+                start_rank = i * self.args.rollout_num_gpus_per_engine
+                end_rank = (i + 1) * self.args.rollout_num_gpus_per_engine
+                group_ranks = list(range(start_rank, end_rank))
+                if dist.get_rank() in group_ranks:
+                    self._ipc_engine = engine
 
     @torch.no_grad()
     def update_weights(self) -> None:
@@ -123,10 +190,19 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
 
-        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+        for bucket_idx, hf_named_tensors in enumerate(self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights)):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
+            # PP add-on: non-source ranks must keep tensors alive until the source
+            # rank finishes update_weights_from_tensor.remote().
+            dist.barrier(group=self._ipc_gather_group)
             del long_lived_tensors
+            # PP add-on: periodic GC to reclaim CUDA IPC handles between buckets.
+            if self._ipc_gc_interval > 0 and ((bucket_idx + 1) % self._ipc_gc_interval == 0):
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
+                    torch.cuda.empty_cache()
 
         dist.barrier(group=get_gloo_group())
 
@@ -149,6 +225,7 @@ class UpdateWeightFromTensor:
             ipc_gather_src=self._ipc_gather_src,
             ipc_gather_group=self._ipc_gather_group,
             weight_version=self.weight_version,
+            gpu_direct_for_vocab=self._gpu_direct_for_vocab,
         )
         all_refs.extend(refs_colocated)
 
@@ -173,9 +250,21 @@ def _send_to_colocated_engine(
     ipc_gather_src,
     ipc_gather_group,
     weight_version,
+    gpu_direct_for_vocab: bool = False,
 ) -> tuple[list[ObjectRef], Any]:
     # TODO improve
     long_live_tensors = []
+
+    # PP add-on: vocab/lm_head weights fail with flattened-bucket in PP>1.
+    # Route them through per-tensor CUDA IPC instead.
+    if gpu_direct_for_vocab and any(_is_vocab_or_lm_head_weight(n) for n, _ in hf_named_tensors):
+        return _send_gpu_direct(
+            hf_named_tensors,
+            ipc_engine=ipc_engine,
+            ipc_gather_src=ipc_gather_src,
+            ipc_gather_group=ipc_gather_group,
+            weight_version=weight_version,
+        )
 
     if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
         converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
@@ -221,3 +310,27 @@ def _send_to_colocated_engine(
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
     return refs, long_live_tensors
+
+
+# ---------------------------------------------------------------------------
+# PP add-on: per-tensor CUDA IPC for vocab/lm_head in PP>1
+# ---------------------------------------------------------------------------
+
+def _send_gpu_direct(
+    hf_named_tensors, *, ipc_engine, ipc_gather_src, ipc_gather_group, weight_version,
+) -> tuple[list[ObjectRef], list]:
+    """Send per-tensor CUDA IPC handles (used for vocab/lm_head in PP>1)."""
+    long_live_tensors = [tensor for _, tensor in hf_named_tensors]
+    local_payload = MultiprocessingSerializer.serialize(hf_named_tensors, output_str=True)
+    gathered = [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
+    dist.gather_object(local_payload, object_gather_list=gathered, dst=ipc_gather_src, group=ipc_gather_group)
+
+    refs = []
+    if dist.get_rank() == ipc_gather_src:
+        refs.append(
+            ipc_engine.update_weights_from_tensor.remote(
+                serialized_named_tensors=gathered, load_format=None, weight_version=str(weight_version),
+            )
+        )
+    return refs, long_live_tensors
+
