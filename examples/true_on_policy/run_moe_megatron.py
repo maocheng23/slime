@@ -222,12 +222,16 @@ def execute():
         "--no-rope-fusion "
     )
     true_on_policy_envs = {
-        # NOTE: Use "allreduce:Tree" instead of "Tree" to only affect AllReduce operations
-        "NCCL_ALGO": "allreduce:Tree",
+        # Forward determinism is ensured by:
+        #   1. Software tree AllReduce (AllGather + tree sum) — bypasses NCCL AllReduce
+        #   2. torch.use_deterministic_algorithms(True) during forward (toggled off for bwd)
+        #   3. CUBLAS_WORKSPACE_CONFIG for cuBLAS algorithm determinism
+        # NCCL_ALGO/NCCL_NVLS_ENABLE removed: forward uses software tree AllReduce
+        # (AllGather + tree sum), not NCCL AllReduce. Removing lets backward use fast NCCL.
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-        "NCCL_NVLS_ENABLE": "0",
         "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
+        "MEGATRON_DETERMINISTIC_FORWARD_ONLY": "1",
     }
     # --- PP add-on: stage-local sync + GPU-direct for vocab ---
     if is_pp:
@@ -267,6 +271,7 @@ def execute():
         extra_env_vars={
             **true_on_policy_envs,
             **build_debug_envs(MODE, _system_env),
+            "SLIME_PROFILE_FWD_BWD": os.environ.get("SLIME_PROFILE_FWD_BWD", "0"),
         },
     )
 

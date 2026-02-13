@@ -209,6 +209,7 @@ def execute():
         megatron_model_type=MODEL_TYPE,
         extra_env_vars={
             **true_on_policy_envs,
+            "SLIME_PROFILE_FWD_BWD": os.environ.get("SLIME_PROFILE_FWD_BWD", "0"),
             "DEBUG_OVERRIDE_REWARDS": "first_one" if MODE == "debug_one_sample" else "",
             # "SGLANG_DUMPER_ENABLE": "1" if MODE == "debug_one_sample" else "0",
             # "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if MODE == "debug_one_sample" else "0",

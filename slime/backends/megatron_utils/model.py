@@ -442,7 +442,18 @@ def train_one_step(
 
     if valid_step:
         # Update parameters.
+        import time as _time
+        _profile_enabled = os.environ.get("SLIME_PROFILE_FWD_BWD", "0") == "1"
+        if _profile_enabled:
+            torch.cuda.synchronize()
+            _opt_t0 = _time.time()
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        if _profile_enabled:
+            torch.cuda.synchronize()
+            _opt_elapsed = _time.time() - _opt_t0
+            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if _rank == 0:
+                print(f"[PROFILE] optimizer_step={_opt_elapsed:.2f}s", flush=True)
 
         # Update learning rate.
         assert update_successful
