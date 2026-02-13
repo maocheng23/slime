@@ -272,6 +272,8 @@ def execute():
             **true_on_policy_envs,
             **build_debug_envs(MODE, _system_env),
             "SLIME_PROFILE_FWD_BWD": os.environ.get("SLIME_PROFILE_FWD_BWD", "0"),
+            "SLIME_PROFILE_BWD_DETAIL": os.environ.get("SLIME_PROFILE_BWD_DETAIL", "0"),
+            "USE_TRITON_BACKWARD": os.environ.get("USE_TRITON_BACKWARD", "0"),
         },
     )
 
