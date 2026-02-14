@@ -226,8 +226,10 @@ def execute():
         #   1. Software tree AllReduce (AllGather + tree sum) — bypasses NCCL AllReduce
         #   2. torch.use_deterministic_algorithms(True) during forward (toggled off for bwd)
         #   3. CUBLAS_WORKSPACE_CONFIG for cuBLAS algorithm determinism
-        # NCCL_ALGO/NCCL_NVLS_ENABLE removed: forward uses software tree AllReduce
-        # (AllGather + tree sum), not NCCL AllReduce. Removing lets backward use fast NCCL.
+        # NCCL_ALGO removed: forward uses software tree AllReduce, not NCCL AllReduce.
+        # NCCL_NVLS_ENABLE=0 required: NVLS multicast fails in container environments
+        # during SGLang's ncclCommInitRank. Must be explicitly disabled.
+        "NCCL_NVLS_ENABLE": "0",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
