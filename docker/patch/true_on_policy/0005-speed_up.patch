@@ -1,0 +1,26 @@
+diff --git a/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py b/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py
+index 389f2ef42..ad3072be2 100644
+--- a/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py
++++ b/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py
+@@ -397,8 +397,19 @@ def scatter_input_by_local_expert(topk: torch.Tensor, input: torch.Tensor, E: in
+     # Initialize result
+     output = torch.zeros(M, E, hidden_size, device=input.device, dtype=input.dtype)
+     
+-    # Scatter add
+-    output.scatter_add_(1, index, output_masked)
++    # scatter_add_ with unique topk indices per token is inherently deterministic
++    # (no write conflicts along dim=1). Remote experts (-1 → clamped to 0) only
++    # contribute 0.0 values, so even overlapping writes are exact (IEEE 754:
++    # x + 0.0 = x). Bypass PyTorch's conservative deterministic sort path which
++    # is ~1000x slower (indexing_backward_kernel + DeviceRadixSort).
++    _was_det = torch.are_deterministic_algorithms_enabled()
++    if _was_det:
++        torch.use_deterministic_algorithms(False)
++    try:
++        output.scatter_add_(1, index, output_masked)
++    finally:
++        if _was_det:
++            torch.use_deterministic_algorithms(True)
+     
+     return output
+ 
