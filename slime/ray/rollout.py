@@ -494,6 +494,8 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             "NCCL_ALGO": os.environ.get("NCCL_ALGO", ""),
             "NVTE_ALLOW_NONDETERMINISTIC_ALGO": os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", ""),
             "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
+            # TP-invariant RowParallelLinear (cross-TP support)
+            "ROW_LINEAR_ENABLE_INV": os.environ.get("ROW_LINEAR_ENABLE_INV", "0"),
         }
 
         worker_type = "regular"

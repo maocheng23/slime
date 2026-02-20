@@ -1,0 +1,73 @@
+diff --git a/python/sglang/srt/layers/linear.py b/python/sglang/srt/layers/linear.py
+index 88da0b2..5e48471 100644
+--- a/python/sglang/srt/layers/linear.py
++++ b/python/sglang/srt/layers/linear.py
+@@ -1398,6 +1398,9 @@ class RowParallelLinear(LinearBase):
+                 param.load_row_parallel_weight(loaded_weight)
+ 
+     def forward(self, input_, skip_all_reduce=False):
++        import os
++        from sglang.srt.tp_invariant_ops.tp_invariant_ops import is_tp_invariant_mode_enabled
++
+         if self.input_is_parallel:
+             input_parallel = input_
+         else:
+@@ -1411,16 +1414,23 @@ class RowParallelLinear(LinearBase):
+         # Only fuse bias add into GEMM for rank 0 (this ensures that
+         # bias will not get added more than once in TP>1 case)
+         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+-        with use_symmetric_memory(
+-            get_tp_group(), disabled=not is_allocation_symmetric()
+-        ):
+-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
++
++        _use_tp_inv = is_tp_invariant_mode_enabled() and os.environ.get("ROW_LINEAR_ENABLE_INV", "0") == "1"
++        if _use_tp_inv:
++            output_parallel = torch.ops.tp_inv_ops.matmul_tp_inv(input_parallel, self.weight.t())
++            if bias_ is not None:
++                output_parallel = output_parallel + bias_
++        else:
++            with use_symmetric_memory(
++                get_tp_group(), disabled=not is_allocation_symmetric()
++            ):
++                output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+ 
+         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
+             # Use tree_all_reduce for true on-policy mode to match Megatron
+             from sglang.srt.server_args import get_global_server_args
+             server_args = get_global_server_args()
+-            if server_args is not None and server_args.rl_on_policy_target in ("fsdp", "fsdp_tp"):
++            if is_tp_invariant_mode_enabled() or (server_args is not None and server_args.rl_on_policy_target in ("fsdp", "fsdp_tp")):
+                 from sglang.srt.distributed import tensor_model_parallel_tree_all_reduce
+                 output = tensor_model_parallel_tree_all_reduce(output_parallel)
+             else:
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index dc453f7..a40218f 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -415,6 +415,12 @@ class FusedMoE(torch.nn.Module):
+                 )
+ 
+             expert_data = expert_data.narrow(shard_dim, start, shard_size)
++        if expert_data.device != loaded_weight.device or expert_data.shape != loaded_weight.shape:
++            import sys
++            print(f"[DEBUG _load_w13] MISMATCH: expert_data={expert_data.shape}@{expert_data.device} "
++                  f"loaded_weight={loaded_weight.shape}@{loaded_weight.device} "
++                  f"shard_id={shard_id} shard_dim={shard_dim} shard_size={shard_size} tp_rank={tp_rank} start={start}",
++                  file=sys.stderr, flush=True)
+         expert_data.copy_(loaded_weight)
+ 
+     def _load_w2(
+diff --git a/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py b/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py
+index ad3072b..17f81ca 100644
+--- a/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py
++++ b/python/sglang/srt/tp_invariant_ops/tp_invariant_ops.py
+@@ -338,7 +338,7 @@ except RuntimeError:
+ 
+ 
+ def is_tp_invariant_mode_enabled():
+-    return _tp_inv_MODE
++    return _tp_inv_MODE or os.environ.get("ROW_LINEAR_ENABLE_INV", "0") == "1"
+ 
+ 
+ def enable_tp_invariant_mode():

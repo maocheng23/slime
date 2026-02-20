@@ -26,6 +26,11 @@ TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "1"))
 # --- PP add-on ---
 PP_SIZE = int(os.environ.get("SLIME_PP_SIZE", "1"))
 
+# SGLang TP/EP override: allows different TP/EP for SGLang vs Megatron (cross-TP)
+SGLANG_TP_SIZE = int(os.environ.get("SLIME_SGLANG_TP_SIZE", "0"))  # 0 = same as Megatron TP
+SGLANG_EP_SIZE = int(os.environ.get("SLIME_SGLANG_EP_SIZE", "0"))  # 0 = same as Megatron EP
+SGLANG_PP_SIZE = int(os.environ.get("SLIME_SGLANG_PP_SIZE", "0"))  # 0 = same as Megatron PP
+
 WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "")
 assert WANDB_API_KEY != "", "WANDB_API_KEY is not set"
 
@@ -61,7 +66,12 @@ def execute():
     )
     data_parallel_size = NUM_GPUS // (tensor_parallel_size * pipeline_parallel_size)
     expert_parallel_size = tensor_parallel_size
-    gpus_per_sglang_engine = tensor_parallel_size * pipeline_parallel_size
+
+    # --- Cross-TP: SGLang can use a different TP/EP/PP size ---
+    sglang_tp_size = SGLANG_TP_SIZE if SGLANG_TP_SIZE > 0 else tensor_parallel_size
+    sglang_ep_size = SGLANG_EP_SIZE if SGLANG_EP_SIZE > 0 else expert_parallel_size
+    sglang_pp_size = SGLANG_PP_SIZE if SGLANG_PP_SIZE > 0 else pipeline_parallel_size
+    gpus_per_sglang_engine = sglang_tp_size * sglang_pp_size
 
     global_batch_size = 2 if is_debug else 128
     if global_batch_size % data_parallel_size != 0:
@@ -156,9 +166,9 @@ def execute():
     )
     sglang_args = (
         f"--rollout-num-gpus-per-engine {gpus_per_sglang_engine} "
-        f"--sglang-tp-size {tensor_parallel_size} "
-        f"--sglang-pipeline-parallel-size {pipeline_parallel_size} "
-        f"--sglang-ep-size {expert_parallel_size} "
+        f"--sglang-tp-size {sglang_tp_size} "
+        f"--sglang-pipeline-parallel-size {sglang_pp_size} "
+        f"--sglang-ep-size {sglang_ep_size} "
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
         f"--sglang-mem-fraction-static {sglang_mem_fraction_static} "
@@ -276,6 +286,7 @@ def execute():
             "SLIME_PROFILE_FWD_BWD": os.environ.get("SLIME_PROFILE_FWD_BWD", "0"),
             "SLIME_PROFILE_BWD_DETAIL": os.environ.get("SLIME_PROFILE_BWD_DETAIL", "0"),
             "USE_TRITON_BACKWARD": os.environ.get("USE_TRITON_BACKWARD", "0"),
+            "ROW_LINEAR_ENABLE_INV": os.environ.get("SLIME_ROW_LINEAR_ENABLE_INV", "1"),
         },
     )
 

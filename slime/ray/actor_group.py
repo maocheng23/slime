@@ -57,6 +57,8 @@ class RayTrainGroup:
             "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": "1",
             **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
             **self.args.train_env_vars,
+            # TP-invariant RowParallelLinear (cross-TP support)
+            "ROW_LINEAR_ENABLE_INV": os.environ.get("ROW_LINEAR_ENABLE_INV", "0"),
         }
 
         if self.args.offload_train and self.args.train_backend == "megatron":

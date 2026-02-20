@@ -23,6 +23,10 @@ USE_RAW = os.environ.get("SLIME_USE_RAW", "1") == "1"
 USE_TP = os.environ.get("SLIME_USE_TP", "1") == "1"
 TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "4"))
 
+# SGLang TP/PP override: allows different TP/PP for SGLang vs Megatron (cross-TP)
+SGLANG_TP_SIZE = int(os.environ.get("SLIME_SGLANG_TP_SIZE", "0"))  # 0 = same as Megatron TP
+SGLANG_PP_SIZE = int(os.environ.get("SLIME_SGLANG_PP_SIZE", "0"))  # 0 = same as Megatron PP
+
 # --- PP add-on ---
 PP_SIZE = int(os.environ.get("SLIME_PP_SIZE", "1"))
 assert PP_SIZE >= 1, f"SLIME_PP_SIZE must be >= 1, got {PP_SIZE}"
@@ -54,6 +58,11 @@ def execute():
         NUM_GPUS, USE_TP, TP_SIZE, PP_SIZE
     )
     is_pp = pipeline_parallel_size > 1
+
+    # --- Cross-TP: SGLang can use a different TP/PP size ---
+    sglang_tp_size = SGLANG_TP_SIZE if SGLANG_TP_SIZE > 0 else tensor_parallel_size
+    sglang_pp_size = SGLANG_PP_SIZE if SGLANG_PP_SIZE > 0 else pipeline_parallel_size
+    gpus_per_sglang_engine_actual = sglang_tp_size * sglang_pp_size
 
     global_batch_size = 1 if is_debug else 256
     if global_batch_size % data_parallel_size != 0:
@@ -150,9 +159,9 @@ def execute():
     )
     sglang_args = (
         f"--rollout-num-gpus {NUM_GPUS} "
-        f"--rollout-num-gpus-per-engine {gpus_per_sglang_engine} "
-        f"--sglang-tp-size {tensor_parallel_size} "
-        f"--sglang-pipeline-parallel-size {pipeline_parallel_size} "
+        f"--rollout-num-gpus-per-engine {gpus_per_sglang_engine_actual} "
+        f"--sglang-tp-size {sglang_tp_size} "
+        f"--sglang-pipeline-parallel-size {sglang_pp_size} "
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
         f"--sglang-mem-fraction-static {sglang_mem_fraction_static} "
@@ -179,9 +188,7 @@ def execute():
         "--actor-num-nodes 1 "
         f"--actor-num-gpus-per-node {NUM_GPUS} "
     )
-    # --- PP add-on: colocate only for PP=1 ---
-    if pipeline_parallel_size == 1:
-        misc_args += "--colocate "
+    misc_args += "--colocate "
     # --- PP add-on: offload & buffer settings ---
     if is_pp:
         if _system_bool("SLIME_DISABLE_TRAIN_OFFLOAD", False):
@@ -218,6 +225,7 @@ def execute():
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "NCCL_NVLS_ENABLE": "0",
         "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
+        "ROW_LINEAR_ENABLE_INV": os.environ.get("SLIME_ROW_LINEAR_ENABLE_INV", "1"),
     }
     # --- PP add-on: stage-local sync + GPU-direct for vocab ---
     if is_pp:
@@ -251,7 +259,7 @@ def execute():
 
     U.execute_train(
         train_args=train_args,
-        num_gpus_per_node=NUM_GPUS if pipeline_parallel_size == 1 else NUM_GPUS * 2,
+        num_gpus_per_node=NUM_GPUS,
         megatron_model_type=MODEL_TYPE,
         extra_env_vars={
             **true_on_policy_envs,

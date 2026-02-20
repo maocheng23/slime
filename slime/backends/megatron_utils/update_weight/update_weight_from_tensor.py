@@ -57,45 +57,56 @@ class UpdateWeightFromTensor:
         self.quantization_config = quantization_config
         self.weight_version = 0
 
-        self._hf_weight_iterator = HfWeightIteratorBase.create(
-            args=args, model=model, model_name=model_name, quantization_config=quantization_config
-        )
-
         # --- PP stage-local IPC configuration (add-on for PP>1) ---
-        self._pp_size = int(
-            getattr(self.args, "sglang_pipeline_parallel_size", 0)
-            or getattr(self.args, "pipeline_model_parallel_size", 0)
-            or 1
-        )
+        # Use Megatron's PP size for stage-local decisions: the IPC groups must
+        # match Megatron's pipeline stages so each stage sends its own layers.
+        self._megatron_pp_size = int(getattr(self.args, "pipeline_model_parallel_size", 1))
+        self._sglang_pp_size = int(getattr(self.args, "sglang_pipeline_parallel_size", 0) or self._megatron_pp_size)
+        self._is_cross_pp = self._megatron_pp_size != self._sglang_pp_size
         self._use_stage_local_ipc_group = (
-            os.environ.get("SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP", "1" if self._pp_size > 1 else "0") == "1"
+            os.environ.get("SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP", "1" if self._megatron_pp_size > 1 else "0") == "1"
         )
-        if self._pp_size > 1 and self._use_stage_local_ipc_group:
+        # Cross-PP (Megatron PP != SGLang PP): stage-local IPC won't work because
+        # CUDA IPC handles from one stage's GPUs can't be accessed by SGLang workers
+        # on another stage's GPUs.  Fall back to full IPC group with PP broadcast.
+        if self._is_cross_pp and self._use_stage_local_ipc_group:
+            logger.warning(
+                "Cross-PP detected (Megatron PP=%d, SGLang PP=%d): disabling stage-local "
+                "IPC sync, falling back to PP broadcast + full IPC group.",
+                self._megatron_pp_size, self._sglang_pp_size,
+            )
+            self._use_stage_local_ipc_group = False
+            # Override env var so HfWeightIteratorDirect also uses PP broadcast
+            os.environ["SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP"] = "0"
+        if self._megatron_pp_size > 1 and self._use_stage_local_ipc_group:
             logger.warning(
                 "PP stage-local IPC tensor sync is experimental. "
                 "If rollout generate fails after update_weights, set "
                 "SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP=0."
             )
+
+        self._hf_weight_iterator = HfWeightIteratorBase.create(
+            args=args, model=model, model_name=model_name, quantization_config=quantization_config
+        )
         self._gpu_direct_for_vocab = (
-            os.environ.get("SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB", "1" if self._pp_size > 1 else "0") == "1"
+            self._use_stage_local_ipc_group
+            and os.environ.get("SLIME_TENSOR_SYNC_GPU_DIRECT_FOR_VOCAB", "1" if self._megatron_pp_size > 1 else "0") == "1"
         )
         self._ipc_gc_interval = max(
-            0, int(os.environ.get("SLIME_TENSOR_SYNC_IPC_GC_INTERVAL", "1" if self._pp_size > 1 else "0"))
+            0, int(os.environ.get("SLIME_TENSOR_SYNC_IPC_GC_INTERVAL", "1" if self._megatron_pp_size > 1 else "0"))
         )
 
         # --- Create IPC Gloo groups ---
-        # PP>1 + stage_local: group_size = tp_size (one group per PP stage)
+        # PP>1 + stage_local: one IPC group per Megatron PP stage
+        #   group_size = world_size / megatron_pp_size (all ranks in one stage)
         # Otherwise (original): group_size = rollout_num_gpus_per_engine
+        world_size = dist.get_world_size()
         if self._use_stage_local_ipc_group:
-            tp_size = int(getattr(self.args, "sglang_tp_size", 0) or 0)
-            if tp_size <= 0:
-                tp_size = max(1, self.args.rollout_num_gpus_per_engine // self._pp_size)
-            ipc_group_size = tp_size
+            ipc_group_size = world_size // self._megatron_pp_size
         else:
             ipc_group_size = self.args.rollout_num_gpus_per_engine
         self._ipc_group_size = ipc_group_size
 
-        world_size = dist.get_world_size()
         assert world_size % self._ipc_group_size == 0, (
             f"world_size ({world_size}) must be divisible by IPC group size ({self._ipc_group_size})"
         )
@@ -146,19 +157,20 @@ class UpdateWeightFromTensor:
                 )
 
         # Map current rank to its colocated IPC engine.
-        # PP>1 + stage_local: multiple IPC groups map to one engine (pp_size groups per engine).
+        # PP>1 + stage_local: multiple IPC groups map to one engine
+        #   (megatron_pp_size groups per engine).
         # Otherwise (original): one IPC group per engine.
         if self._use_stage_local_ipc_group:
             self._ipc_engine = None
             if self.rollout_engines:
                 assert self._ipc_group_index is not None
-                engine_index = self._ipc_group_index // self._pp_size
+                engine_index = self._ipc_group_index // self._megatron_pp_size
                 if engine_index < len(self.rollout_engines):
                     self._ipc_engine = self.rollout_engines[engine_index]
             if dist.get_rank() == self._ipc_gather_src:
                 assert self._ipc_engine is not None, (
                     f"Failed to map IPC source rank {dist.get_rank()} to a rollout engine "
-                    f"(group_index={self._ipc_group_index}, pp_size={self._pp_size}, "
+                    f"(group_index={self._ipc_group_index}, megatron_pp_size={self._megatron_pp_size}, "
                     f"num_rollout_engines={len(self.rollout_engines)})"
                 )
         else:
@@ -226,6 +238,7 @@ class UpdateWeightFromTensor:
             ipc_gather_group=self._ipc_gather_group,
             weight_version=self.weight_version,
             gpu_direct_for_vocab=self._gpu_direct_for_vocab,
+            target_num_payloads=self.args.rollout_num_gpus_per_engine,
         )
         all_refs.extend(refs_colocated)
 
@@ -251,6 +264,7 @@ def _send_to_colocated_engine(
     ipc_gather_group,
     weight_version,
     gpu_direct_for_vocab: bool = False,
+    target_num_payloads: int = 0,
 ) -> tuple[list[ObjectRef], Any]:
     # TODO improve
     long_live_tensors = []
@@ -264,6 +278,7 @@ def _send_to_colocated_engine(
             ipc_gather_src=ipc_gather_src,
             ipc_gather_group=ipc_gather_group,
             weight_version=weight_version,
+            target_num_payloads=target_num_payloads,
         )
 
     if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
@@ -299,6 +314,16 @@ def _send_to_colocated_engine(
 
     refs = []
     if dist.get_rank() == ipc_gather_src:
+        # For cross-PP stage-local sync, the IPC group may be smaller than the
+        # SGLang engine's TP size.  SGLang workers index by tp_rank, so pad the
+        # gathered list to target_num_payloads.  After TP all-gather all entries
+        # are identical, so replication is safe.
+        if target_num_payloads > 0 and len(serialized_named_tensors) < target_num_payloads:
+            n = len(serialized_named_tensors)
+            serialized_named_tensors = [
+                serialized_named_tensors[i % n] for i in range(target_num_payloads)
+            ]
+
         # TODO: here we assume all ranks have the same number of dtypes, not sure if that is correct.
         num_dtypes = len(serialized_named_tensors[0])
         for i in range(num_dtypes):
@@ -318,6 +343,7 @@ def _send_to_colocated_engine(
 
 def _send_gpu_direct(
     hf_named_tensors, *, ipc_engine, ipc_gather_src, ipc_gather_group, weight_version,
+    target_num_payloads: int = 0,
 ) -> tuple[list[ObjectRef], list]:
     """Send per-tensor CUDA IPC handles (used for vocab/lm_head in PP>1)."""
     long_live_tensors = [tensor for _, tensor in hf_named_tensors]
@@ -327,6 +353,10 @@ def _send_gpu_direct(
 
     refs = []
     if dist.get_rank() == ipc_gather_src:
+        # Pad to target size for SGLang TP workers (same as flattened bucket path)
+        if target_num_payloads > 0 and len(gathered) < target_num_payloads:
+            n = len(gathered)
+            gathered = [gathered[i % n] for i in range(target_num_payloads)]
         refs.append(
             ipc_engine.update_weights_from_tensor.remote(
                 serialized_named_tensors=gathered, load_format=None, weight_version=str(weight_version),
