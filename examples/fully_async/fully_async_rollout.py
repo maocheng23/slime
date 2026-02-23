@@ -14,6 +14,31 @@ _global_worker = None
 _worker_lock = threading.Lock()
 
 
+def _get_sample_weight_version(group: list[Sample]) -> int | None:
+    """Extract the maximum weight version from a group of samples.
+
+    Returns None when no version is recorded (e.g. first rollout before any
+    weight update has been broadcast).
+    """
+    for sample in group:
+        if sample.weight_versions:
+            try:
+                return max(int(v) for v in sample.weight_versions)
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def _current_weight_version(rollout_id: int, update_weights_interval: int) -> int:
+    """Estimate the training-side weight version from the rollout step.
+
+    The actor increments weight_version once every ``update_weights_interval``
+    rollout steps, so the latest version visible to the rollout engines is
+    ``rollout_id // update_weights_interval``.
+    """
+    return rollout_id // update_weights_interval
+
+
 def get_global_worker(args, data_buffer):
     """Get or create global worker"""
     global _global_worker
@@ -161,9 +186,15 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
     data = []
     completed_groups = {}
     do_print = True
+    stale_discarded = 0
+
+    max_staleness = getattr(args, "rollout_max_staleness", None)
+    cur_wv = _current_weight_version(rollout_id, args.update_weights_interval) if max_staleness else None
 
     print(f"Starting async rollout generation for {target_data_size} groups")
     print(f"Global worker queue size: {worker.get_queue_size()}")
+    if max_staleness is not None:
+        print(f"Staleness control enabled: max_staleness={max_staleness}, current_weight_version={cur_wv}")
 
     # Main loop: collect results from global worker's output queue
     start_time = time.time()
@@ -207,8 +238,19 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
                     print(f"Returned aborted group {group_id} to data buffer", flush=True)
                 except Exception as e:
                     print(f"Failed to return aborted group {group_id} to buffer: {e}", flush=True)
-                # don't count as processed for training
                 continue
+
+            # Staleness check: drop groups generated with a weight version
+            # that is too far behind the current training weight version.
+            if max_staleness is not None and cur_wv is not None:
+                sample_wv = _get_sample_weight_version(group)
+                if sample_wv is not None and cur_wv - sample_wv > max_staleness:
+                    stale_discarded += 1
+                    try:
+                        data_buffer.add_samples([group])
+                    except Exception:
+                        pass
+                    continue
 
             if do_print:
                 print(
@@ -218,7 +260,6 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
                 )
                 do_print = False
 
-            # Simplified: directly add samples, no filters used
             data.append(group)
             processed_any = True
 
@@ -238,6 +279,14 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
 
     duration = time.time() - start_time
     print(f"Rollout completed in {duration:.2f}s! Global worker queue size: {worker.get_queue_size()}")
+    if stale_discarded > 0:
+        total_seen = len(data) + stale_discarded
+        pct = stale_discarded / total_seen * 100 if total_seen else 0
+        print(
+            f"Staleness control: discarded {stale_discarded}/{total_seen} groups "
+            f"({pct:.1f}%) due to weight-version lag > {max_staleness}",
+            flush=True,
+        )
 
     if data:
         print(

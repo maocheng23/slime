@@ -404,6 +404,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Interval for updating the weights",
             )
             parser.add_argument(
+                "--rollout-max-staleness",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum allowed staleness (in weight-version lag) for rollout samples. "
+                    "Samples generated with a weight version more than this many updates behind "
+                    "the current training weight version will be discarded. "
+                    "Only effective with async training (train_async.py / fully_async). "
+                    "If None (default), no staleness filtering is applied."
+                ),
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",
