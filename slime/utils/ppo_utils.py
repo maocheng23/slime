@@ -169,16 +169,16 @@ def compute_log_probs(
             if vocab_size is not None and full_logits.size(-1) > vocab_size:
                 full_logits = full_logits[..., :vocab_size]
             
-            log_probs = torch.log_softmax(full_logits.float(), dim=-1)
+            log_probs = torch.log_softmax(full_logits, dim=-1)
             gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
-            
-            return gathered.float()
+
+            return gathered
         else:
             if vocab_size is not None and logits.size(-1) > vocab_size:
                 logits = logits[..., :vocab_size]
-            log_probs = torch.log_softmax(logits.float(), dim=-1)
+            log_probs = torch.log_softmax(logits, dim=-1)
             gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
-            return gathered.float()
+            return gathered
     else:
         from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 

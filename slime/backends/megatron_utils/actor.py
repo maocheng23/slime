@@ -58,6 +58,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         init(args)
 
+        self._enable_true_on_policy_optimizations(args)
+
         if is_megatron_main_rank():
             init_tracking(args, primary=False)
 
@@ -155,6 +157,27 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof.on_init_end()
 
         return start_rollout_id
+
+    def _enable_true_on_policy_optimizations(self, args):
+        if getattr(args, "true_on_policy_mode", False):
+            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
+
+            logger.info("MegatronTrainRayActor call enable_batch_invariant_mode for true-on-policy")
+            enable_batch_invariant_mode(enable_bmm=False)
+
+            # Also patch TransformerEngine's general_gemm and RMSNorm to use
+            # batch-invariant kernels. SGLang's enable_batch_invariant_mode only
+            # patches aten ops, but TE layers (used by MoE experts and full
+            # attention) go through TE's own GEMM path, bypassing aten::mm.
+            try:
+                from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                    _te_patch_for_batch_invariant,
+                )
+
+                _te_patch_for_batch_invariant()
+                logger.info("MegatronTrainRayActor patched TE kernels for true-on-policy")
+            except ImportError:
+                logger.warning("Could not import TE batch-invariant patches")
 
     @timer
     def sleep(self) -> None:

@@ -99,6 +99,58 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
+async def _recompute_logprobs_via_prefill(
+    args: Namespace, full_token_ids: list[int], prompt_len: int
+) -> list[float] | None:
+    """Send the full sequence back to SGLang as a prefill-only request to get
+    logprobs computed via the prefill (chunk) kernel instead of decode
+    (fused_recurrent). This ensures rollout logprobs match Megatron's prefill
+    path for architectures like GDN where prefill and decode kernels diverge.
+
+    Returns a list of logprobs for the response tokens, or None on failure.
+    """
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    # Start 1 position earlier so the first (always-None) logprob falls on
+    # the last prompt token, and all response tokens get valid logprobs.
+    logprob_start = max(prompt_len - 1, 0)
+    payload = {
+        "input_ids": full_token_ids,
+        "sampling_params": {"max_new_tokens": 0, "temperature": 1.0},
+        "return_logprob": True,
+        "logprob_start_len": logprob_start,
+    }
+    try:
+        print(f"[PREFILL] Sending prefill request: {len(full_token_ids)} tokens, logprob_start={logprob_start}", flush=True)
+        output = await post(url, payload)
+        print(f"[PREFILL] Got response, meta_info keys: {list(output['meta_info'].keys())}", flush=True)
+        input_logprobs = output["meta_info"].get("input_token_logprobs", [])
+        print(f"[PREFILL] input_logprobs len={len(input_logprobs)}, skip_count={prompt_len - logprob_start}, first_3={input_logprobs[:3]}", flush=True)
+        # SGLang returns None logprob for the first token in the range.
+        # By starting at prompt_len-1, the None falls on the last prompt token.
+        # Skip prompt items and collect only response token logprobs.
+        skip_count = prompt_len - logprob_start  # number of prompt items to skip
+        response_logprobs = []
+        for item in input_logprobs[skip_count:]:
+            if item is None or item[0] is None:
+                continue
+            response_logprobs.append(item[0])
+        expected_count = len(full_token_ids) - prompt_len
+        if len(response_logprobs) == expected_count:
+            print(f"[PREFILL] Returning {len(response_logprobs)} logprobs, first_3={response_logprobs[:3]}", flush=True)
+            return response_logprobs
+        else:
+            logger.warning(
+                f"Prefill logprob count mismatch: got {len(response_logprobs)}, "
+                f"expected {expected_count} (input_logprobs len={len(input_logprobs)}, "
+                f"logprob_start={logprob_start}, skip_count={skip_count})"
+            )
+    except Exception as e:
+        print(f"[PREFILL] Exception: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+    return None
+
+
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
     if args.ci_test:
@@ -168,6 +220,20 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.tokens = sample.tokens + new_response_tokens
         sample.response_length += len(new_response_tokens)
         sample.response += output["text"]
+
+        # For true-on-policy mode, recompute logprobs via prefill to avoid
+        # prefill-vs-decode kernel divergence (e.g. GDN chunk vs fused_recurrent).
+        _top_mode = getattr(args, "true_on_policy_mode", False)
+        logger.info(f"[DEBUG] true_on_policy_mode={_top_mode}, new_response_tokens_len={len(new_response_tokens)}")
+        if _top_mode and new_response_tokens:
+            prefill_log_probs = await _recompute_logprobs_via_prefill(
+                args, sample.tokens, len(prompt_ids)
+            )
+            if prefill_log_probs is not None:
+                print(f"[PREFILL] Using prefill logprobs (len={len(prefill_log_probs)}) instead of decode (len={len(new_response_log_probs)})", flush=True)
+                new_response_log_probs = prefill_log_probs
+            else:
+                print(f"[PREFILL] prefill_log_probs is None, falling back to decode logprobs", flush=True)
 
         if sample.rollout_log_probs is None:
             sample.rollout_log_probs = []
