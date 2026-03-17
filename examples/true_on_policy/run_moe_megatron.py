@@ -244,6 +244,7 @@ def execute():
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
         "MEGATRON_DETERMINISTIC_FORWARD_ONLY": "1",
+        "MEGATRON_ROPE_BF16": "1",
     }
     # --- PP add-on: stage-local sync + GPU-direct for vocab ---
     if is_pp:

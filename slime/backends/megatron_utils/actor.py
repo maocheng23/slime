@@ -1,3 +1,4 @@
+import sys; sys.path.insert(0, "/root/slime"); import dump_per_layer  # noqa
 import logging
 import os
 import random
@@ -96,6 +97,70 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
         self.parallel_state = MegatronParallelState(model=self.model)
+        # === PER-LAYER DUMP: register hooks on existing model ===
+        import os as _plos
+        if _plos.environ.get("SLIME_DUMP_PER_LAYER", "0") == "1":
+            import torch.distributed as _pldist
+            _plrank = _pldist.get_rank() if _pldist.is_initialized() else 0
+            if _plrank == 0:
+                _pldir = "/root/slime/per_layer_dump"
+                _plos.makedirs(_pldir, exist_ok=True)
+                _plcount = [0]
+                _plmodel = self.model[0] if isinstance(self.model, list) else self.model
+                _pllayers = [(n, m) for n, m in _plmodel.named_modules() if m.__class__.__name__ == "TransformerLayer"]
+                _pltotal = len(_pllayers)
+                for _pli, (_pln, _plm) in enumerate(_pllayers):
+                    def _mk(idx, total=_pltotal, dd=_pldir, cnt=_plcount):
+                        def _hk(mod, inp, out):
+                            if cnt[0] >= total:
+                                return
+                            import torch as _t
+                            hs = out[0] if isinstance(out, tuple) else out
+                            _t.save(hs.detach().cpu().clone(), f"{dd}/megatron_layer_{idx:02d}.pt")
+                            if idx == 0:
+                                inp_hs = inp[0] if isinstance(inp, (tuple, list)) else inp
+                                _t.save(inp_hs.detach().cpu().clone(), f"{dd}/megatron_layer_input.pt")
+                                print(f"[PER_LAYER_DUMP] Dumping {total} layers", flush=True)
+                            cnt[0] += 1
+                            if cnt[0] == total:
+                                print(f"[PER_LAYER_DUMP] Done: {total} layers to {dd}/", flush=True)
+                        return _hk
+                    _plm.register_forward_hook(_mk(_pli))
+                for _pln2, _plm2 in _plmodel.named_modules():
+                    if _plm2.__class__.__name__ == "TransformerLayer":
+                        pass
+                print(f"[PER_LAYER_DUMP] Registered {_pltotal} hooks. Layer classes found:", flush=True)
+                _clscounts = {}
+                for _n3, _m3 in _plmodel.named_modules():
+                    cn = _m3.__class__.__name__
+                    _clscounts[cn] = _clscounts.get(cn, 0) + 1
+                for cn, cnt in sorted(_clscounts.items(), key=lambda x: -x[1])[:10]:
+                    print(f"  {cn}: {cnt}", flush=True)
+
+
+        # === WEIGHT DUMP: Save Megatron model weights for parity check ===
+        import os as _wos
+        if _wos.environ.get("SLIME_DUMP_LAYERS", "") == "1":
+            import torch.distributed as _wdist
+            _wrank = _wdist.get_rank() if _wdist.is_initialized() else 0
+            if _wrank == 0:
+                _wdd = "/root/slime/weight_dumps"
+                _wos.makedirs(_wdd, exist_ok=True)
+                _wm = self.model[0] if isinstance(self.model, list) else self.model
+                _wsd = {}
+                for _wn, _wp in _wm.named_parameters():
+                    _wsd[_wn] = (_wp.dtype, list(_wp.shape), _wp.data.flatten()[:5].tolist())
+                torch.save(_wsd, f"{_wdd}/megatron_weight_info.pt")
+                # Also save a few actual weight tensors for direct comparison
+                _key_params = {}
+                for _wn, _wp in _wm.named_parameters():
+                    if any(k in _wn for k in ["embedding.word_embeddings", "layers.0.self_attention", "layers.0.input_layernorm", "layers.0.pre_mlp_layernorm", "final_layernorm", "output_layer"]):
+                        _key_params[_wn] = _wp.data.detach().cpu().clone()
+                torch.save(_key_params, f"{_wdd}/megatron_key_weights.pt")
+                print(f"[WEIGHT_DUMP] Saved {len(_wsd)} param infos and {len(_key_params)} key weights to {_wdd}/", flush=True)
+                for _wn in sorted(_key_params.keys())[:10]:
+                    _wp = _key_params[_wn]
+                    print(f"  {_wn}: dtype={_wp.dtype}, shape={list(_wp.shape)}, first5={_wp.flatten()[:5].tolist()}", flush=True)
 
         if role == "critic":
             if self.args.offload_train:

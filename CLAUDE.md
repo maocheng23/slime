@@ -371,11 +371,21 @@ These produce **different floating-point results**. Both sides MUST use `moe_sum
 - **Expected logprobs_abs_diff: EXACTLY 0** (no GDN, no FA3 prefill/decode issue)
 - Any non-zero diff is a real bug, not an inherent limitation
 - Run script: `examples/true_on_policy/run_moe_megatron.py`
-- **Current status (2026-03-15)**: Step 0 diff reduced from ~0.002 to ~1.78e-05 by fixing RoPE bf16→float32 in `rope_utils.py`. Remaining diff under investigation.
-- **Fixed**: RoPE in `_apply_rotary_pos_emb_bshd` was computing in bf16 while SGLang uses float32. Fix: `rope_utils.py` lines 122-128.
-- **Verified identical**: All kernels (TP=1, TP=8), QKV all-gather path, RMSNorm, log_softmax, temperature, QKV fused vs separate.
-- **Remaining ~1.78e-05**: Source unknown. All isolated component tests pass bitwise. Must be in the full model wiring (actual TransformerLayer composition).
-- **Dtype flow is clean**: All RMSNorm outputs bf16, all linear inputs bf16. No mixed-dtype issues.
+- **Current status (2026-03-17)**: `logprob_abs_diff = 0.0` — EXACTLY ZERO at TP=8, EP=8. All stages bitwise identical.
+- **Fixed (2026-03-17)** — Root causes found and fixed via layer-by-layer dump comparison:
+  1. **SGLang-side CUDA graph crashes**: Debug prints with `.tolist()`/`.detach().float()` in `logits_processor.py` — guarded with `is_current_stream_capturing()`
+  2. **DeepGEMM alignment**: N,K must be multiples of 128. Added gate in `batch_invariant_ops.py`
+  3. **Mixed dtype in `mm_batch_invariant`**: cast to bf16 when dtypes differ (safety guard)
+  4. **Mixed dtype in `FusedExpertsFunction.forward`**: cast hidden_states to `w1.dtype` before `fused_experts_impl`
+  5. **SGLang `RowParallelLinear.forward`**: tree_all_reduce with CUDA graph guard
+  6. **SGLangRMSNorm fp32 output**: `fp32_weight * bf16_x → fp32`. Fix: cast output to `orig_dtype` when dtypes differ
+  7. **QKV TP sharding when `num_kv_heads < TP`**: Megatron uses group-based sharding (640-dim per rank), SGLang uses KV-head replication (768-dim per rank). Fix: after all-gather in `get_query_key_value_tensors`, re-index to match SGLang's per-rank Q/K/V assignment (`attention.py`)
+  8. **SGLangQKRMSNorm computation path**: MoE: `bf16_weight * bf16_x` (matching SGLang bf16 weight). Dense: `fp32_weight * bf16_x` (matching SGLang fp32 weight). Gated by `MEGATRON_ROPE_BF16` env var.
+  9. **RoPE bf16 vs fp32**: SGLang MoE uses `_apply_rotary_emb` (bf16 cos/sin). Dense uses `apply_rotary_pos_emb_native` (fp32). Fix: `MEGATRON_ROPE_BF16=1` in `rope_utils.py` (MoE only)
+  10. **RowParallelLinear matmul kernel**: Both sides use `matmul_tp_persistent` (TP-invariant) when `ROW_LINEAR_ENABLE_INV=1`. SGLang enables via `is_tp_invariant_mode_enabled()` + `torch.ops.tp_inv_ops.matmul_tp_inv`. Megatron uses same kernel directly.
+- **Key architectural difference (num_kv_heads < TP)**: Qwen3-30B-A3B has `num_kv_heads=4, TP=8`. SGLang replicates KV heads (each rank has 1 complete KV head), Megatron uses partial group sharding. The QKV re-index fix in `attention.py` handles this by extracting from the all-gathered QKV using SGLang's assignment.
+- **RoPE difference between dense and MoE**: Dense model uses `apply_rotary_pos_emb_native` (fp32). MoE model uses `_apply_rotary_emb` via `RotaryEmbedding.forward_native` (bf16 cos/sin). Both SGLang paths are controlled by `rl_on_policy_target is not None` → `forward_native`, but the actual rotation function differs.
+- **Dump comparison methodology**: Compare first N matching tokens (match via embedding identity). Megatron `after_attn` is post-allreduce, SGLang `after_attn` is pre-allreduce — use `moe_input` for fair post-allreduce comparison. Megatron dumps must use rank-0-only filter (`debug_dump.py`).
 
 ### Qwen3-Next (Hybrid GDN + Full Attention + MoE)
 - **Layer types**: `config.layers_block_type` — e.g., `["linear_attention", "linear_attention", "linear_attention", "attention"]`
@@ -389,7 +399,8 @@ These produce **different floating-point results**. Both sides MUST use `moe_sum
 
 ### Dense Models (Qwen3-0.6B)
 - Run script: `examples/true_on_policy/run_simple_megatron.py` (with `--sglang-fp32-residual`)
-- **Current status (2026-03-16)**: Layer-level dump comparison shows divergence starts at **QK-Norm** (RMSNorm on Q/K). Root cause identified: QK-Norm weight precision mismatch (fp32 vs bf16).
+- **Current status (2026-03-17)**: `logprob_abs_diff = 0.0` — EXACTLY ZERO at TP=8. All stages bitwise identical.
+- Uses `rl_on_policy_target="fsdp"`, `fp32_residual=True`, NO `MEGATRON_ROPE_BF16` (fp32 RoPE matches SGLang's `apply_rotary_pos_emb_native`)
 - Unit tests: `scripts/test_dense_layer_alignment.py`, `scripts/test_dense_full_model.py`
 - Compare script: `scripts/compare_dense_dumps.py` (layout-aware, handles interleaved vs concatenated QKV)
 
@@ -439,6 +450,43 @@ elif get_global_server_args().rl_on_policy_target == 'fsdp_tp':
 #### Previous Issues (Fixed)
 - **MLP dtype mismatch**: `x = x.bfloat16()` was commented out in `Qwen2MLP.forward` — now uncommented
 - **TransformerLayer residual flow**: SGLang uses `fp32_residual=True` (residual add inside norm in fp32), Megatron uses fused `SGLangLayerNormColumnParallelLinear` with residual support
+
+## Regression Rule: Do Not Break Previously Verified Models
+
+**Every SGLang/Megatron code change must not regress previously verified models.** The verified test matrix is:
+
+| Model | TP | Expected logprobs_abs_diff | Run Command |
+|-------|----|---------------------------|-------------|
+| Qwen3-0.6B (dense) | TP=1 | ~1e-05 (FA prefill/decode) | `run_simple_megatron.py` |
+| Qwen3-0.6B (dense) | TP=8 | ~1e-05 (FA prefill/decode) | `run_simple_megatron.py` |
+| Qwen3-30B-A3B (MoE) | TP=8, EP=8 | EXACTLY 0 | `run_moe_megatron.py` |
+| Qwen3-Next (GDN) | TP=8, EP=8 | >0 (GDN kernel only) | `run_qwen3_next_megatron.py` |
+
+Before merging any fix:
+1. Re-run `run_simple_megatron.py` in `debug_one_sample` mode and verify `logprobs_abs_diff ≈ 1e-05`
+2. Re-run `run_moe_megatron.py` in `debug_one_sample` mode and verify `logprobs_abs_diff == 0.0`
+
+**CRITICAL for SGLang forward-pass changes**: Any change to `linear.py`, `logits_processor.py`, `communicator.py`, `batch_invariant_ops.py`, or model files affects ALL models. Run BOTH `run_simple_megatron.py` and `run_moe_megatron.py`.
+
+### Missing Unit Tests (Known Gaps — Need to Write)
+
+These scenarios are verified only via E2E runs. Writing unit tests for them would catch regressions faster:
+
+| Missing Test | What It Should Cover | Priority |
+|-------------|---------------------|---------|
+| `test_dense_tp8_allreduce.py` | `RowParallelLinear.forward` at TP=8 uses `tensor_model_parallel_tree_all_reduce` when `fsdp_tp`, NOT NCCL. Root cause of TP=8 dense divergence. | HIGH |
+| `test_dense_moe_cuda_graph.py` | `tree_all_reduce_sum` is NOT CUDA-graph-capturable. Verify guard `not torch.cuda.is_current_stream_capturing()` in `linear.py` prevents crash. | HIGH |
+| `test_deepgemm_alignment.py` | DeepGEMM requires N,K multiple of 128. Test that `matmul_persistent` falls back to Triton for `N=18992` (vocab_size/TP). | HIGH |
+| `test_debug_prints_cuda_graph.py` | Debug prints with `.tolist()` inside forward must be guarded with `is_current_stream_capturing()`. | MEDIUM |
+| `test_dense_tp2_vs_tp8.py` | TP=2 masks allreduce bugs (a+b==b+a), but TP=8 exposes them. Test that tree allreduce at TP=8 matches TP=1 exactly (vs NCCL which does not). | HIGH |
+
+**Why TP=2 masks allreduce bugs**: For TP=2, any allreduce of `[a, b]` gives `a+b == b+a` (fp32 is commutative for 2 operands). For TP=8, different pairings give different results. Always test at TP=4 or TP=8, not just TP=2.
+
+**CUDA graph incompatible operations** (must guard with `is_current_stream_capturing()`):
+- `tensor.tolist()` / `tensor.item()` — CPU sync
+- `dist.all_gather()` / `dist.all_reduce()` — NCCL ops (unless captured ahead of time)
+- `torch.zeros_like()` — memory allocation
+- Any `print()` with tensor data extraction
 
 ## Debugging True-On-Policy Issues
 
