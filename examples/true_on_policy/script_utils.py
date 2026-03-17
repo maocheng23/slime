@@ -58,7 +58,8 @@ def build_debug_envs(mode: str, system_env) -> dict[str, str]:
     """Debug-only environment variables keyed on MODE == 'debug_one_sample'."""
     is_debug = mode == "debug_one_sample"
     return {
-        "SGLANG_DUMPER_ENABLE": "1" if is_debug else "0",
+        "SGLANG_DUMPER_ENABLE": os.environ.get("SGLANG_DUMPER_ENABLE", "1" if is_debug else "0"),
+        "SLIME_DEBUG_LAYER_DUMP": os.environ.get("SLIME_DEBUG_LAYER_DUMP", "1" if is_debug else "0"),
         "SGLANG_TEMP_UTILS_ENABLE_DEBUG_PRINT": "1" if is_debug else "0",
         "SLIME_DEBUG_ROUTER": "1" if is_debug else "0",
         "SLIME_DEBUG_ATTN": "1" if is_debug else "0",

@@ -84,6 +84,17 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
         if partition_dim == 0:
             partition_dim = 1
     param = torch.cat(param_partitions, dim=partition_dim)
+    if "linear_qkv.weight" in name and "layers.0." in name:
+        import torch.distributed as _dist_ag
+        _r_ag = _dist_ag.get_rank() if _dist_ag.is_initialized() else 0
+        if _r_ag == 0:
+            _flat = param.float().reshape(-1)
+            print(f"[DBG_QKV] all_gather layer0 linear_qkv: shape={list(param.shape)} "
+                  f"partition_dim={partition_dim} partition_stride={partition_stride} tp_size={tp_size} "
+                  f"first10={_flat[:10].tolist()} norm={_flat.norm().item():.6f}", flush=True)
+            for i, p in enumerate(param_partitions):
+                _pf = p.float().reshape(-1)
+                print(f"[DBG_QKV]   rank{i}: shape={list(p.shape)} first5={_pf[:5].tolist()}", flush=True)
     return param
 
 
@@ -159,6 +170,17 @@ def all_gather_params_async(
                 if partition_dim == 0:
                     partition_dim = 1
             param = torch.cat(param_partitions, dim=partition_dim)
+            if "linear_qkv.weight" in info.name and "layers.0." in info.name:
+                import torch.distributed as _dist_ag2
+                _r_ag2 = _dist_ag2.get_rank() if _dist_ag2.is_initialized() else 0
+                if _r_ag2 == 0:
+                    _flat2 = param.float().reshape(-1)
+                    print(f"[DBG_QKV] all_gather_async layer0 linear_qkv: shape={list(param.shape)} "
+                          f"partition_dim={partition_dim} partition_stride={partition_stride} tp_size={len(param_partitions)} "
+                          f"first10={_flat2[:10].tolist()} norm={_flat2.norm().item():.6f}", flush=True)
+                    for i, p in enumerate(param_partitions):
+                        _pf2 = p.float().reshape(-1)
+                        print(f"[DBG_QKV]   rank{i}: shape={list(p.shape)} first5={_pf2[:5].tolist()}", flush=True)
 
         gathered_params.append(param)
 

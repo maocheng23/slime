@@ -223,6 +223,7 @@ def execute():
         "--true-on-policy-model qwen3_next "
         "--deterministic-mode "
         "--true-on-policy-mode "
+        "--recompute-logprobs-via-prefill "
         "--use-cpu-initialization "
         "--no-rope-fusion "
     )

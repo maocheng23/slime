@@ -23,12 +23,30 @@ def convert_qwen2_to_hf(args, name, param):
         if rest == "self_attention.linear_proj.weight":
             return [(f"model.layers.{layer_idx}.self_attn.o_proj.weight", param)]
         elif rest == "self_attention.linear_qkv.weight":
+            if layer_idx == "0":
+                import torch.distributed as _dist_qkv
+                _r_qkv = _dist_qkv.get_rank() if _dist_qkv.is_initialized() else 0
+                if _r_qkv == 0:
+                    _flat = param.float().reshape(-1)
+                    print(f"[DBG_QKV] convert_qwen2_to_hf layer0: param_shape={list(param.shape)} "
+                          f"num_query_groups={args.num_query_groups} value_num_per_group={value_num_per_group} "
+                          f"head_dim={head_dim} hidden_size={args.hidden_size} "
+                          f"first10={_flat[:10].tolist()} norm={_flat.norm().item():.6f}", flush=True)
 
             param = param.view(args.num_query_groups, -1, head_dim, args.hidden_size)
             q_param, k_param, v_param = torch.split(param, split_size_or_sections=[value_num_per_group, 1, 1], dim=1)
             q_param = q_param.reshape(-1, args.hidden_size)
             k_param = k_param.reshape(-1, args.hidden_size)
             v_param = v_param.reshape(-1, args.hidden_size)
+
+            if layer_idx == "0":
+                import torch.distributed as _dist_qkv2
+                _r_qkv2 = _dist_qkv2.get_rank() if _dist_qkv2.is_initialized() else 0
+                if _r_qkv2 == 0:
+                    print(f"[DBG_QKV] layer0 q_proj: shape={list(q_param.shape)} first5={q_param.float().reshape(-1)[:5].tolist()}", flush=True)
+                    print(f"[DBG_QKV] layer0 k_proj: shape={list(k_param.shape)} first5={k_param.float().reshape(-1)[:5].tolist()}", flush=True)
+                    print(f"[DBG_QKV] layer0 v_proj: shape={list(v_param.shape)} first5={v_param.float().reshape(-1)[:5].tolist()}", flush=True)
+
             return [
                 (f"model.layers.{layer_idx}.self_attn.q_proj.weight", q_param),
                 (f"model.layers.{layer_idx}.self_attn.k_proj.weight", k_param),

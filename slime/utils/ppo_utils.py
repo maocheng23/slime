@@ -1,6 +1,7 @@
 # Adapt from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/models/utils.py
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
+import os
 from argparse import Namespace
 
 import torch
@@ -163,20 +164,42 @@ def compute_log_probs(
 
     if true_on_policy_mode:
         if tp_size > 1:
-            from megatron.core.tensor_parallel import gather_from_tensor_model_parallel_region
-            full_logits = gather_from_tensor_model_parallel_region(logits.contiguous(), group=process_group)
-            
+            _rank = dist.get_rank(process_group) if process_group is not None else 0
+            _partial = logits.contiguous()
+
+            print(f"[DBG_TP8] MEGATRON compute_log_probs rank={_rank} tp_size={tp_size} "
+                  f"partial_logits shape={list(_partial.shape)} dtype={_partial.dtype} "
+                  f"vocab_size={vocab_size} "
+                  f"partial[0,:5]={_partial[0,:5].tolist()}")
+
+            # Megatron's ColumnParallelLinear partitions the PADDED vocab across TP ranks,
+            # so we must all_gather full padded partitions first, then truncate to vocab_size.
+            # Trimming per-rank BEFORE all_gather would misalign rank1's vocab offset.
+            all_parts = [torch.empty_like(_partial) for _ in range(tp_size)]
+            dist.all_gather(all_parts, _partial.contiguous(), group=process_group)
+            full_logits = torch.cat(all_parts, dim=-1)
+
             if vocab_size is not None and full_logits.size(-1) > vocab_size:
                 full_logits = full_logits[..., :vocab_size]
-            
-            log_probs = torch.log_softmax(full_logits, dim=-1)
+
+            print(f"[DBG_TP8] MEGATRON full_logits rank={_rank} "
+                  f"shape={list(full_logits.shape)} dtype={full_logits.dtype} "
+                  f"full[0,:5]={full_logits[0,:5].tolist()} "
+                  f"full[0,-5:]={full_logits[0,-5:].tolist()}")
+
+            full_logits_f = full_logits.float()
+            log_probs = torch.log_softmax(full_logits_f, dim=-1)
             gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
+
+            print(f"[DBG_TP8] MEGATRON gathered_logprobs rank={_rank} "
+                  f"tokens={tokens.tolist()} gathered={gathered.tolist()}")
 
             return gathered
         else:
             if vocab_size is not None and logits.size(-1) > vocab_size:
                 logits = logits[..., :vocab_size]
-            log_probs = torch.log_softmax(logits, dim=-1)
+            # Cast to float32 to match SGLang's logprob path
+            log_probs = torch.log_softmax(logits.float(), dim=-1)
             gathered = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
             return gathered
     else:

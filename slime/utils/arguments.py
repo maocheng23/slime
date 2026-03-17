@@ -131,6 +131,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to enable true-on-policy mode.",
             )
             parser.add_argument(
+                "--recompute-logprobs-via-prefill",
+                action="store_true",
+                default=False,
+                help="Recompute logprobs via prefill instead of using decode logprobs. "
+                "Only needed for models with prefill/decode kernel divergence (e.g. GDN).",
+            )
+            parser.add_argument(
                 "--train-env-vars",
                 type=json.loads,
                 default="{}",

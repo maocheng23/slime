@@ -221,11 +221,13 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.response_length += len(new_response_tokens)
         sample.response += output["text"]
 
-        # For true-on-policy mode, recompute logprobs via prefill to avoid
-        # prefill-vs-decode kernel divergence (e.g. GDN chunk vs fused_recurrent).
+        # Recompute logprobs via prefill only for models where prefill and decode
+        # kernels diverge numerically (e.g. GDN's chunk-prefill vs fused_recurrent-decode).
+        # Standard Transformer models (Qwen3, LLaMA, etc.) do NOT need this.
         _top_mode = getattr(args, "true_on_policy_mode", False)
-        logger.info(f"[DEBUG] true_on_policy_mode={_top_mode}, new_response_tokens_len={len(new_response_tokens)}")
-        if _top_mode and new_response_tokens:
+        _use_gdn = getattr(args, "recompute_logprobs_via_prefill", False)
+        logger.info(f"[DEBUG] true_on_policy_mode={_top_mode}, recompute_logprobs_via_prefill={_use_gdn}, new_response_tokens_len={len(new_response_tokens)}")
+        if (_top_mode and _use_gdn and new_response_tokens):
             prefill_log_probs = await _recompute_logprobs_via_prefill(
                 args, sample.tokens, len(prompt_ids)
             )

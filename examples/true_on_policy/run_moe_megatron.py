@@ -220,7 +220,7 @@ def execute():
 
     true_on_policy_args = (
         "--sglang-enable-deterministic-inference "
-        "--sglang-rl-on-policy-target fsdp "
+        "--sglang-rl-on-policy-target fsdp_tp "
         "--sglang-attention-backend fa3 "
         "--use-sglang "
         "--use-sglang-attention "

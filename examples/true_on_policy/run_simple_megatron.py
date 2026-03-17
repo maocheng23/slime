@@ -8,7 +8,7 @@ from script_utils import build_debug_envs, make_system_helpers, resolve_parallel
 # Environment configuration
 # ---------------------------------------------------------------------------
 MODEL_NAME = os.environ.get("SLIME_SCRIPT_MODEL_NAME", "Qwen3-0.6B")
-assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-4B"}
+assert MODEL_NAME in {"Qwen3-0.6B", "Qwen3-0.6B-1L", "Qwen3-4B"}
 
 MODEL_TYPE = os.environ.get("SLIME_SCRIPT_MODEL_TYPE", "qwen3-0.6B")
 assert MODEL_TYPE in {"qwen3-0.6B", "qwen3-4B"}
@@ -89,6 +89,7 @@ def execute():
         "--wandb-group qwen3-0.6B-megatron "
         f"--wandb-key {WANDB_API_KEY} "
         "--disable-wandb-random-suffix "
+        f"--wandb-mode {os.environ.get('SLIME_WANDB_MODE', 'online')} "
     )
 
     rollout_args = (
@@ -165,6 +166,7 @@ def execute():
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
         f"--sglang-mem-fraction-static {sglang_mem_fraction_static} "
+        f"{'--sglang-disable-cuda-graph ' if is_debug else ''}"
     )
 
     router_args = (
@@ -209,7 +211,7 @@ def execute():
 
     true_on_policy_args = (
         "--sglang-enable-deterministic-inference "
-        "--sglang-rl-on-policy-target fsdp "
+        "--sglang-rl-on-policy-target fsdp_tp "
         "--sglang-attention-backend fa3 "
         "--use-sglang "
         "--use-sglang-attention "
@@ -217,6 +219,7 @@ def execute():
         "--true-on-policy-mode "
         "--use-cpu-initialization "
         "--no-rope-fusion "
+        "--sglang-fp32-residual "
     )
     true_on_policy_envs = {
         # NOTE: Use "allreduce:Tree" instead of "Tree" to only affect AllReduce operations

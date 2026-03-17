@@ -637,6 +637,14 @@ def policy_loss_function(
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
 
+        import torch.distributed as _dist_lpdiff
+        _rank_lpdiff = _dist_lpdiff.get_rank() if _dist_lpdiff.is_initialized() else 0
+        _per_token_diff = (old_log_probs - rollout_log_probs).abs()
+        print(f"[DBG_TP8] LOGPROB_DIFF rank={_rank_lpdiff} "
+              f"megatron_logprobs={old_log_probs.tolist()} "
+              f"sglang_logprobs={rollout_log_probs.tolist()} "
+              f"per_token_diff={_per_token_diff.tolist()}")
+
     reported_loss = {
         "loss": loss.clone().detach(),
         "pg_loss": pg_loss.clone().detach(),
