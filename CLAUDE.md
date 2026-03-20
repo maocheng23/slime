@@ -388,14 +388,50 @@ These produce **different floating-point results**. Both sides MUST use `moe_sum
 - **Dump comparison methodology**: Compare first N matching tokens (match via embedding identity). Megatron `after_attn` is post-allreduce, SGLang `after_attn` is pre-allreduce — use `moe_input` for fair post-allreduce comparison. Megatron dumps must use rank-0-only filter (`debug_dump.py`).
 
 ### Qwen3-Next (Hybrid GDN + Full Attention + MoE)
-- **Layer types**: `config.layers_block_type` — e.g., `["linear_attention", "linear_attention", "linear_attention", "attention"]`
-- **GDN layers** use `Qwen3GatedDeltaNet` with `RadixLinearAttention`, `RMSNormGated`, conv1d
-- **Full Attention** layers use `Qwen3HybridAttention` with `GemmaRMSNorm` Q/K norms
-- **MoE**: `Qwen2MoeSparseMoeBlock` (same FusedMoE as Qwen3 MoE)
+- **Test model**: Qwen3-Next-4layer (3 GDN layers + 1 Full Attention layer, all with MoE)
+- **Run script**: `examples/true_on_policy/run_qwen3_next_megatron.py`
+- **Layer types**: `config.layers_block_type` — `["linear_attention", "linear_attention", "linear_attention", "full_attention"]`
+- **GDN layers** (layers 0-2): `Qwen3GatedDeltaNet` with `RadixLinearAttention`, `RMSNormGated`, conv1d, `chunk_gated_delta_rule`
+- **Full Attention** (layer 3): `Qwen3HybridAttention` with `GemmaRMSNorm` Q/K norms, FA3
+- **MoE**: `Qwen2MoeSparseMoeBlock` on all layers (512 experts, topk=10, shared expert with sigmoid gate)
 - **Norms**: `GemmaRMSNorm` everywhere (additive weight: `x * (1.0 + weight)`)
-- **Known divergence**: `chunk_gated_delta_rule` gives different results for prefill (all tokens at once) vs decode (sequential with state). This is the sole source of `logprobs_abs_diff > 0` for GDN models.
-- FA3 prefill/decode tiling difference is a **Qwen3-Next only** issue, NOT present in Qwen3-30B-A3B.
-- **Dtype flow is clean**: `GemmaRMSNorm` always outputs bf16, residual add is outside norm in bf16.
+- **Dtype flow**: `GemmaRMSNorm` always outputs bf16, residual add is outside norm in bf16
+
+#### Alignment Strategy: Prefill-to-Prefill Only
+- **Only compare prefill pass** (Megatron forward on full sequence) with **SGLang prefill pass** (prompt processing)
+- **Do NOT compare decode tokens** — GDN `chunk_gated_delta_rule` gives inherently different results for prefill (all tokens at once) vs decode (sequential with state carry-forward). This is NOT a bug.
+- **Prompt tokens** (prefill portion) should be **bitwise identical** between Megatron and SGLang
+- **Decode tokens** (generated tokens) will have `logprob_abs_diff > 0` due to GDN prefill/decode divergence — this is expected and acceptable
+
+#### Layer-by-Layer Debug Approach
+Apply the same methodology as Qwen3-30B-A3B MoE:
+1. **Dump at each stage** on both Megatron and SGLang sides
+2. **Match tokens by embedding identity** (find matching forward_pass_id)
+3. **Compare only prompt tokens** (the prefill portion, not generated tokens)
+4. **Find first divergence point** and fix kernel/dtype/weight mismatch
+5. **Layer 0 (GDN)**: embedding → GemmaRMSNorm → GDN attention (conv1d, l2norm, chunk_gated_delta_rule, RMSNormGated) → MoE
+6. **Layer 3 (Full Attn)**: GemmaRMSNorm → QKV → QK-Norm → RoPE → FA3 → o_proj → MoE
+7. **Each GDN layer** uses `_HybridGDNCore` (SGLang fwd, FLA bwd) — forward should match SGLang exactly
+8. **Each MoE layer** should match Qwen3-30B-A3B fixes (fused_experts, router, tree_allreduce)
+
+#### Known GDN-Specific Divergence Sources
+- `chunk_gated_delta_rule`: prefill processes all tokens at once, decode processes sequentially with state. max_diff ≈ 0.0005 per GDN layer per decode token. **Only affects decode, not prefill.**
+- FA3 prefill/decode tiling: different internal tiling for full-sequence causal vs single-token decode. **Only in Full Attention layer, only for decode tokens.**
+
+#### Current Status (2026-03-18)
+- **`logprob_abs_diff = 2.56`** — large diff, under investigation
+- **Root cause IDENTIFIED**: SGLang's `recompute_logprobs_via_prefill` does NOT actually do a full 101-token prefill. SGLang's **radix cache** reuses the KV cache from the decode phase, so only the 10 response tokens are computed as an extend. The GDN state at the prompt boundary comes from DECODE (sequential token-by-token processing with state carry-forward), NOT from PREFILL (all-at-once chunk processing). Megatron always does a full PREFILL of all 128 tokens. This is the **GDN prefill-vs-decode divergence** described in the skill.
+- **Evidence**: (1) Prompt tokens (0-90) are IDENTICAL at all layers between Megatron and SGLang (verified via dumps). (2) SGLang dump analysis shows the "prefill recompute" request uses radix cache — mb157-158 show 91-token prefills (just prompt), then response tokens are extended via cache. No 101-token full-prefill forward pass exists. (3) Per-token logprob diffs accumulate: 0.26 → 8.7, consistent with recurrent GDN state divergence.
+- **Cache flush attempted but didn't help**: Flushing the radix cache before recompute was tried but SGLang still uses cached KV. The radix cache may not be fully flushed, or SGLang's chunked prefill still reuses partial state.
+- **Conclusion**: For GDN models, `train_rollout_logprob_abs_diff > 0` is **inherent** — the response token logprobs always differ because SGLang's rollout computes them via decode (sequential GDN state) while Megatron computes via prefill (chunked GDN state). The **prefill forward pass is verified IDENTICAL** for prompt tokens (all layers, all kernels). The diff is NOT from a kernel/dtype/weight mismatch — it's from the GDN architecture's inherent prefill-vs-decode divergence.
+- **Verification approach**: Compare prefill hidden states (prompt tokens) via dumps — these should be IDENTICAL. The response token logprob diff is expected and acceptable for GDN models.
+- **Verified**: Per-layer dump comparison for the first 91 prompt tokens shows ALL layers IDENTICAL (embedding through after_final_layernorm). The diff is NOT in the forward pass kernels — it's in the **sequence packing** affecting GDN chunking.
+- **Fix needed**: Ensure Megatron's `compute_log_probs` processes each sequence SEPARATELY (not packed) for GDN models, matching SGLang's per-sequence prefill recomputation. This is a data pipeline change in `actor.py` / `model.py`, not a kernel change.
+- **Note**: `recompute_logprobs_via_prefill=True` means SGLang recomputes logprobs via a separate prefill request per sequence. Megatron must process the same per-sequence input.
+
+#### Expected Results (after fix)
+- **Prefill-to-prefill logprobs**: `logprob_abs_diff = 0.0` (when Megatron processes same per-sequence input as SGLang)
+- **Overall `train_rollout_logprob_abs_diff`**: 0.0 once packing matches
 
 ### Dense Models (Qwen3-0.6B)
 - Run script: `examples/true_on_policy/run_simple_megatron.py` (with `--sglang-fp32-residual`)

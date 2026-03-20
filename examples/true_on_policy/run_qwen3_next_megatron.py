@@ -233,6 +233,7 @@ def execute():
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "MEGATRON_USE_DETERMINISTIC_ALLREDUCE": "1",
         "MEGATRON_DETERMINISTIC_FORWARD_ONLY": "1",
+        "MEGATRON_ROPE_BF16": "1",
     }
     if is_pp:
         true_on_policy_envs["SLIME_TENSOR_SYNC_STAGE_LOCAL_GROUP"] = _system_env(
@@ -277,6 +278,8 @@ def execute():
             "ROW_LINEAR_ENABLE_INV": os.environ.get("SLIME_ROW_LINEAR_ENABLE_INV", "1"),
             "SLIME_DEBUG_LAYER_DUMP": os.environ.get("SLIME_DEBUG_LAYER_DUMP", "0"),
             "SGLANG_DEBUG_LAYER_DUMP": os.environ.get("SGLANG_DEBUG_LAYER_DUMP", "0"),
+            "SGLANG_DUMP_MAX_FWD": os.environ.get("SGLANG_DUMP_MAX_FWD", "10"),
+            "SLIME_DEBUG_DUMP_MAX_FWD": os.environ.get("SLIME_DEBUG_DUMP_MAX_FWD", "10"),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
         },
     )
