@@ -26,6 +26,10 @@ TP_SIZE = int(os.environ.get("SLIME_TP_SIZE", "1"))
 # --- PP add-on ---
 PP_SIZE = int(os.environ.get("SLIME_PP_SIZE", "1"))
 
+# --- CP (Ulysses) add-on ---
+CP_SIZE = int(os.environ.get("SLIME_CP_SIZE", "1"))
+assert CP_SIZE >= 1, f"SLIME_CP_SIZE must be >= 1, got {CP_SIZE}"
+
 # SGLang TP/EP override: allows different TP/EP for SGLang vs Megatron (cross-TP)
 SGLANG_TP_SIZE = int(os.environ.get("SLIME_SGLANG_TP_SIZE", "0"))  # 0 = same as Megatron TP
 SGLANG_EP_SIZE = int(os.environ.get("SLIME_SGLANG_EP_SIZE", "0"))  # 0 = same as Megatron EP
@@ -54,17 +58,20 @@ def prepare():
 def execute():
     is_debug = MODE == "debug_one_sample"
 
-    # --- PP add-on: pipeline parallel topology ---
+    # --- PP/CP add-on: pipeline/context parallel topology ---
     pipeline_parallel_size = PP_SIZE
+    context_parallel_size = CP_SIZE
     is_pp = pipeline_parallel_size > 1
 
     # For MoE models, SGLang requires TP >= EP
     # Use TP_SIZE from env var, default to NUM_GPUS (so TP=EP=NUM_GPUS, DP=1)
     tensor_parallel_size = TP_SIZE if USE_TP else (NUM_GPUS // pipeline_parallel_size)
-    assert NUM_GPUS % (tensor_parallel_size * pipeline_parallel_size) == 0, (
-        f"NUM_GPUS ({NUM_GPUS}) must be divisible by TP * PP ({tensor_parallel_size} * {pipeline_parallel_size})"
+    model_parallel_size = tensor_parallel_size * pipeline_parallel_size * context_parallel_size
+    assert NUM_GPUS % model_parallel_size == 0, (
+        f"NUM_GPUS ({NUM_GPUS}) must be divisible by "
+        f"TP*PP*CP ({tensor_parallel_size}*{pipeline_parallel_size}*{context_parallel_size})"
     )
-    data_parallel_size = NUM_GPUS // (tensor_parallel_size * pipeline_parallel_size)
+    data_parallel_size = NUM_GPUS // model_parallel_size
     expert_parallel_size = tensor_parallel_size
 
     # --- Cross-TP: SGLang can use a different TP/EP/PP size ---
@@ -157,9 +164,12 @@ def execute():
     tp_args = (
         f"--tensor-model-parallel-size {tensor_parallel_size} "
         f"--pipeline-model-parallel-size {pipeline_parallel_size} "
+        f"--context-parallel-size {context_parallel_size} "
         f"--expert-model-parallel-size {expert_parallel_size} "
         "--expert-tensor-parallel-size 1 "
     )
+    if context_parallel_size > 1:
+        tp_args += "--cp-comm-type a2a "
 
     sglang_mem_fraction_static = float(
         _system_env("SLIME_SGLANG_MEM_FRACTION_STATIC", "0.35" if MODEL_NAME == "Qwen3-30B-A3B" else "0.5")

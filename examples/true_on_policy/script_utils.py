@@ -35,23 +35,34 @@ def resolve_parallel_sizes(
     use_tp: bool,
     tp_size: int,
     pp_size: int,
-) -> tuple[int, int, int, int]:
-    """Resolve TP/PP/DP and rollout-engine GPU counts under a single topology.
+    cp_size: int = 1,
+) -> tuple[int, int, int, int, int]:
+    """Resolve TP/PP/CP/DP and rollout-engine GPU counts under a single topology.
 
     Returns:
-        ``(tensor_parallel_size, pipeline_parallel_size, data_parallel_size,
-        gpus_per_sglang_engine)``
+        ``(tensor_parallel_size, pipeline_parallel_size, context_parallel_size,
+        data_parallel_size, gpus_per_sglang_engine)``
     """
     pipeline_parallel_size = pp_size
     tensor_parallel_size = tp_size if use_tp else 1
-    assert tensor_parallel_size >= 1, f"tensor_parallel_size must be >= 1, got {tensor_parallel_size}"
-    assert pipeline_parallel_size >= 1, f"pipeline_parallel_size must be >= 1, got {pipeline_parallel_size}"
-    assert num_gpus % (tensor_parallel_size * pipeline_parallel_size) == 0, (
-        f"NUM_GPUS ({num_gpus}) must be divisible by TP * PP ({tensor_parallel_size} * {pipeline_parallel_size})"
+    context_parallel_size = cp_size
+    assert tensor_parallel_size >= 1
+    assert pipeline_parallel_size >= 1
+    assert context_parallel_size >= 1
+    model_parallel_size = tensor_parallel_size * pipeline_parallel_size * context_parallel_size
+    assert num_gpus % model_parallel_size == 0, (
+        f"NUM_GPUS ({num_gpus}) must be divisible by "
+        f"TP*PP*CP ({tensor_parallel_size}*{pipeline_parallel_size}*{context_parallel_size})"
     )
-    data_parallel_size = num_gpus // (tensor_parallel_size * pipeline_parallel_size)
+    data_parallel_size = num_gpus // model_parallel_size
     gpus_per_sglang_engine = tensor_parallel_size * pipeline_parallel_size
-    return tensor_parallel_size, pipeline_parallel_size, data_parallel_size, gpus_per_sglang_engine
+    return (
+        tensor_parallel_size,
+        pipeline_parallel_size,
+        context_parallel_size,
+        data_parallel_size,
+        gpus_per_sglang_engine,
+    )
 
 
 def build_debug_envs(mode: str, system_env) -> dict[str, str]:

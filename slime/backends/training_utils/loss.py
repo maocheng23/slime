@@ -70,13 +70,15 @@ def get_responses(
     logits = logits.div(args.rollout_temperature)
 
     cp_size = parallel_state.cp_size
+    # Ulysses CP keeps the full sequence on every rank — use the cp_size==1 path
+    effective_cp_size = 1 if parallel_state.is_ulysses_cp else cp_size
     end = 0
     for i, (tokens, total_length, response_length) in enumerate(
         zip(unconcat_tokens, total_lengths, response_lengths, strict=False)
     ):
         max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
 
-        if cp_size == 1:
+        if effective_cp_size == 1:
             if qkv_format == "bshd":
                 end = max_seq_len * i + total_length
                 start = end - response_length
@@ -340,7 +342,7 @@ def compute_advantages_and_returns(args: Namespace, parallel_state: ParallelStat
     if args.normalize_advantages:
         all_advs = torch.cat(advantages)
         cp_size = parallel_state.cp_size
-        if cp_size == 1:
+        if cp_size == 1 or parallel_state.is_ulysses_cp:
             all_masks = torch.cat(loss_masks)
         else:
             mask_chunks = []
@@ -856,15 +858,20 @@ def loss_function(
         loss, log = func(args, parallel_state, batch, logits, sum_of_sample_mean)
 
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
+    # For Ulysses CP every rank holds the full sequence, so the effective
+    # CP contribution to loss scaling is 1 (same as CP=1).
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
+    _is_ulysses = parallel_state.is_ulysses_cp
     if not args.calculate_per_token_loss:
         if apply_megatron_loss_scaling:
-            loss = loss * num_microbatches / global_batch_size * parallel_state.dp_cp_size
+            effective_dp_cp = parallel_state.dp_size if _is_ulysses else parallel_state.dp_cp_size
+            loss = loss * num_microbatches / global_batch_size * effective_dp_cp
         else:
             loss = loss / global_batch_size * parallel_state.dp_size
     else:
         if apply_megatron_loss_scaling:
-            loss = loss * parallel_state.cp_size
+            effective_cp = 1 if _is_ulysses else parallel_state.cp_size
+            loss = loss * effective_cp
 
     return (
         loss,

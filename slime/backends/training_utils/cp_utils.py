@@ -65,7 +65,7 @@ def get_sum_of_sample_mean(
     Calculate correct sample mean for CP
     """
     cp_size = parallel_state.cp_size
-    if cp_size == 1:
+    if cp_size == 1 or parallel_state.is_ulysses_cp:
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
@@ -132,7 +132,7 @@ def all_gather_with_cp(
     cp_group = parallel_state.cp_group
     cp_size = parallel_state.cp_size
 
-    if cp_size == 1:
+    if cp_size == 1 or parallel_state.is_ulysses_cp:
         return tensor
 
     _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length, parallel_state)
@@ -199,7 +199,9 @@ def slice_with_cp(
             tokens = F.pad(tokens, pad_tuple, value=pad_value)
         return tokens
 
-    if cp_size == 1:
+    # Ulysses CP does not split the sequence — every rank holds the full
+    # sequence and only splits attention heads inside the attention module.
+    if cp_size == 1 or parallel_state.is_ulysses_cp:
         if qkv_format == "bshd":
             pad = max_seq_len - tokens.size(0)
             tokens = pad_tokens(tokens, pad)
@@ -233,7 +235,7 @@ def slice_log_prob_with_cp(
 
     cp_size = parallel_state.cp_size
 
-    if cp_size == 1:
+    if cp_size == 1 or parallel_state.is_ulysses_cp:
         return log_prob
 
     prompt_length = total_length - response_length

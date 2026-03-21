@@ -40,6 +40,14 @@ class MegatronParallelState(ParallelState):
         self.cp_group = mpu.get_context_parallel_group()
         self.tp_group = mpu.get_tensor_model_parallel_group()
 
+        # Read cp_comm_type from the Megatron model config when available
+        if model is not None:
+            model_to_check = model[0] if isinstance(model, Sequence) else model
+            cfg = get_model_config(model_to_check)
+            self.cp_comm_type = getattr(cfg, "cp_comm_type", None)
+            if isinstance(self.cp_comm_type, list):
+                self.cp_comm_type = self.cp_comm_type[0]
+
         self.is_pp_last_stage = mpu.is_pipeline_last_stage()
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
         if vpp_size is None:

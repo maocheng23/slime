@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from typing import Optional
+
 import torch.distributed as dist
 
 
@@ -9,6 +11,7 @@ class ParallelState:
     dp_size: int
     cp_rank: int
     cp_size: int
+    cp_comm_type: Optional[str]
     dp_cp_rank: int
     dp_cp_size: int
     dp_group: dist.ProcessGroup | None
@@ -28,3 +31,9 @@ class ParallelState:
         self.vpp_size = 1
         self.microbatch_group_size_per_vp_stage = None
         self.is_pp_last_stage = True
+        self.cp_comm_type = None
+
+    @property
+    def is_ulysses_cp(self) -> bool:
+        """True when using Ulysses (a2a) context parallelism."""
+        return self.cp_size > 1 and self.cp_comm_type == "a2a"

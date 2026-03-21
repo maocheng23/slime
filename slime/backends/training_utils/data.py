@@ -149,8 +149,11 @@ def get_batch(
             tokens = F.pad(tokens, (0, pad), value=pad_token_id)
             cu_seqlens.append(cu_seqlens[-1] + pad)
 
-        # thd requires the cu_seqlens to be of the origin length
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int).cuda() * cp_size
+        # For standard CP the cu_seqlens are scaled by cp_size because each
+        # rank holds only a fraction of the sequence.  Ulysses CP keeps the
+        # full sequence on every rank, so no scaling is needed.
+        cp_scale = 1 if parallel_state.is_ulysses_cp else cp_size
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int).cuda() * cp_scale
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
         tokens = tokens.unsqueeze(0)

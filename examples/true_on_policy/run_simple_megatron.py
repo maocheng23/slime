@@ -31,6 +31,10 @@ SGLANG_PP_SIZE = int(os.environ.get("SLIME_SGLANG_PP_SIZE", "0"))  # 0 = same as
 PP_SIZE = int(os.environ.get("SLIME_PP_SIZE", "1"))
 assert PP_SIZE >= 1, f"SLIME_PP_SIZE must be >= 1, got {PP_SIZE}"
 
+# --- CP (Ulysses) add-on ---
+CP_SIZE = int(os.environ.get("SLIME_CP_SIZE", "1"))
+assert CP_SIZE >= 1, f"SLIME_CP_SIZE must be >= 1, got {CP_SIZE}"
+
 WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "")
 assert WANDB_API_KEY != "", "WANDB_API_KEY is not set"
 
@@ -53,10 +57,14 @@ def prepare():
 def execute():
     is_debug = MODE == "debug_one_sample"
 
-    # --- PP add-on: resolve topology with PP ---
-    tensor_parallel_size, pipeline_parallel_size, data_parallel_size, gpus_per_sglang_engine = resolve_parallel_sizes(
-        NUM_GPUS, USE_TP, TP_SIZE, PP_SIZE
-    )
+    # --- PP/CP add-on: resolve topology ---
+    (
+        tensor_parallel_size,
+        pipeline_parallel_size,
+        context_parallel_size,
+        data_parallel_size,
+        gpus_per_sglang_engine,
+    ) = resolve_parallel_sizes(NUM_GPUS, USE_TP, TP_SIZE, PP_SIZE, CP_SIZE)
     is_pp = pipeline_parallel_size > 1
 
     # --- Cross-TP: SGLang can use a different TP/PP size ---
@@ -146,7 +154,10 @@ def execute():
     tp_args = (
         f"--tensor-model-parallel-size {tensor_parallel_size} "
         f"--pipeline-model-parallel-size {pipeline_parallel_size} "
+        f"--context-parallel-size {context_parallel_size} "
     )
+    if context_parallel_size > 1:
+        tp_args += "--cp-comm-type a2a "
 
     default_sglang_mem_fraction_static = 0.2 if MODEL_NAME == "Qwen3-4B" else 0.5
     # --- PP add-on: lower mem fraction for PP ---
