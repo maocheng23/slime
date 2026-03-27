@@ -53,6 +53,9 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     from sglang.srt.entrypoints.http_server import launch_server
 
+    # Propagate Ray runtime-env vars to spawned subprocess
+    import os as _launch_os
+    print(f"[LAUNCH_SERVER] SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK={_launch_os.environ.get(chr(83)+chr(71)+chr(76)+chr(65)+chr(78)+chr(71)+chr(95)+chr(69)+chr(78)+chr(65)+chr(66)+chr(76)+chr(69)+chr(95)+chr(84)+chr(80)+chr(95)+chr(77)+chr(69)+chr(77)+chr(79)+chr(82)+chr(89)+chr(95)+chr(73)+chr(78)+chr(66)+chr(65)+chr(76)+chr(65)+chr(78)+chr(67)+chr(69)+chr(95)+chr(67)+chr(72)+chr(69)+chr(67)+chr(75), chr(78)+chr(79)+chr(84)+chr(95)+chr(83)+chr(69)+chr(84))}", flush=True)
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
@@ -554,6 +557,8 @@ def _compute_server_args(
         "skip_server_warmup": True,
         # always enable draft weights cpu backup so that we run training without mtp weights.
         "enable_draft_weights_cpu_backup": True,
+        # GDN/Mamba models require page_size=1 for MambaRadixCache
+        "page_size": 1,
     }
 
     if worker_type == "prefill":

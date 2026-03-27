@@ -7,11 +7,17 @@ import torch.nn.functional as F
 from megatron.core import parallel_state as mpu
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from transformers import AutoConfig
 from transformers.activations import ACT2FN
+
+def _has_matmul_tp_inv():
+    """Lazily check if matmul_tp_inv is available. Must be checked at forward time,
+    not import time, because tp_inv_ops is registered later by SGLang's runtime."""
+    return hasattr(torch.ops, 'tp_inv_ops') and hasattr(torch.ops.tp_inv_ops, 'matmul_tp_inv')
 
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
@@ -72,38 +78,31 @@ class _HybridGDNCore(torch.autograd.Function):
             beta = b.sigmoid()
             g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
-        # Save original q, k before GQA expansion for backward
+        # Save original q, k for backward (before any modification)
         query_orig, key_orig = query, key
 
-        # 2. GQA expansion
-        if v_per_k_group > 1:
-            query = query.repeat_interleave(v_per_k_group, dim=2)
-            key = key.repeat_interleave(v_per_k_group, dim=2)
-
-        # 3. L2norm + chunk kernel (SGLang — inference-only)
-        if _sglang_l2norm_fwd is not None:
-            q_norm = _sglang_l2norm_fwd(query)
-            k_norm = _sglang_l2norm_fwd(key)
-            use_l2norm = False
-        else:
-            q_norm, k_norm = query, key
-            use_l2norm = True
+        # 2. Match SGLang's forward_extend exactly:
+        #    - Do NOT expand Q/K via repeat_interleave (SGLang passes original heads)
+        #    - Let the kernel handle GQA mapping internally
+        #    - Use use_qk_l2norm_in_kernel=True (l2norm inside kernel, matching SGLang)
 
         if cu_seqlens is None:
             B, T = query.shape[:2]
             cu_seqlens = torch.arange(0, (B + 1) * T, T, dtype=torch.long, device=query.device)
         N_seqs = cu_seqlens.shape[0] - 1
-        H, K, V = q_norm.shape[2], q_norm.shape[3], value.shape[3]
-        zero_state = torch.zeros(N_seqs, H, K, V, device=query.device, dtype=query.dtype)
+        # State uses num_v_heads (not num_k_heads) to match SGLang's kernel behavior
+        H_v = value.shape[2]
+        K_dim, V_dim = query.shape[3], value.shape[3]
+        zero_state = torch.zeros(N_seqs, H_v, K_dim, V_dim, device=query.device, dtype=query.dtype)
         state_idx = torch.arange(N_seqs, dtype=torch.int32, device=query.device)
 
         o, _, _ = _sglang_chunk_gated_delta_rule(
-            q_norm, k_norm, value,
+            query, key, value,
             g=g, beta=beta,
             initial_state=zero_state,
             initial_state_indices=state_idx,
             cu_seqlens=cu_seqlens.to(torch.long),
-            use_qk_l2norm_in_kernel=use_l2norm,
+            use_qk_l2norm_in_kernel=True,
         )
 
         # Save ORIGINAL (pre-expansion) q, k for backward
@@ -187,6 +186,102 @@ except ImportError:
             output = x_f * torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.eps)
             return (output * (1.0 + self.weight.float())).type_as(x)
 
+class _Qwen3NextQKNorm(nn.Module):
+    """GemmaRMSNorm for Q/K normalization in Qwen3-Next.
+    Accepts (config, hidden_size, eps) kwargs from build_module.
+    Uses additive weight: x * (1 + weight), matching SGLang's GemmaRMSNorm."""
+
+    def __init__(self, config=None, hidden_size=None, eps=1e-6, **kwargs):
+        super().__init__()
+        dim = hidden_size or (config.kv_channels if config else 128)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        orig_shape = x.shape
+        if x.ndim > 2:
+            x = x.reshape(-1, orig_shape[-1])
+        try:
+            import sgl_kernel
+            w = self.weight.data.to(x.dtype)
+            out = sgl_kernel.gemma_rmsnorm(x, w, self.eps)
+        except (ImportError, RuntimeError):
+            x_f = x.float()
+            out = x_f * torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.eps)
+            out = (out * (1.0 + self.weight.float())).type_as(x)
+        if len(orig_shape) > 2:
+            out = out.reshape(orig_shape)
+        return out
+
+
+class Qwen3NextPreMLPNorm(nn.Module):
+    """GemmaRMSNorm wrapper compatible with Megatron's build_module (accepts config kwarg).
+
+    Used for pre_mlp_layernorm in Qwen3-Next which uses GemmaRMSNorm (additive: x * (1 + weight))
+    instead of standard RMSNorm (multiplicative: x * weight).
+    Also handles residual add (matching SGLang's layer_communicator.prepare_mlp).
+
+    Uses SGLang's CUDA GemmaRMSNorm kernel (via Qwen3NextRMSNorm) for bitwise-identical
+    results with SGLang's inference. Falls back to PyTorch native if unavailable.
+
+    The weight is stored directly (not in a submodule) to match checkpoint key
+    'pre_mlp_layernorm.weight' (not 'pre_mlp_layernorm.norm.weight').
+    """
+
+    def __init__(self, config, hidden_size: int = None, eps: float = None, **kwargs):
+        super().__init__()
+        dim = hidden_size or config.hidden_size
+        self._eps = eps or getattr(config, 'layernorm_epsilon', 1e-6)
+        self._dim = dim
+        # Weight stored directly (matching checkpoint key structure)
+        self.weight = nn.Parameter(torch.zeros(dim))
+        # Compatibility: Megatron's TransformerBlock accesses fp32_residual on norm modules.
+        # Qwen3-Next does NOT use fp32_residual (residual add is outside norm in bf16).
+        self.fp32_residual = False
+
+    def _gemma_rms_norm_native(self, x):
+        """Fallback: PyTorch native GemmaRMSNorm."""
+        x_f = x.float()
+        variance = x_f.pow(2).mean(dim=-1, keepdim=True)
+        x_normed = x_f * torch.rsqrt(variance + self._eps)
+        return (x_normed * (1.0 + self.weight.float())).to(x.dtype)
+
+    def forward(self, x, residual=None):
+        orig_shape = x.shape
+        need_reshape = x.ndim == 3
+        if need_reshape:
+            D = x.shape[-1]
+            x = x.contiguous().view(-1, D)
+            if residual is not None:
+                residual = residual.contiguous().view(-1, D)
+
+        # Use SGLang's CUDA kernels directly for bitwise identity.
+        # When residual is provided, SGLang uses gemma_fused_add_rmsnorm (fused add+norm
+        # in one kernel). We MUST use the same fused kernel — separate add + norm gives
+        # different floating-point results due to intermediate precision differences.
+        try:
+            import sgl_kernel
+            w = self.weight.data.to(x.dtype)
+            if residual is not None:
+                sgl_kernel.gemma_fused_add_rmsnorm(x, residual, w, self._eps)
+                out = x
+            else:
+                out = sgl_kernel.gemma_rmsnorm(x, w, self._eps)
+        except (ImportError, RuntimeError):
+            if residual is not None:
+                x = x + residual
+                residual = x.clone()
+            out = self._gemma_rms_norm_native(x)
+
+        if need_reshape:
+            out = out.view(orig_shape)
+            if residual is not None:
+                residual = residual.view(orig_shape)
+
+        if residual is not None:
+            return out, residual
+        return out
+
 try:
     from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as SGLangRMSNormGated
 except ImportError:
@@ -257,9 +352,18 @@ try:
 except ImportError:
     _fla_causal_conv1d_fwd = None
 
-# Import SGLang's CUDA causal_conv1d which supports fused SiLU activation.
-# The fused kernel applies SiLU with different intermediate precision than F.silu(),
-# so we must use this for bitwise identical forward passes.
+# Import SGLang's Triton causal_conv1d — this is what SGLang's forward_extend actually uses.
+# CRITICAL: SGLang switched from CUDA (sgl_kernel) to Triton (causal_conv1d_triton).
+# The CUDA and Triton kernels produce different floating-point results.
+# We MUST use the same Triton kernel for bitwise-identical forward passes.
+try:
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn as _sglang_triton_causal_conv1d_fn,
+    )
+except ImportError:
+    _sglang_triton_causal_conv1d_fn = None
+
+# Fallback: CUDA kernel (only used if Triton import fails)
 try:
     import sgl_kernel as _sgl_kernel
 except ImportError:
@@ -268,33 +372,49 @@ except ImportError:
 
 class _CausalConv1dWithBackward(torch.autograd.Function):
     """Causal conv1d with optional SiLU activation.
-    Forward: SGLang CUDA kernel (conv + fused SiLU) for bitwise identity with rollout,
+    Forward: SGLang Triton kernel (conv + fused SiLU) for bitwise identity with rollout,
              or FLA triton kernel + F.silu fallback.
     Backward: manual conv gradient + SiLU chain rule."""
 
     @staticmethod
     def forward(ctx, x, weight, cu_seqlens, activation):
         # x: [B, T, D], weight: [D, K], cu_seqlens: [num_seqs+1]
-        use_sglang_kernel = (activation == "silu" and _sgl_kernel is not None)
+        use_sglang_kernel = (activation == "silu" and _sglang_triton_causal_conv1d_fn is not None)
 
         if use_sglang_kernel:
-            # Use SGLang's fused CUDA kernel for conv + SiLU.
-            # sgl_kernel.causal_conv1d_fwd expects (D, total_seqlen) for varlen mode.
+            # Use the SAME Triton causal_conv1d_fn that SGLang's forward_extend uses.
+            # SGLang switched from CUDA to Triton — we must match for bitwise identity.
             B, T, D = x.shape
-            # Reshape [B, T, D] -> [D, B*T] (varlen format)
-            x_2d = x.clone().reshape(-1, D).transpose(0, 1).contiguous()  # [D, B*T]
-            _sgl_kernel.causal_conv1d_fwd(
-                x_2d,              # modified in-place [D, B*T]
-                weight,            # [D, K]
-                None,              # bias
-                None,              # conv_states
-                cu_seqlens,        # query_start_loc
-                None,              # cache_indices
-                None,              # has_initial_state
-                True,              # silu_activation
-                -1,                # pad_slot_id
+            total_tokens = B * T
+            x_2d = x.clone().reshape(-1, D).transpose(0, 1).contiguous()  # [D, total_tokens]
+
+            # Build arguments matching SGLang's forward_extend call:
+            # - conv_states: dummy (no initial state for forward-only)
+            # - has_initial_state: all False
+            # - cache_indices: sequential
+            # - seq_lens_cpu: derived from cu_seqlens
+            n_seqs = cu_seqlens.shape[0] - 1
+            cu_seqlens_int32 = cu_seqlens.to(torch.int32)
+            conv_width = weight.shape[1]
+            conv_states = torch.zeros(n_seqs, D, conv_width - 1,
+                                      device=x.device, dtype=x.dtype)
+            has_initial_state = torch.zeros(n_seqs, dtype=torch.bool, device=x.device)
+            cache_indices = torch.arange(n_seqs, dtype=torch.int32, device=x.device)
+            seq_lens_cpu = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+
+            out_2d = _sglang_triton_causal_conv1d_fn(
+                x_2d,
+                weight,
+                bias=None,
+                conv_states=conv_states,
+                query_start_loc=cu_seqlens_int32,
+                seq_lens_cpu=seq_lens_cpu,
+                cache_indices=cache_indices,
+                has_initial_state=has_initial_state,
+                activation="silu",
             )
-            out = x_2d.transpose(0, 1).reshape(B, T, D)  # [B, T, D]
+
+            out = out_2d.transpose(0, 1).reshape(B, T, D)  # [B, T, D]
 
             # For backward: we need the pre-SiLU conv output. Recompute it
             # using FLA kernel (cheaper than storing both tensors).
@@ -341,34 +461,6 @@ class _CausalConv1dWithBackward(torch.autograd.Function):
         return grad_x, None, None, None
 
 from .hf_attention import HuggingfaceAttention
-
-# ---- Debug layer dump infrastructure ----
-_DEBUG_DUMP = os.environ.get("SLIME_DEBUG_LAYER_DUMP", "0") == "1"
-_DUMP_DIR = "/tmp/megatron_debug"
-_DUMP_MAX_FWD = int(os.environ.get("SLIME_DEBUG_DUMP_MAX_FWD", "4"))  # dump this many forward passes
-_dump_fwd_count = [0]  # mutable counter
-
-
-def _dsave(name, tensor):
-    """Save tensor for debug comparison. Dumps first N forward passes with mb suffix."""
-    if not _DEBUG_DUMP or _dump_fwd_count[0] >= _DUMP_MAX_FWD:
-        return
-    tp_rank = mpu.get_tensor_model_parallel_rank() if mpu.model_parallel_is_initialized() else 0
-    if tp_rank != 0:
-        return
-    os.makedirs(_DUMP_DIR, exist_ok=True)
-    mb = _dump_fwd_count[0]
-    t = tensor.detach().float().cpu()
-    torch.save(t, f"{_DUMP_DIR}/{name}_mb{mb}.pt")
-    print(f"[MEGA DUMP] mb{mb} {name}: shape={list(t.shape)} mean={t.mean():.8f} std={t.std():.8f} absmax={t.abs().max():.8f}", flush=True)
-
-
-def _dprint_weight(name, param):
-    """Print weight stats on first call."""
-    if not _DEBUG_DUMP:
-        return
-    t = param.detach().float()
-    print(f"[MEGA WEIGHT] {name}: shape={list(t.shape)} mean={t.mean():.8f} std={t.std():.8f} absmax={t.abs().max():.8f}", flush=True)
 
 
 # adapt from https://github.com/huggingface/transformers/blob/38a08b6e8ae35857109cedad75377997fecbf9d0/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L564
@@ -452,7 +544,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
-        self._weights_printed = False
 
         # --- Precompute TP shard indices ---
         v_per_k_group = self.num_v_heads // self.num_k_heads
@@ -470,14 +561,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         # conv1d: Q|K|V contiguous sections, each independently sharded
         q_per_rank = self.key_dim // tp_size
-        v_per_rank = self.value_dim // tp_size
+        v_per_rank_conv = self.value_dim // tp_size
         q_start = tp_rank * q_per_rank
         k_start = self.key_dim + tp_rank * q_per_rank
-        v_start = 2 * self.key_dim + tp_rank * v_per_rank
+        v_start = 2 * self.key_dim + tp_rank * v_per_rank_conv
         self.register_buffer('_conv_indices', torch.cat([
             torch.arange(q_start, q_start + q_per_rank),
             torch.arange(k_start, k_start + q_per_rank),
-            torch.arange(v_start, v_start + v_per_rank),
+            torch.arange(v_start, v_start + v_per_rank_conv),
         ]).long(), persistent=False)
 
         # A_log / dt_bias: sharded by v_heads
@@ -486,6 +577,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self._a_end = (tp_rank + 1) * v_heads_per_rank
 
         # out_proj: RowParallel style, input columns sharded
+        v_per_rank = self.value_dim // tp_size
         self._out_col_start = tp_rank * v_per_rank
         self._out_col_end = (tp_rank + 1) * v_per_rank
 
@@ -525,28 +617,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor = None,
     ):
-        # Print weight stats on first call
-        if not self._weights_printed and _DEBUG_DUMP:
-            self._weights_printed = True
-            _dprint_weight(f"gdn{self.layer_idx}.in_proj_qkvz", self.in_proj_qkvz.weight)
-            _dprint_weight(f"gdn{self.layer_idx}.in_proj_ba", self.in_proj_ba.weight)
-            _dprint_weight(f"gdn{self.layer_idx}.out_proj", self.out_proj.weight)
-            _dprint_weight(f"gdn{self.layer_idx}.A_log", self.A_log)
-            _dprint_weight(f"gdn{self.layer_idx}.dt_bias", self.dt_bias)
-            _dprint_weight(f"gdn{self.layer_idx}.norm", self.norm.weight)
-            _dprint_weight(f"gdn{self.layer_idx}.conv1d", self.conv1d.weight)
-
-        _dsave(f"gdn{self.layer_idx}_input", hidden_states)
-
         # TP-sharded in_proj_qkvz: contiguous group slicing (interleaved QKVZ layout)
         w_qkvz = self.in_proj_qkvz.weight[self._qkvz_start:self._qkvz_end]
         projected_states_qkvz = F.linear(hidden_states, w_qkvz)
-        _dsave(f"gdn{self.layer_idx}_proj_qkvz", projected_states_qkvz)
 
         # TP-sharded in_proj_ba
         w_ba = self.in_proj_ba.weight[self._ba_start:self._ba_end]
         projected_states_ba = F.linear(hidden_states, w_ba)
-        _dsave(f"gdn{self.layer_idx}_proj_ba", projected_states_ba)
 
         query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
         query, key, value = (x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value))
@@ -557,7 +634,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         conv_indices = self._conv_indices.to(self.conv1d.weight.device)
         conv_weight_tp = self.conv1d.weight[conv_indices].squeeze(1)  # [channels_tp, kernel_size]
         mixed_qkv = _CausalConv1dWithBackward.apply(mixed_qkv, conv_weight_tp, cu_seqlens, self.activation)
-        _dsave(f"gdn{self.layer_idx}_after_conv", mixed_qkv)
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -592,26 +668,32 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 cu_seqlens=cu_seqlens.to(torch.long) if cu_seqlens is not None else None,
                 use_qk_l2norm_in_kernel=True,
             )
-        _dsave(f"gdn{self.layer_idx}_after_gdr", core_attn_out)
-
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
-        _dsave(f"gdn{self.layer_idx}_after_norm", core_attn_out)
 
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
 
         # TP-sharded out_proj (RowParallel: input columns sharded, output is partial sum)
+        # Must use matmul_tp_inv to match SGLang's RowParallelLinear which uses
+        # torch.ops.tp_inv_ops.matmul_tp_inv when ROW_LINEAR_ENABLE_INV=1.
+        # batch_invariant_mode patches aten::mm with matmul_persistent, but that's a
+        # DIFFERENT kernel from matmul_tp_persistent. For TP-sharded RowParallel matmuls,
+        # SGLang explicitly uses matmul_tp_inv, so we must do the same.
         w_out = self.out_proj.weight[:, self._out_col_start:self._out_col_end]
-        output = F.linear(core_attn_out, w_out)
-        _dsave(f"gdn{self.layer_idx}_output", output)
-
-        # Increment forward counter after last GDN layer
-        if self.layer_idx == 2:
-            _dump_fwd_count[0] += 1
+        _K = core_attn_out.shape[-1]
+        if (_has_matmul_tp_inv()
+                and os.environ.get("ROW_LINEAR_ENABLE_INV", "0") == "1"
+                and _K >= 128 and _K % 128 == 0):
+            output = torch.ops.tp_inv_ops.matmul_tp_inv(
+                core_attn_out.reshape(-1, _K),
+                w_out.t(),
+            ).reshape(core_attn_out.shape[:-1] + (w_out.shape[0],))
+        else:
+            output = F.linear(core_attn_out, w_out)
 
         return output
 
@@ -643,7 +725,31 @@ class Attention(HuggingfaceAttention):
         self.linear_attn = Qwen3NextGatedDeltaNet(self.hf_config, self.hf_layer_idx, tp_rank, tp_size)
 
     def hf_forward(self, hidden_states, packed_seq_params):
-        hidden_states = self.input_layernorm(hidden_states)
+        # Check if TransformerLayer passed a separate residual for fused add+norm.
+        # This matches SGLang's LayerCommunicator.prepare_attn which calls:
+        #   gemma_fused_add_rmsnorm(hidden_states, residual) -> residual += hs; norm(residual)
+        _input_residual = getattr(self, '_sglang_input_residual', None)
+        if _input_residual is not None:
+            del self._sglang_input_residual
+            try:
+                import sgl_kernel
+                w = self.input_layernorm.weight.data.to(hidden_states.dtype)
+                eps = self.input_layernorm.eps if hasattr(self.input_layernorm, 'eps') else self.input_layernorm.variance_epsilon
+                # gemma_fused_add_rmsnorm requires 2D [tokens, hidden]
+                orig_shape = hidden_states.shape
+                x = hidden_states.view(-1, orig_shape[-1])
+                r = _input_residual.view(-1, orig_shape[-1])
+                # Fused add+norm: residual += hidden_states (in-place), x = norm(residual)
+                sgl_kernel.gemma_fused_add_rmsnorm(x, r, w, eps)
+                hidden_states = x.view(orig_shape)
+                _input_residual = r.view(_input_residual.shape)
+                self._sglang_updated_residual = _input_residual
+            except (ImportError, RuntimeError):
+                _input_residual.add_(hidden_states)
+                hidden_states = self.input_layernorm(_input_residual)
+                self._sglang_updated_residual = _input_residual
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
             cu_seqlens=packed_seq_params.cu_seqlens_q,
@@ -651,9 +757,41 @@ class Attention(HuggingfaceAttention):
         # TP reduction for GDN's RowParallel-style out_proj.
         # When SP is on, HuggingfaceAttention.forward() handles TP reduction via reduce_scatter.
         # When SP is off, we must explicitly all-reduce the partial output.
+        # Use _tree_all_reduce_sum to match SGLang's tensor_model_parallel_tree_all_reduce
+        # (used in communicator.py prepare_mlp when rl_on_policy_target="fsdp_tp").
+        # reduce_from_tensor_model_parallel_region calls _reduce which also uses
+        # _tree_all_reduce_sum when MEGATRON_USE_DETERMINISTIC_ALLREDUCE=1, but we
+        # call it directly to avoid any ambiguity.
         if not self.args.sequence_parallel and self.linear_attn.tp_size > 1:
-            hidden_states = reduce_from_tensor_model_parallel_region(hidden_states)
+            tp_group = mpu.get_tensor_model_parallel_group()
+            if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+                hidden_states = _tree_all_reduce_sum(hidden_states, tp_group)
+            else:
+                hidden_states = reduce_from_tensor_model_parallel_region(hidden_states)
         return hidden_states
+
+
+def _make_qwen3next_fused_ln_linear():
+    """Create a subclass of SGLangLayerNormColumnParallelLinear with GemmaRMSNorm.
+    Deferred to avoid import-time dependency on Megatron extensions."""
+    from megatron.core.extensions.sglang import SGLangLayerNormColumnParallelLinear
+
+    class Qwen3NextFusedLayerNormColumnParallelLinear(SGLangLayerNormColumnParallelLinear):
+        """Subclass that replaces the internal SGLangRMSNorm (multiplicative: x * weight)
+        with GemmaRMSNorm (additive: x * (1 + weight)) for Qwen3-Next.
+
+        The bridge checkpoint maps input_layernorm.weight to layer_norm_weight,
+        but the weight may be wrong if IdentityOp was used for input_layernorm.
+        We load the correct weight from HF checkpoint on first forward call.
+        """
+
+        def __init__(self, input_size, output_size, *, config, **kwargs):
+            super().__init__(input_size, output_size, config=config, **kwargs)
+            # Replace the norm with GemmaRMSNorm (additive: x * (1 + weight))
+            # The bridge correctly loads input_layernorm.weight via layer_norm_weight mapping.
+            self.norm = Qwen3NextPreMLPNorm(config, hidden_size=input_size, eps=config.layernorm_epsilon)
+
+    return Qwen3NextFusedLayerNormColumnParallelLinear
 
 
 def get_qwen3_next_spec(args, config, vp_stage):
@@ -679,11 +817,36 @@ def get_qwen3_next_spec(args, config, vp_stage):
     hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
 
     for layer_id in range(num_layers_to_build):
+        layer_specs = copy.deepcopy(transformer_layer_spec.layer_specs[layer_id])
+
+        # Qwen3-Next uses GemmaRMSNorm (additive: x * (1 + weight)) for ALL norms
+        # except QK-norm. Override all norms that default to SGLangRMSNorm (multiplicative).
+        # GemmaRMSNorm weights are stored as deltas from 1 (values ~0),
+        # so multiplicative `x * weight` gives ~0, while additive `x * (1 + weight)` is correct.
+
+        # Fix pre_mlp_layernorm (between GDN/attention output and MoE input)
+        if hasattr(layer_specs.submodules, 'pre_mlp_layernorm'):
+            layer_specs.submodules.pre_mlp_layernorm = Qwen3NextPreMLPNorm
+
         if hf_config.layer_types[layer_id + offset] == "linear_attention":
-            layer_specs = copy.deepcopy(transformer_layer_spec.layer_specs[layer_id])
+            # GDN layers: custom Attention module handles input_layernorm internally
             layer_specs.submodules.self_attention = ModuleSpec(
                 module=Attention,
                 params={"args": args},
             )
-            transformer_layer_spec.layer_specs[layer_id] = layer_specs
+        # L3 (full attention): override norms to use GemmaRMSNorm (additive: x * (1+weight)).
+        if hf_config.layer_types[layer_id + offset] == "full_attention":
+            # Input layernorm (fused into linear_qkv)
+            Qwen3NextFusedLNLinear = _make_qwen3next_fused_ln_linear()
+            layer_specs.submodules.self_attention.submodules.linear_qkv = Qwen3NextFusedLNLinear
+            # Q/K layernorm: SGLangQKRMSNorm uses multiplicative (weight*x),
+            # but Qwen3-Next uses GemmaRMSNorm ((1+weight)*x) for ALL norms.
+            layer_specs.submodules.self_attention.submodules.q_layernorm = _Qwen3NextQKNorm
+            layer_specs.submodules.self_attention.submodules.k_layernorm = _Qwen3NextQKNorm
+
+        transformer_layer_spec.layer_specs[layer_id] = layer_specs
+
+    # Final layernorm also uses GemmaRMSNorm. Previous regression was from broken residual flow.
+    transformer_layer_spec.layer_norm = Qwen3NextPreMLPNorm
+
     return transformer_layer_spec

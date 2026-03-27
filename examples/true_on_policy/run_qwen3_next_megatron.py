@@ -36,6 +36,12 @@ if MODE != "debug_one_sample":
 ENABLE_CI = os.environ.get("SLIME_ENABLE_CI", "0") == "1"
 CHECK_WEIGHT_UPDATE_EQUAL = os.environ.get("SLIME_CHECK_WEIGHT_UPDATE_EQUAL", "0") == "1"
 
+USE_DVR = os.environ.get("SLIME_USE_DVR", "1") == "1"
+DVR_NUM_STEPS = int(os.environ.get("SLIME_DVR_NUM_STEPS", "15"))
+DVR_NUM_DRAFT_TOKENS = int(os.environ.get("SLIME_DVR_NUM_DRAFT_TOKENS", "16"))
+DVR_MAMBA_TRACK_INTERVAL = int(os.environ.get("SLIME_DVR_MAMBA_TRACK_INTERVAL", "64"))
+DVR_MAX_RUNNING_REQUESTS = os.environ.get("SLIME_DVR_MAX_RUNNING_REQUESTS", "")
+
 USE_EXTERNAL_SYSTEM_SETUP = os.environ.get("SLIME_USE_EXTERNAL_SYSTEM_SETUP", "0") == "1"
 _system_env, _system_bool, _system_int = make_system_helpers(USE_EXTERNAL_SYSTEM_SETUP)
 
@@ -68,7 +74,7 @@ def execute():
     sglang_pp_size = SGLANG_PP_SIZE if SGLANG_PP_SIZE > 0 else pipeline_parallel_size
     gpus_per_sglang_engine = sglang_tp_size * sglang_pp_size
 
-    global_batch_size = 2 if is_debug else 128
+    global_batch_size = int(os.environ.get("SLIME_SCRIPT_GLOBAL_BATCH_SIZE", "2" if is_debug else "128"))
     if global_batch_size % data_parallel_size != 0:
         global_batch_size = math.ceil(global_batch_size / data_parallel_size) * data_parallel_size
 
@@ -100,7 +106,7 @@ def execute():
         "--rm-type math "
         f"--num-rollout {3 if is_debug else 3000} "
         f"--rollout-batch-size {1 if is_debug else 16} "
-        f"--n-samples-per-prompt {2 if is_debug else 8} "
+        f"--n-samples-per-prompt {int(os.environ.get('SLIME_SCRIPT_N_SAMPLES', '2' if is_debug else '8'))} "
         f"--rollout-max-response-len {10 if is_debug else 1024} "
         "--rollout-temperature 1 "
         f"--global-batch-size {global_batch_size} "
@@ -214,7 +220,6 @@ def execute():
         misc_args += "--check-weight-update-equal "
 
     true_on_policy_args = (
-        "--sglang-enable-deterministic-inference "
         "--sglang-rl-on-policy-target fsdp_tp "
         "--sglang-attention-backend fa3 "
         "--use-sglang "
@@ -227,6 +232,28 @@ def execute():
         "--use-cpu-initialization "
         "--no-rope-fusion "
     )
+
+    if USE_DVR:
+        true_on_policy_args += (
+            "--sglang-enable-prefill-only-deterministic-inference "
+            "--sglang-disable-overlap-schedule "
+            "--sglang-speculative-algorithm DECODE_VERIFY_ROLLBACK "
+            f"--sglang-speculative-num-steps {DVR_NUM_STEPS} "
+            "--sglang-speculative-eagle-topk 1 "
+            f"--sglang-speculative-num-draft-tokens {DVR_NUM_DRAFT_TOKENS} "
+            f"--sglang-mamba-track-interval {DVR_MAMBA_TRACK_INTERVAL} "
+            "--sglang-mamba-scheduler-strategy extra_buffer "
+        )
+        if DVR_MAX_RUNNING_REQUESTS:
+            true_on_policy_args += (
+                f"--sglang-max-running-requests {DVR_MAX_RUNNING_REQUESTS} "
+            )
+    else:
+        true_on_policy_args += (
+            "--sglang-enable-deterministic-inference "
+            "--sglang-mamba-scheduler-strategy extra_buffer "
+        )
+
     true_on_policy_envs = {
         "NCCL_NVLS_ENABLE": "0",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
@@ -265,12 +292,22 @@ def execute():
         f"{true_on_policy_args} "
     )
 
+    dvr_env_vars = {}
+    if USE_DVR:
+        dvr_env_vars = {
+            "USE_CHAIN_SPECULATIVE_SAMPLING": "1",
+            "SGLANG_GDN_PREFILL_TRUNCATION_ALIGN_SIZE": os.environ.get(
+                "SLIME_GDN_PREFILL_TRUNCATION_ALIGN_SIZE", "128"
+            ),
+        }
+
     U.execute_train(
         train_args=train_args,
         num_gpus_per_node=NUM_GPUS,
         megatron_model_type=MODEL_TYPE,
         extra_env_vars={
             **true_on_policy_envs,
+            **dvr_env_vars,
             **build_debug_envs(MODE, _system_env),
             "SLIME_PROFILE_FWD_BWD": os.environ.get("SLIME_PROFILE_FWD_BWD", "0"),
             "SLIME_PROFILE_BWD_DETAIL": os.environ.get("SLIME_PROFILE_BWD_DETAIL", "0"),
@@ -281,6 +318,15 @@ def execute():
             "SGLANG_DUMP_MAX_FWD": os.environ.get("SGLANG_DUMP_MAX_FWD", "10"),
             "SLIME_DEBUG_DUMP_MAX_FWD": os.environ.get("SLIME_DEBUG_DUMP_MAX_FWD", "10"),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+            "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": os.environ.get("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", "1"),
+            "SGLANG_DBG_LAYER_PRINT": os.environ.get("SGLANG_DBG_LAYER_PRINT", "0"),
+            "SGLANG_DBG_LAYER_MAX_FWD": os.environ.get("SGLANG_DBG_LAYER_MAX_FWD", "10"),
+            "SLIME_DBG_LAYER_PRINT": os.environ.get("SLIME_DBG_LAYER_PRINT", "0"),
+            "SLIME_DBG_LAYER_MAX_FWD": os.environ.get("SLIME_DBG_LAYER_MAX_FWD", "10"),
+            "SGLANG_SAVE_CMP": os.environ.get("SGLANG_SAVE_CMP", "0"),
+            "SGLANG_SAVE_CMP_MAX_FWD": os.environ.get("SGLANG_SAVE_CMP_MAX_FWD", "6"),
+            "SLIME_SAVE_CMP": os.environ.get("SLIME_SAVE_CMP", "0"),
+            "SLIME_SAVE_CMP_MAX_FWD": os.environ.get("SLIME_SAVE_CMP_MAX_FWD", "6"),
         },
     )
 

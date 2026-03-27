@@ -99,6 +99,29 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
+async def _flush_sglang_cache(args: Namespace) -> bool:
+    """Flush the SGLang radix cache so that subsequent prefill requests
+    compute GDN/Mamba state from scratch (zeros) instead of reusing
+    decode-contaminated state stored in the radix tree."""
+    flush_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/flush_cache"
+    try:
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(flush_url) as resp:
+                success = resp.status == 200
+                if not success:
+                    logger.warning(f"[PREFILL] flush_cache returned status {resp.status}")
+                return success
+    except Exception:
+        try:
+            await post(flush_url, {})
+            return True
+        except Exception as e:
+            logger.warning(f"[PREFILL] flush_cache failed: {e}")
+            return False
+
+
 async def _recompute_logprobs_via_prefill(
     args: Namespace, full_token_ids: list[int], prompt_len: int
 ) -> list[float] | None:
@@ -107,9 +130,22 @@ async def _recompute_logprobs_via_prefill(
     (fused_recurrent). This ensures rollout logprobs match Megatron's prefill
     path for architectures like GDN where prefill and decode kernels diverge.
 
+    For hybrid GDN models, the radix cache may store decode-phase GDN state
+    that would be reused on a prefix match, causing the "prefill" logprobs to
+    actually reflect decode-kernel state. We flush the cache first so the
+    prefill request computes GDN state from scratch with initial_state=zeros,
+    matching Megatron's training forward.
+
     Returns a list of logprobs for the response tokens, or None on failure.
     """
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+
+    # Flush the radix cache to evict decode-contaminated GDN/Mamba state.
+    # This forces the prefill request to compute all GDN recurrent state
+    # from scratch (initial_state=zeros), matching Megatron's from-scratch
+    # chunk_gated_delta_rule forward.
+    await _flush_sglang_cache(args)
+
     # Start 1 position earlier so the first (always-None) logprob falls on
     # the last prompt token, and all response tokens get valid logprobs.
     logprob_start = max(prompt_len - 1, 0)
