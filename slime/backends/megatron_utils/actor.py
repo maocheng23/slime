@@ -1,4 +1,3 @@
-import sys; sys.path.insert(0, "/root/slime"); import dump_per_layer  # noqa
 import logging
 import os
 import random

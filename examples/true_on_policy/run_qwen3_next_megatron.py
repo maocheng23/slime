@@ -166,6 +166,7 @@ def execute():
     sglang_mem_fraction_static = float(
         _system_env("SLIME_SGLANG_MEM_FRACTION_STATIC", "0.15" if is_debug else "0.35")
     )
+    sglang_disable_cuda_graph = os.environ.get("SLIME_SGLANG_DISABLE_CUDA_GRAPH", "0") == "1"
     sglang_args = (
         f"--rollout-num-gpus-per-engine {gpus_per_sglang_engine} "
         f"--sglang-tp-size {sglang_tp_size} "
@@ -175,6 +176,8 @@ def execute():
         "--sglang-enable-metrics "
         f"--sglang-mem-fraction-static {sglang_mem_fraction_static} "
     )
+    if sglang_disable_cuda_graph:
+        sglang_args += "--sglang-disable-cuda-graph "
 
     router_args = (
         "--router-health-check-timeout-secs 30 "

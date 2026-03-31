@@ -69,7 +69,11 @@ class _TensorBackuperNormal(TensorBackuper):
     def restore(self, tag: str) -> None:
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
-            assert name in backup_dict
+            if name not in backup_dict:
+                # Lazily-created cached tensors (e.g. _se_gate_up_shard)
+                # may appear after the initial backup. Save them now.
+                backup_dict[name] = param.detach().clone().cpu().pin_memory()
+                continue
             param.copy_(backup_dict[name], non_blocking=True)
         torch.cuda.synchronize()
 
