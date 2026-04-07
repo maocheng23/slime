@@ -5,6 +5,12 @@ from mbridge.models import Qwen2MoEBridge
 
 @register_model("qwen3_next")
 class Qwen3NextBridge(Qwen2MoEBridge):
+    # SGLangLayerNormColumnParallelLinear.state_dict() leaks its internal
+    # "norm.weight" and "linear.weight" as top-level keys (bug in state_dict
+    # prefix handling). These duplicate properly-prefixed layer keys and must
+    # be skipped during weight loading to avoid IndexError in mbridge mapping.
+    _SKIP_KEYS = {"norm.weight", "linear.weight"}
+
     _ATTENTION_MAPPING = (
         Qwen2MoEBridge._ATTENTION_MAPPING
         | {
@@ -37,6 +43,20 @@ class Qwen3NextBridge(Qwen2MoEBridge):
             ],
         }
     )
+
+    def load_weights(self, models, weights_path, memory_efficient=False):
+        """Override to filter out spurious duplicate keys before loading."""
+        orig_l2g = self._weight_name_mapping_mcore_local_to_global
+
+        def _filtered_l2g(model, consider_ep=True):
+            ret = orig_l2g(model, consider_ep)
+            return {k: v for k, v in ret.items() if v not in self._SKIP_KEYS}
+
+        self._weight_name_mapping_mcore_local_to_global = _filtered_l2g
+        try:
+            super().load_weights(models, weights_path, memory_efficient=memory_efficient)
+        finally:
+            self._weight_name_mapping_mcore_local_to_global = orig_l2g
 
     def _weight_to_mcore_format(
         self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
