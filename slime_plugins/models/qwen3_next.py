@@ -214,6 +214,93 @@ class _Qwen3NextQKNorm(nn.Module):
         return out
 
 
+class _GemmaRMSNormWithBackward(torch.autograd.Function):
+    """Hybrid autograd for GemmaRMSNorm: SGLang kernel forward, native PyTorch backward.
+
+    Forward: sgl_kernel.gemma_rmsnorm (bitwise identical to SGLang inference).
+    Backward: native PyTorch GemmaRMSNorm (supports autograd for gradient computation).
+
+    This follows the same pattern as _HybridGDNCore and _RMSNormGatedWithBackward.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, eps):
+        import sgl_kernel
+        w = weight.data.to(x.dtype)
+        out = sgl_kernel.gemma_rmsnorm(x, w, eps)
+        ctx.save_for_backward(x, weight)
+        ctx.eps = eps
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        eps = ctx.eps
+        # Recompute with native PyTorch for autograd support
+        x_req = x.detach().requires_grad_(True)
+        w_req = weight.detach().requires_grad_(True)
+        with torch.enable_grad():
+            x_f = x_req.float()
+            variance = x_f.pow(2).mean(dim=-1, keepdim=True)
+            x_normed = x_f * torch.rsqrt(variance + eps)
+            out = (x_normed * (1.0 + w_req.float())).to(x_req.dtype)
+        out.backward(grad_output)
+        return x_req.grad, w_req.grad, None
+
+
+class _GemmaFusedAddRMSNormWithBackward(torch.autograd.Function):
+    """Hybrid autograd for fused add+GemmaRMSNorm: SGLang kernel forward, native backward.
+
+    Forward: sgl_kernel.gemma_fused_add_rmsnorm (bitwise identical to SGLang inference).
+             This kernel does x += residual, then rmsnorm(x) in one fused pass.
+             Returns (normed_output, updated_residual) where updated_residual = x after add.
+    Backward: native PyTorch for gradient computation.
+    """
+
+    @staticmethod
+    def forward(ctx, x, residual, weight, eps):
+        import sgl_kernel
+        w = weight.data.to(x.dtype)
+        # sgl_kernel.gemma_fused_add_rmsnorm modifies x and residual in-place:
+        #   x += residual, then x = rmsnorm(x)
+        #   residual is also updated to the post-add value
+        # We must clone to avoid corrupting autograd tensors.
+        x_work = x.clone()
+        res_work = residual.clone()
+        sgl_kernel.gemma_fused_add_rmsnorm(x_work, res_work, w, eps)
+        normed_out = x_work
+        updated_residual = res_work
+        # Save originals for backward
+        ctx.save_for_backward(x, residual, weight)
+        ctx.eps = eps
+        return normed_out, updated_residual
+
+    @staticmethod
+    def backward(ctx, grad_normed, grad_residual):
+        x, residual, weight = ctx.saved_tensors
+        eps = ctx.eps
+        # Recompute with native PyTorch: fused add + gemma_rmsnorm
+        x_req = x.detach().requires_grad_(True)
+        res_req = residual.detach().requires_grad_(True)
+        w_req = weight.detach().requires_grad_(True)
+        with torch.enable_grad():
+            added = x_req + res_req
+            x_f = added.float()
+            variance = x_f.pow(2).mean(dim=-1, keepdim=True)
+            x_normed = x_f * torch.rsqrt(variance + eps)
+            normed_out = (x_normed * (1.0 + w_req.float())).to(x_req.dtype)
+            # updated_residual = added (the post-add value)
+            updated_residual = added
+        # Backward through both outputs
+        tensors = [normed_out]
+        grads = [grad_normed]
+        if grad_residual is not None:
+            tensors.append(updated_residual)
+            grads.append(grad_residual)
+        torch.autograd.backward(tensors, grads)
+        return x_req.grad, res_req.grad, w_req.grad, None
+
+
 class Qwen3NextPreMLPNorm(nn.Module):
     """GemmaRMSNorm wrapper compatible with Megatron's build_module (accepts config kwarg).
 
@@ -221,8 +308,8 @@ class Qwen3NextPreMLPNorm(nn.Module):
     instead of standard RMSNorm (multiplicative: x * weight).
     Also handles residual add (matching SGLang's layer_communicator.prepare_mlp).
 
-    Uses SGLang's CUDA GemmaRMSNorm kernel (via Qwen3NextRMSNorm) for bitwise-identical
-    results with SGLang's inference. Falls back to PyTorch native if unavailable.
+    Forward: SGLang CUDA kernel (bitwise identical to inference).
+    Backward: Native PyTorch (proper autograd support) via hybrid autograd Functions.
 
     The weight is stored directly (not in a submodule) to match checkpoint key
     'pre_mlp_layernorm.weight' (not 'pre_mlp_layernorm.norm.weight').
@@ -255,18 +342,15 @@ class Qwen3NextPreMLPNorm(nn.Module):
             if residual is not None:
                 residual = residual.contiguous().view(-1, D)
 
-        # Use SGLang's CUDA kernels directly for bitwise identity.
-        # When residual is provided, SGLang uses gemma_fused_add_rmsnorm (fused add+norm
-        # in one kernel). We MUST use the same fused kernel — separate add + norm gives
-        # different floating-point results due to intermediate precision differences.
+        # Use hybrid autograd: SGLang kernel forward (bitwise identity) + native backward.
         try:
-            import sgl_kernel
-            w = self.weight.data.to(x.dtype)
+            import sgl_kernel  # noqa: F401 — availability check
             if residual is not None:
-                sgl_kernel.gemma_fused_add_rmsnorm(x, residual, w, self._eps)
-                out = x
+                out, residual = _GemmaFusedAddRMSNormWithBackward.apply(
+                    x, residual, self.weight, self._eps,
+                )
             else:
-                out = sgl_kernel.gemma_rmsnorm(x, w, self._eps)
+                out = _GemmaRMSNormWithBackward.apply(x, self.weight, self._eps)
         except (ImportError, RuntimeError):
             if residual is not None:
                 x = x + residual
@@ -723,6 +807,13 @@ class Attention(HuggingfaceAttention):
         tp_rank = mpu.get_tensor_model_parallel_rank()
         tp_size = mpu.get_tensor_model_parallel_world_size()
         self.linear_attn = Qwen3NextGatedDeltaNet(self.hf_config, self.hf_layer_idx, tp_rank, tp_size)
+
+        # Debug: check if mpu TP group matches pg_collection.tp
+        mpu_tp = mpu.get_tensor_model_parallel_group()
+        pg_tp = pg_collection.tp if pg_collection is not None else None
+        print(f"[GDN_TP_CHECK layer={layer_number}] mpu_tp id={id(mpu_tp)} type={type(mpu_tp).__name__} "
+              f"pg_tp id={id(pg_tp)} type={type(pg_tp).__name__ if pg_tp else 'None'} "
+              f"same={mpu_tp is pg_tp}", flush=True)
 
     def hf_forward(self, hidden_states, packed_seq_params):
         # Check if TransformerLayer passed a separate residual for fused add+norm.
