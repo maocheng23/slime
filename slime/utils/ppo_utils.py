@@ -175,9 +175,9 @@ def compute_log_probs(
             # Megatron's ColumnParallelLinear partitions the PADDED vocab across TP ranks,
             # so we must all_gather full padded partitions first, then truncate to vocab_size.
             # Trimming per-rank BEFORE all_gather would misalign rank1's vocab offset.
-            all_parts = [torch.empty_like(_partial) for _ in range(tp_size)]
-            dist.all_gather(all_parts, _partial.contiguous(), group=process_group)
-            full_logits = torch.cat(all_parts, dim=-1)
+            # Use autograd-aware all_gather so gradients flow back through the loss.
+            from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
+            full_logits = all_gather_last_dim_from_tensor_parallel_region(_partial, group=process_group)
 
             if vocab_size is not None and full_logits.size(-1) > vocab_size:
                 full_logits = full_logits[..., :vocab_size]
